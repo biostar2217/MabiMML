@@ -21,7 +21,10 @@ from . import ai
 from . import ime
 from . import theme
 from . import updater
+from . import progress as progress_ui
+from .convert import will_recognize
 import threading
+import time
 
 ROLE_LABELS = [("자동", "auto"), ("멜로디", "melody"), ("화음1", "chord1"),
                ("화음2", "chord2"), ("제외", "skip")]
@@ -39,6 +42,30 @@ PREVIEW_SOUNDS = ["연주 악기 따라", "피아노"]
 SETTINGS_VERSION = 2
 GAP_LABELS = [("MIDI만", "auto"), ("항상", "on"), ("끄기", "off")]
 SUSTAIN_LABELS = [("모든 음 늘리기", "all"), ("베이스만 늘리기", "bass"), ("끄기", "off")]
+
+
+def _remember_read_speed(path, seconds):
+    """큰 파일을 읽은 시간으로 다음 예상 시간을 맞춘다 (1MB 넘는 파일만)."""
+    try:
+        mb = os.path.getsize(path) / 1048576
+    except OSError:
+        return
+    if mb < 1:
+        return
+    cfg = load_config()
+    cfg[progress_ui.CFG_READ_SPEED] = round(progress_ui.update_average(
+        cfg.get(progress_ui.CFG_READ_SPEED), seconds / mb), 3)
+    save_config(cfg)
+
+
+def _remember_convert_speed(notes, seconds):
+    """MML 만들기에 걸린 시간 (음표 1000개당 초). 음표가 많을 때만 잰다."""
+    if notes < 5000:
+        return
+    cfg = load_config()
+    cfg[progress_ui.CFG_CONVERT_SPEED] = round(progress_ui.update_average(
+        cfg.get(progress_ui.CFG_CONVERT_SPEED), seconds / notes * 1000), 4)
+    save_config(cfg)
 
 
 class App(tk.Tk):
@@ -823,16 +850,32 @@ class App(tk.Tk):
         self._load(usable[0])
 
     def _load(self, path):
+        if getattr(self, "_loading", None):      # 불러오는 중에 또 열면 무시 (창이 겹치지 않게)
+            self.status.configure(text="아직 불러오는 중입니다. 끝난 뒤 다시 여세요")
+            return
         self.transpose.set(0)     # 다음 곡까지 높이가 옮겨지지 않게
         self.file_label.configure(text=os.path.basename(path) + " 읽는 중…")
         self.status.configure(text="")
         re_ocr = self.re_ocr.get()   # tk 변수는 메인 스레드에서만 읽는다
+        if will_recognize(path, True, re_ocr):     # 막대 몫은 실제 걸리는 시간 비율에 맞춘다
+            stages, weights = ["PDF 인식 중", "악보 읽는 중", "MML 만드는 중"], [90, 4, 6]
+        else:
+            stages, weights = ["파일 읽는 중", "MML 만드는 중"], [25, 75]
+        prog = progress_ui.Progress(stages, weights)
+        win = progress_ui.LoadingWindow(self, prog, file_name=os.path.basename(path))
+        self._loading = (prog, win)
 
         def work():
+            started = time.monotonic()
             try:
                 song = load_song(path, log=lambda m: self.after(0, lambda: self.status.configure(text=m)),
-                                 re_ocr=re_ocr)
-                self.after(0, lambda: self._loaded(path, song))
+                                 re_ocr=re_ocr, progress=prog)
+                prog.check()
+                if len(stages) == 2:
+                    _remember_read_speed(path, time.monotonic() - started)
+                self.after(0, lambda: self._loaded(path, song, from_file=True))
+            except progress_ui.Cancelled:
+                self.after(0, lambda: self._load_cancelled(path))
             except OMRError as e:
                 msg = str(e)
                 self.after(0, lambda: self._load_failed(path, msg))
@@ -841,7 +884,18 @@ class App(tk.Tk):
                 self.after(0, lambda: self._load_failed(path, msg))
         threading.Thread(target=work, daemon=True).start()
 
+    def _end_loading(self):
+        loading, self._loading = getattr(self, "_loading", None), None
+        if loading:
+            loading[1].done()
+
+    def _load_cancelled(self, path):
+        self._end_loading()
+        self.file_label.configure(text=os.path.basename(path) + " (불러오기 취소함)")
+        self.status.configure(text="불러오기를 취소했습니다")
+
     def _load_failed(self, path, msg):
+        self._end_loading()
         self.file_label.configure(text=os.path.basename(path) + " (읽기 실패)")
         self.status.configure(text="")
         messagebox.showerror("파일 읽기 실패", msg)
@@ -856,7 +910,8 @@ class App(tk.Tk):
             set_audiveris_path(path)
             self.status.configure(text="Audiveris 위치를 저장했습니다")
 
-    def _loaded(self, path, song):
+    def _loaded(self, path, song, from_file=False):
+        loading = getattr(self, "_loading", None) if from_file else None
         self.song = song
         omr = getattr(song, "omr_files", [])
         reused = getattr(song, "omr_reused", False)
@@ -864,11 +919,62 @@ class App(tk.Tk):
             self.re_ocr.set(False)   # 한 번 인식했으면 다음에 실수로 또 인식하지 않게 끈다
         self.file_label.configure(text=os.path.basename(path) + (
             "  (기존 인식 결과 사용)" if reused else "  (악보 인식 완료)" if omr else ""))
+        self._show_tracks(path)
+        if not loading:               # 붙여넣기·직접 입력: 바로 변환
+            self.convert()
+            self._after_convert_notes(reused)
+            return
+        # 파일: MML 만들기도 백그라운드에서 해 창이 멈추지 않게 한다 (큰 MIDI 는 몇 분 걸릴 수 있음)
+        prog, win = loading
+        notes = sum(len(t.notes) for t in song.tracks)
+        per_k = load_config().get(progress_ui.CFG_CONVERT_SPEED) or progress_ui.DEFAULT_CONVERT_SEC_PER_K_NOTES
+        prog.stage(len(prog.stages) - 1, expected=max(0.5, notes / 1000 * per_k), detail=f"음표 {notes:,}개")
+        try:
+            opts = self._convert_options()          # tk 변수는 메인 스레드에서 읽는다
+        except Exception as e:  # noqa: BLE001
+            self._end_loading()
+            messagebox.showerror("변환 실패", str(e))
+            return
+
+        def work():
+            started = time.monotonic()
+            try:
+                result = convert_song(song, opts)
+                _remember_convert_speed(notes, time.monotonic() - started)
+                self.after(0, lambda: self._converted(song, result, prog, reused, omr))
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+                self.after(0, lambda: (self._end_loading(), messagebox.showerror("변환 실패", msg)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _converted(self, song, result, prog, reused, omr):
+        if prog.cancel_event.is_set() or song is not self.song:
+            self._end_loading()
+            self.status.configure(text="MML 만들기를 취소했습니다. 설정을 바꾸거나 '변환'을 누르면 다시 만듭니다")
+            return
+        loading = self._loading
+        if loading:
+            loading[1].update_now()
+        try:
+            self.convert(result=result)      # 탭 그리기는 메인 스레드에서
+        finally:
+            self._end_loading()
+        self._after_convert_notes(reused)
         if omr and not reused:
             messagebox.showinfo("악보 인식 완료",
                                 "인식된 악보를 저장했습니다:\n" + "\n".join(omr) +
                                 "\n\n악보 인식은 틀리는 음이 있을 수 있습니다. 미리듣기로 확인하고, "
                                 "틀린 곳은 MuseScore 등에서 이 파일을 고친 뒤 다시 열어 변환하세요.")
+
+    def _after_convert_notes(self, reused):
+        if reused:
+            self.status.configure(text=self.status.cget("text") +
+                                  " · 기존 인식 결과 사용 (새로 하려면 '다시 인식'을 켜고 파일을 다시 여세요)")
+        if self._load_note:
+            self.status.configure(text=self.status.cget("text") + " · " + self._load_note)
+            self._load_note = ""
+
+    def _show_tracks(self, path):
         self.path = path
         for w in self.track_inner.winfo_children():
             w.destroy()
@@ -883,13 +989,6 @@ class App(tk.Tk):
             v.trace_add("write", self._schedule_live)
             self.role_vars.append(v)
         self.status.configure(text="")
-        self.convert()
-        if reused:
-            self.status.configure(text=self.status.cget("text") +
-                                  " · 기존 인식 결과 사용 (새로 하려면 '다시 인식'을 켜고 파일을 다시 여세요)")
-        if self._load_note:
-            self.status.configure(text=self.status.cget("text") + " · " + self._load_note)
-            self._load_note = ""
 
     def _convert_options(self):
         roles = {}
@@ -970,21 +1069,25 @@ class App(tk.Tk):
 
     def _live_convert(self):
         self._live_job = None
-        if self.song:
+        if self.song and not getattr(self, "_loading", None):   # 불러오는 중이면 끝난 뒤 결과를 쓴다
             self.convert(live=True)
 
-    def convert(self, live=False):
-        if not self.song:
-            messagebox.showinfo("안내", "먼저 파일을 여세요")
-            return
-        try:
-            result = convert_song(self.song, self._convert_options())
-        except Exception as e:  # noqa: BLE001
-            if live:   # 숫자를 입력하는 도중일 수 있으므로 창을 띄우지 않는다
-                self.status.configure(text="설정값을 확인하세요")
-            else:
-                messagebox.showerror("변환 실패", str(e))
-            return
+    def convert(self, live=False, result=None):
+        if result is None:
+            if not self.song:
+                messagebox.showinfo("안내", "먼저 파일을 여세요")
+                return
+            if getattr(self, "_loading", None):
+                self.status.configure(text="아직 불러오는 중입니다")
+                return
+            try:
+                result = convert_song(self.song, self._convert_options())
+            except Exception as e:  # noqa: BLE001
+                if live:   # 숫자를 입력하는 도중일 수 있으므로 창을 띄우지 않는다
+                    self.status.configure(text="설정값을 확인하세요")
+                else:
+                    messagebox.showerror("변환 실패", str(e))
+                return
         self.result = result
         stopped = self.player.is_playing()
         if stopped:

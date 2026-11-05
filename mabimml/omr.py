@@ -129,9 +129,10 @@ def backup_results(path):
     return moved
 
 
-def recognize(path, audiveris=None, keep_dir=None, timeout=1800, log=None):
+def recognize(path, audiveris=None, keep_dir=None, timeout=1800, log=None, progress=None):
     """악보 PDF/이미지를 인식해 MusicXML 파일 경로 목록(악장 순서)을 돌려준다.
-    keep_dir 를 주면 인식된 .mxl 을 그 폴더에 복사해 둔다 (악보 프로그램에서 고칠 수 있게)."""
+    keep_dir 를 주면 인식된 .mxl 을 그 폴더에 복사해 둔다 (악보 프로그램에서 고칠 수 있게).
+    progress(progress.Progress) 를 주면 로그로 진행률을 알리고, 취소하면 Audiveris 를 끝낸다."""
     exe = audiveris or find_audiveris()
     if not exe or not os.path.isfile(exe):
         raise OMRError(NOT_FOUND_MSG)
@@ -143,8 +144,11 @@ def recognize(path, audiveris=None, keep_dir=None, timeout=1800, log=None):
     if log:
         log("악보 인식 중… (페이지 수에 따라 몇 분 걸릴 수 있습니다)")
     try:
-        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=timeout, **kw)
+        if progress is None:      # 명령줄·시험: 예전처럼 한 번에 실행
+            proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  timeout=timeout, **kw)
+        else:                     # 창: 출력 줄을 읽어 진행률을 알리고 취소할 수 있게
+            proc = _run_audiveris(cmd, timeout, kw, path, progress)
     except subprocess.TimeoutExpired:
         raise OMRError("악보 인식이 너무 오래 걸려 중단했습니다")
     except OSError as e:
@@ -174,6 +178,58 @@ def recognize(path, audiveris=None, keep_dir=None, timeout=1800, log=None):
                 kept.append(f)
         return kept
     return found
+
+
+class _Done:
+    def __init__(self, returncode, stdout):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def _run_audiveris(cmd, timeout, kw, path, progress):
+    """Audiveris 를 실행하고 출력 줄을 읽어 진행률을 알린다. 취소되면 progress.Cancelled."""
+    from .progress import AudiverisProgress, Cancelled, count_pdf_pages
+    import threading
+    import time
+    pages = count_pdf_pages(path)
+    meter = AudiverisProgress(pages)
+    start = time.monotonic()
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kw)
+    if progress is not None:
+        progress.add_process(proc)
+    lines = []
+
+    def reader():
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace")
+            lines.append(line)
+            if len(lines) > 4000:
+                del lines[:2000]
+            if meter.feed(line) and progress is not None:
+                total = meter.sheets
+                detail = f"{meter.current_sheet}/{total}장 인식 중" if total and meter.current_sheet else ""
+                if meter.exporting:
+                    detail = "악보 파일로 내보내는 중"
+                progress.set(meter.fraction(), detail)
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise
+    t.join(5)
+    if progress is not None:
+        if progress.cancel_event.is_set():
+            raise Cancelled()
+        sheets = meter.sheets or pages
+        if proc.returncode == 0 and sheets:
+            from .progress import CFG_OMR_SPEED, update_average
+            cfg = load_config()
+            cfg[CFG_OMR_SPEED] = round(update_average(cfg.get(CFG_OMR_SPEED), (time.monotonic() - start) / sheets), 2)
+            save_config(cfg)
+    return _Done(proc.returncode, "".join(lines).encode("utf-8"))
 
 
 def _movement_key(p):

@@ -44,8 +44,26 @@ def preview_program(instrument):
 _LOW_LIMIT_INSTRUMENTS = {INSTRUMENT_DEFAULT, "류트", "우쿨렐레", "만돌린"}   # 낮은 음을 실제로 올리는 악기
 
 
-def load_song(path, audiveris=None, log=None, keep_omr=True, pedal=True, expression=True, re_ocr=False):
+def will_recognize(path, keep_omr=True, re_ocr=False):
+    """이 파일을 열면 Audiveris 인식을 새로 하는가 (저장된 인식 결과가 없거나 다시 인식)."""
+    if os.path.splitext(path)[1].lower() not in OMR_EXTS:
+        return False
+    return re_ocr or not keep_omr or not existing_results(path)
+
+
+def load_song(path, audiveris=None, log=None, keep_omr=True, pedal=True, expression=True, re_ocr=False,
+              progress=None):
+    """progress(progress.Progress)를 주면 단계를 알린다: 인식할 때 0=PDF 인식, 1=악보 읽기, 아니면 0=파일 읽기."""
     ext = os.path.splitext(path)[1].lower()
+    if progress is not None and not will_recognize(path, keep_omr, re_ocr):
+        from .progress import CFG_READ_SPEED, DEFAULT_READ_SEC_PER_MB
+        from .omr import load_config
+        try:
+            mb = os.path.getsize(path) / 1048576
+        except OSError:
+            mb = 0
+        speed = load_config().get(CFG_READ_SPEED) or DEFAULT_READ_SEC_PER_MB
+        progress.stage(0, expected=max(0.5, mb * speed))
     if ext in OMR_EXTS:
         keep = os.path.dirname(os.path.abspath(path)) if keep_omr else None
         # 이미 인식해 둔 파일이 있으면 그것을 읽는다 (악보 프로그램에서 고친 내용을 지키기 위해)
@@ -57,7 +75,16 @@ def load_song(path, audiveris=None, log=None, keep_omr=True, pedal=True, express
             song.omr_files = files
             song.omr_reused = True
             return song
-        files = recognize(path, audiveris=audiveris, keep_dir=keep, log=log)
+        if progress is not None:
+            from .progress import CFG_OMR_SPEED, DEFAULT_OMR_SEC_PER_PAGE, count_pdf_pages
+            from .omr import load_config
+            pages = count_pdf_pages(path) or 1
+            speed = load_config().get(CFG_OMR_SPEED) or DEFAULT_OMR_SEC_PER_PAGE
+            progress.stage(0, expected=pages * speed, detail=f"{pages}쪽, Audiveris 준비 중")
+        files = recognize(path, audiveris=audiveris, keep_dir=keep, log=log, progress=progress)
+        if progress is not None:
+            progress.check()
+            progress.stage(1, expected=max(0.5, 0.3 * len(files)))
         song = merge_songs([read_musicxml(f) for f in files])
         song.omr_files = files
         return song
