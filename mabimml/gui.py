@@ -405,7 +405,7 @@ class App(tk.Tk):
         cfg = self._ai_config()
         key = ai.builtin_key() or ai.decode_key(cfg["key"])
         if not key:
-            self.ai_label.configure(text="앱에 API 키가 들어 있지 않습니다 (mabimml\\assets\\api_key.txt)")
+            self.ai_label.configure(text="AI 명령은 준비 중이에요. 곧 업데이트로 켜질 예정이에요 (다른 기능은 그대로 쓸 수 있어요)")
             return
         choices = self._ai_choices()
         params = ai.build_request(command, self._ai_state(), self._ai_song_info(),

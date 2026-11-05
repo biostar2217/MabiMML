@@ -34,6 +34,15 @@ VERSION_INFO = """VSVersionInfo(
 """
 
 
+def _assets_without_key(work):
+    """평문 키(api_key.txt)를 뺀 assets 사본 경로."""
+    staged = os.path.join(work, "assets")
+    shutil.rmtree(staged, ignore_errors=True)
+    shutil.copytree(os.path.join(ROOT, "mabimml", "assets"), staged,
+                    ignore=shutil.ignore_patterns("api_key.txt", "api_key.example.txt"))
+    return staged
+
+
 def build_exe():
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(WORK)
@@ -44,7 +53,7 @@ def build_exe():
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--windowed",
                     "--name", "MabiMML", "--version-file", info,
                     "--icon", os.path.join(ROOT, "mabimml", "assets", "app.ico"),
-                    "--add-data", os.path.join(ROOT, "mabimml", "assets") + os.pathsep + "mabimml/assets",
+                    "--add-data", _assets_without_key(WORK) + os.pathsep + "mabimml/assets",
                     "--distpath", os.path.join(WORK, "dist"),
                     "--workpath", os.path.join(WORK, "work"), "--specpath", WORK,
                     os.path.join(ROOT, "run_gui.py")], check=True, cwd=ROOT)
@@ -77,16 +86,14 @@ def build_portable():
     with open(info, "w", encoding="utf-8") as f:
         f.write(VERSION_INFO.format(v=", ".join(nums), d=".".join(nums)))
     # assets 는 api_key.txt(평문 키)를 뺀 사본을 넣고, 키는 가린 형태(_k.py)로만 넣는다
-    src_assets = os.path.join(ROOT, "mabimml", "assets")
-    staged = os.path.join(work, "assets")
-    shutil.rmtree(staged, ignore_errors=True)
-    shutil.copytree(src_assets, staged, ignore=shutil.ignore_patterns("api_key.txt"))
-    assets = staged + os.pathsep + "mabimml/assets"
+    assets = _assets_without_key(work) + os.pathsep + "mabimml/assets"
     from mabimml import ai, keyobf
     key_module = os.path.join(ROOT, "mabimml", "_k.py")
     if os.path.exists(key_module):      # 지난 빌드가 중간에 멈춰 남은 파일은 버리고 api_key.txt 에서 새로 만든다
         os.remove(key_module)
-    key = ai.builtin_key()
+    # 공개 릴리스(GitHub)용 기본값은 키 없이 빌드. 가린 키도 exe 를 분석하면 꺼낼 수 있다.
+    # 키를 넣어야 하는 비공개 배포만 'python build_release.py portable --with-key'.
+    key = ai.builtin_key() if "--with-key" in sys.argv else ""
     if key:
         with open(key_module, "w", encoding="utf-8") as f:
             f.write(keyobf.module_text(key))
