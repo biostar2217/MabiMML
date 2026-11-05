@@ -1,0 +1,30 @@
+# 비밀: 실제 API 키와 빌드 때 생기는 가린 키 파일
+mabimml/assets/api_key.txt
+mabimml/_k.py
+*.key
+.env
+.env.*
+
+# 파이썬 / 빌드 산출물
+__pycache__/
+*.pyc
+.venv*/
+build/
+dist/
+_build/
+배포/
+*.exe
+*.zip
+*.spec.bak
+
+# 큰 외부 프로그램과 설치된 패키지 (README 의 '개발 환경' 참고)
+audiveris/
+vendor/
+
+# 사용자 곡·인식 결과
+*.mxl
+*.mid
+*.midi
+*.mml
+*.pdf
+!라이선스/*
