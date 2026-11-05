@@ -1,3 +1,0 @@
-# 이 파일을 api_key.txt 로 복사하고 아래 줄을 자기 Anthropic API 키로 바꾸세요.
-# api_key.txt 는 .gitignore 에 있어 커밋되지 않습니다.
-YOUR_ANTHROPIC_API_KEY
