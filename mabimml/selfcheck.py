@@ -34,7 +34,8 @@ def run_check(report, song_file=None, ai_mode=None):
     real_ai = omr.load_config().get("ai") if ai_mode == "ai" else None
     if ai_mode == "ai" and not real_ai:
         from . import ai as _ai
-        real_ai = {} if not _ai.builtin_key() else {"builtin": True}   # 내장 키로 시험
+        # 내장 키가 있으면 그 키로, 없으면(공개 배포판) 웹서버 중계로 시험
+        real_ai = {"builtin": True} if _ai.builtin_key() else {"relay": True}
     omr.CONFIG_PATH = os.path.join(work, "config.json")
     if real_ai:
         omr.save_config({"ai": real_ai})

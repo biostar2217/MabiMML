@@ -1,8 +1,13 @@
-# 마비노기 MML 변환기 (PC판) v1.5
+# 마비노기 MML 변환기 (PC판) v1.6
 
 제작: LT 남븝
 
 **항상 최신 버전 받기:** https://github.com/biostar2217/MabiMML/releases/latest/download/MabiMML_PDF.exe
+
+## v1.6 변경 내역
+- AI 명령 다시 켬: 키는 웹서버(nambebmabi.com 중계)에만 있고 프로그램에는 없음
+- '불러오는 중' 창: PDF 인식, 큰 파일 읽기, MML 만들기의 단계, 진행 막대, 지난 시간, 남은 시간, 취소
+- 큰 MIDI 를 열 때 창이 멈추지 않음 (MML 만들기를 뒤에서 함)
 
 ## v1.5 변경 내역
 - 자동 업데이트: 시작할 때 하루 한 번 새 버전 확인, '업데이트 확인' 버튼, exe 자동 교체 후 다시 실행

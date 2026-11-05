@@ -430,10 +430,7 @@ class App(tk.Tk):
             self.ai_label.configure(text="명령을 적어 주세요")
             return
         cfg = self._ai_config()
-        key = ai.builtin_key() or ai.decode_key(cfg["key"])
-        if not key:
-            self.ai_label.configure(text="AI 명령은 준비 중이에요. 곧 업데이트로 켜질 예정이에요 (다른 기능은 그대로 쓸 수 있어요)")
-            return
+        key = ai.builtin_key() or ai.decode_key(cfg["key"])   # 없으면 웹서버 중계로 묻는다 (공개 배포판)
         choices = self._ai_choices()
         params = ai.build_request(command, self._ai_state(), self._ai_song_info(),
                                   self._ai_mml(), ai.FIXED_MODEL, ai.FIXED_EFFORT,
@@ -443,7 +440,8 @@ class App(tk.Tk):
 
         def work():
             try:
-                data = ai.changes_to_dict(ai.ask(ai.make_client(key), params), choices)
+                answer = ai.ask(ai.make_client(key), params) if key else ai.ask_relay(params, __version__)
+                data = ai.changes_to_dict(answer, choices)
                 self.after(0, lambda: self._ai_apply(data, choices))
             except ai.AIError as e:
                 msg = str(e)

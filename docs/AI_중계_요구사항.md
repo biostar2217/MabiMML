@@ -37,3 +37,9 @@
 ## 앱 쪽 변경 (중계 주소가 정해지면)
 - `ai.make_client()` 에서 키가 없으면 `anthropic.Anthropic(api_key="mabimml-relay", base_url=<중계주소>, default_headers={"X-MabiMML-Version": __version__})`
 - 버전을 올려 릴리스하면 사용자는 자동 업데이트로 받는다.
+
+## 실제 운영 (2026-11-05)
+- 주소: `POST https://nambebmabi.com/mabimml/ai` (v1.6 부터 사용, `mabimml/ai.py` 의 `RELAY_URL`)
+- 요청: `{"app":"MabiMML","version":"1.6","system":"...","messages":[{"role":"user","content":"..."}],"max_tokens":8192}`
+  모델은 서버가 고정한다. output_config 를 쓰지 않으므로 앱이 JSON 스키마를 system 끝에 글로 붙인다.
+- 응답: 성공 `{"ok":true,"text":"...","stop_reason":"...","usage":{...}}`, 실패 `{"ok":false,"error":"rate_limited|too_large|bad_request|upstream_error|disabled","message":"..."}`

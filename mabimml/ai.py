@@ -226,6 +226,89 @@ def ask(client, params):
     return data
 
 
+# ---------- 웹서버 중계 (앱에 키가 없을 때) ----------
+# 키는 웹서버에만 있다. 앱은 system/messages 만 보내고 서버가 Claude 에 물어 답 글만 돌려준다.
+RELAY_URL = "https://nambebmabi.com/mabimml/ai"
+RELAY_MAX_TOKENS = 8192
+_RELAY_ERRORS = {"rate_limited": "AI 사용 횟수 한도에 걸렸습니다. 잠시 뒤 다시 해 보세요",
+                 "too_large": "보내는 내용이 너무 큽니다. 'MML 전체 보내기'를 끄거나 짧은 곡에서 해 보세요",
+                 "bad_request": "요청 모양이 맞지 않습니다. 프로그램을 최신 버전으로 업데이트해 주세요",
+                 "upstream_error": "Claude 서버 오류입니다. 잠시 뒤 다시 해 보세요",
+                 "disabled": "AI 명령이 잠시 꺼져 있습니다. 나중에 다시 해 보세요"}
+
+
+def relay_body(params, version):
+    """build_request 의 결과를 중계 서버 형식으로 바꾼다. 서버가 output_config 를 쓰지 않으므로
+    답 형식(JSON 스키마)은 system 끝에 글로 적는다."""
+    schema = params.get("output_config", {}).get("format", {}).get("schema")
+    system = params.get("system", "")
+    if schema:
+        system += ("\n\n답은 아래 JSON 스키마에 맞는 JSON 객체 하나로만 쓴다. 코드 블록 표시(```)나 다른 글은 쓰지 않는다.\n"
+                   + json.dumps(schema, ensure_ascii=False))
+    messages = []
+    for m in params.get("messages", []):
+        content = m.get("content")
+        if isinstance(content, list):
+            content = "\n\n".join(b.get("text", "") for b in content if b.get("type") == "text")
+        messages.append({"role": m.get("role", "user"), "content": content})
+    return {"app": "MabiMML", "version": str(version), "system": system, "messages": messages,
+            "max_tokens": min(RELAY_MAX_TOKENS, int(params.get("max_tokens", RELAY_MAX_TOKENS)))}
+
+
+def extract_json(text):
+    """답 글에서 JSON 객체를 꺼낸다 (코드 블록이나 앞뒤 글이 붙어 와도)."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    start, end = text.find("{"), text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except ValueError:
+            pass
+    raise AIError("Claude의 답을 읽지 못했습니다")
+
+
+def ask_relay(params, version, url=RELAY_URL, timeout=120, opener=None):
+    """중계 서버로 묻고 (모델의 JSON 답)을 돌려준다. 오류는 한국어 AIError."""
+    import urllib.error
+    import urllib.request
+    opener = opener or urllib.request.urlopen
+    data = json.dumps(relay_body(params, version), ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Content-Type": "application/json; charset=utf-8", "User-Agent": f"MabiMML/{version}",
+        "X-MabiMML-Version": str(version)})
+    try:
+        with opener(req, timeout=timeout) as resp:
+            answer = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            answer = json.loads(e.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            raise AIError(f"AI 중계 서버 오류({e.code})입니다. 잠시 뒤 다시 해 보세요")
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise AIError("AI 서버에 연결하지 못했습니다. 인터넷 연결을 확인하세요")
+    except ValueError:
+        raise AIError("AI 서버의 답을 읽지 못했습니다")
+    if not isinstance(answer, dict):
+        raise AIError("AI 서버의 답을 읽지 못했습니다")
+    if not answer.get("ok"):
+        msg = answer.get("message") or _RELAY_ERRORS.get(answer.get("error"), "AI 서버 오류입니다")
+        raise AIError(msg)
+    stop = answer.get("stop_reason")
+    if stop == "refusal":
+        raise AIError("Claude가 이 요청을 처리하지 않았습니다. 다르게 말해 보세요")
+    if stop == "max_tokens":
+        raise AIError("답이 너무 길어 끊겼습니다. 명령을 짧게 해 보세요")
+    return extract_json(answer.get("text", ""))
+
+
 def check_key(client, model):
     """키가 맞는지 확인 (아주 짧은 요청)."""
     import anthropic
