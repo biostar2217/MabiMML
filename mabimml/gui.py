@@ -20,6 +20,7 @@ from .dnd import enable_drop
 from . import ai
 from . import ime
 from . import theme
+from . import updater
 import threading
 
 ROLE_LABELS = [("자동", "auto"), ("멜로디", "melody"), ("화음1", "chord1"),
@@ -72,6 +73,11 @@ class App(tk.Tk):
                 self._poll_drops()
         except (OSError, AttributeError, ValueError, tk.TclError):
             pass   # 끌어다 놓기만 안 될 뿐 프로그램은 정상 동작
+        # 하루 한 번 백그라운드로 새 버전 확인 (설정에서 끌 수 있음, 실패는 조용히 넘어감)
+        self.after(1500, lambda: updater.startup_check(self, __version__, self._close))
+
+    def check_for_update(self):
+        updater.manual_check(self, __version__, self._close)
 
     def _poll_drops(self):
         if self._drops:
@@ -98,6 +104,7 @@ class App(tk.Tk):
         ttk.Button(top, text="클립보드에서 MML 읽기", command=self.paste_mobile).pack(side="left", padx=6)
         ttk.Button(top, text="초기화", command=self.reset_all).pack(side="left")
         ttk.Button(top, text="Audiveris 위치 설정…", command=self.pick_audiveris).pack(side="right")
+        ttk.Button(top, text="업데이트 확인", command=self.check_for_update).pack(side="right", padx=(0, 6))
         ttk.Combobox(top, textvariable=self.color_theme, width=6, state="readonly",
                      values=list(theme.THEMES)).pack(side="right", padx=(0, 8))
         ttk.Label(top, text="색 테마").pack(side="right", padx=(0, 3))
@@ -230,6 +237,10 @@ class App(tk.Tk):
                         variable=self.keep_original).grid(row=3, column=0, columnspan=6, sticky="w", padx=4)
         ttk.Checkbutton(gf, text="자브키엘 악보집용 (여러 장일 때 장마다 세 파트 길이를 맞추고 템포를 모든 파트에)",
                         variable=self.jabchiel).grid(row=4, column=0, columnspan=6, sticky="w", padx=4)
+        self.update_on_start = tk.BooleanVar(value=updater.auto_check_enabled(load_config()))
+        ttk.Checkbutton(gf, text="시작할 때 업데이트 확인 (하루 한 번)",
+                        variable=self.update_on_start).grid(row=5, column=0, columnspan=6, sticky="w", padx=4)
+        self.update_on_start.trace_add("write", lambda *_: updater.set_auto_check(self.update_on_start.get()))
 
         # 설정을 바꾸면 바로 MML에 반영
         for v in (self.rank, self.no_song, self.grid_var, self.triplet, self.volume, self.fixed_vol,
