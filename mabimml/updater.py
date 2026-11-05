@@ -23,6 +23,8 @@ USER_AGENT = "MabiMML-updater"
 TIMEOUT = 5
 CHECK_INTERVAL = 24 * 60 * 60          # 자동 확인은 하루 한 번
 ASSET_RE = re.compile(r"^MabiMML_v?\d+(?:\.\d+)*_PDF\.exe$", re.IGNORECASE)
+FIXED_ASSET = "MabiMML_PDF.exe"       # 항상 최신 링크용 고정 이름 (releases/latest/download/MabiMML_PDF.exe)
+LATEST_DOWNLOAD = f"https://github.com/{REPO}/releases/latest/download/{FIXED_ASSET}"
 BACKUP_NAME = "MabiMML_이전.exe"
 CFG_LAST = "update_last_check"
 CFG_ENABLED = "update_check_on_start"
@@ -66,13 +68,18 @@ def is_newer(tag, current):
 
 
 def pick_asset(assets):
-    """릴리스 자산 목록에서 MabiMML_vX.Y_PDF.exe 를 고른다. 없으면 None."""
+    """릴리스 자산 목록에서 MabiMML_vX.Y_PDF.exe 를 고르고, 없으면 고정 이름 MabiMML_PDF.exe. 둘 다 없으면 None."""
+    fixed = None
     for a in assets or []:
         name = a.get("name", "")
         url = a.get("browser_download_url", "")
-        if ASSET_RE.match(name) and url:
+        if not url:
+            continue
+        if ASSET_RE.match(name):
             return {"name": name, "url": url, "size": int(a.get("size") or 0)}
-    return None
+        if name.lower() == FIXED_ASSET.lower() and fixed is None:
+            fixed = {"name": name, "url": url, "size": int(a.get("size") or 0)}
+    return fixed
 
 
 # ---------- 조회 ----------

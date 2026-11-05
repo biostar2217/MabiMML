@@ -2,6 +2,8 @@
 
 제작: LT 남븝
 
+**항상 최신 버전 받기:** https://github.com/biostar2217/MabiMML/releases/latest/download/MabiMML_PDF.exe
+
 ## v1.5 변경 내역
 - 자동 업데이트: 시작할 때 하루 한 번 새 버전 확인, '업데이트 확인' 버튼, exe 자동 교체 후 다시 실행
 - 공개 배포판에는 API 키를 넣지 않음: AI 명령은 준비 중 (다른 기능은 그대로)
@@ -160,8 +162,11 @@ python -m mabimml 악보.pdf --audiveris "D:\Audiveris\Audiveris.exe"   # Audive
 ## 릴리스 만드는 법
 1. `mabimml/__init__.py` 의 `__version__` 을 올리고 커밋·푸시합니다 (예: `1.5`).
 2. `build_release.py portable` 로 `MabiMML_v1.5_PDF.exe` 를 만듭니다.
-3. 태그 `v1.5` 로 GitHub 릴리스를 만들고 exe 를 자산으로 올립니다. 자산 이름은 반드시 `MabiMML_vX.Y_PDF.exe` 형식이어야 업데이트가 찾습니다.
-   `gh release create v1.5 ..\_build\portable\MabiMML_v1.5_PDF.exe --title "v1.5" --notes "고친 점"`
+3. 태그 `v1.5` 로 GitHub 릴리스를 만들고 exe 를 **두 이름으로** 올립니다.
+   - `MabiMML_v1.5_PDF.exe` : 업데이트가 먼저 찾는 이름
+   - `MabiMML_PDF.exe` : 같은 파일의 고정 이름. 위의 '항상 최신 버전 받기' 링크가 이 파일을 가리키므로 매번 올립니다.
+   `copy ..\_build\portable\MabiMML_v1.5_PDF.exe ..\_build\portable\MabiMML_PDF.exe`
+   `gh release create v1.5 ..\_build\portable\MabiMML_v1.5_PDF.exe ..\_build\portable\MabiMML_PDF.exe --title "MabiMML v1.5" --notes "고친 점"`
 4. 릴리스 설명(notes)의 앞부분이 업데이트 안내 창에 보입니다.
 
 ## 개발 환경 (저장소에 없는 것)

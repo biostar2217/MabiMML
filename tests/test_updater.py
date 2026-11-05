@@ -1,4 +1,4 @@
-﻿"""자동 업데이트 모듈 시험 (네트워크 없이). python -m unittest tests.test_updater"""
+"""자동 업데이트 모듈 시험 (네트워크 없이). python -m unittest tests.test_updater"""
 import io
 import json
 import os
@@ -63,6 +63,12 @@ class AssetTest(unittest.TestCase):
         a = updater.pick_asset(RELEASE["assets"])
         self.assertEqual(a["name"], "MabiMML_v1.5_PDF.exe")
         self.assertEqual(a["size"], 123)
+
+    def test_fixed_name(self):
+        only_fixed = [{"name": "MabiMML_PDF.exe", "browser_download_url": "https://x/f.exe", "size": 5}]
+        self.assertEqual(updater.pick_asset(only_fixed)["url"], "https://x/f.exe")
+        both = only_fixed + RELEASE["assets"]          # 버전 붙은 이름이 먼저
+        self.assertEqual(updater.pick_asset(both)["name"], "MabiMML_v1.5_PDF.exe")
 
     def test_none(self):
         self.assertIsNone(updater.pick_asset([{"name": "MabiMML_v1.5.exe", "browser_download_url": "u"}]))
