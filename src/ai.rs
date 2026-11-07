@@ -29,7 +29,7 @@ pub const SETTINGS: [(&str, &str); 13] = [
     ("fixed_bpm", "정수, 곡 전체 고정 템포 0~255 (0은 원곡 템포)"),
     ("transpose", "정수, 음 높이(반음, 절대값) -48~48. 12가 한 옥타브"),
     ("part_volume", "정수 세 개를 쉼표로, 파트 음량 멜로디,화음1,화음2 각각 -7~7 (예: 0,-2,-3)"),
-    ("low_limit", "true/false, o2e 아래 음 옥타브 올리기"),
+    ("low_limit", "true/false, o2e 아래 음 옥타브 올리기 (류트·우쿨렐레·만돌린 계열만 올리고, 음역이 정해진 악기는 음역에 맞춰 자동으로 옮긴다). 낮은 음 안내가 있어도 곡 전체 transpose 로 고치지 말 것: 높은 음이 범위를 넘는다"),
     ("tempo_all_parts", "true/false, 템포를 모든 파트에 적기"),
     ("no_song", "true/false, 노래 파트 제외 한도(1랭크 1600/1200/900) 사용"),
     ("split_players", "true/false, 4파트 이상 모바일 MML을 두 사람 악보로"),

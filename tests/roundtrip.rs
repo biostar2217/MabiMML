@@ -234,9 +234,13 @@ fn lecture_rules() {
     let mut ps: Vec<i64> = read_midi(&pv, true, true).unwrap().tracks.iter().flat_map(|t| t.notes.iter().map(|n| n.pitch)).collect();
     ps.sort();
     assert_eq!(ps, vec![72, 76]);
-    let r = one(vec![n(0.0, 96.0, 39, 100.0)], "", Options { instrument: "피아노".into(), transpose: 12, ..opts() });
+    let r = one(vec![n(0.0, 96.0, 39, 100.0)], "", Options { instrument: "튜닝 플루트".into(), transpose: 12, ..opts() });
     assert_eq!(r.parts_notes[0][0].pitch, 39);
     assert!(r.warnings.iter().any(|w| w.contains("안 날 수") && w.contains("마디 1")));
+    // 피아노는 o2e 아래도 나므로 안내하지 않는다
+    let r = one(vec![n(0.0, 96.0, 39, 100.0)], "", Options { instrument: "피아노".into(), transpose: 12, ..opts() });
+    assert_eq!(r.parts_notes[0][0].pitch, 39);
+    assert!(!r.warnings.iter().any(|w| w.contains("안 날 수")));
     assert_eq!(one(vec![n(0.0, 96.0, 39, 100.0)], "", Options { instrument: "만돌린".into(), ..opts() }).parts_notes[0][0].pitch, 51);
     assert!(one(base.clone(), "", Options { instrument: "실로폰".into(), ..opts() }).warnings.iter().any(|w| w.contains("한 파트 악기")));
     // 낮은 음
