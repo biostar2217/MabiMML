@@ -1,4 +1,4 @@
-# 마비노기 MML 변환기 v2.4.4 (Rust판)
+# 마비노기 MML 변환기 v2.4.5 (Rust판)
 
 MIDI · MusicXML · 악보 PDF/이미지 · 이미 만든 MML 을 PC판 마비노기 작곡 악보(`MML@멜로디,화음1,화음2;`)로 바꿔 주는 프로그램입니다.
 파이썬판 v1.6 의 모든 기능을 Rust 로 처음부터 다시 만들었고, **같은 입력·같은 설정이면 결과 MML 이 파이썬판과 글자 하나까지 같습니다** (아래 비교표).
@@ -27,6 +27,7 @@ MIDI · MusicXML · 악보 PDF/이미지 · 이미 만든 MML 을 PC판 마비�
 - **v2.4.2**: AI 명령이 MML을 직접 고칠 수 있음(특정 음·마디 고치기 등, 문법 검사와 되돌리기). 피아노·리라·하프·실로폰·첼로·바이올린 음역을 넣어 'o2e 아래 음이 안 날 수 있다'는 잘못된 안내를 없앰.
 - **v2.4.3**: 악보 보기에서 악보(장) 경계와 이름을 표시하고 장마다 바탕을 번갈아 칠함(고른 장은 진하게). 합주·전체 보기에서 악보 단추를 누르면 그 장으로 이동.
 - **v2.4.4**: 드럼 트랙이 없는 곡도 합주에서 박자에 맞춘 드럼(킥·스네어·하이햇, 8마디마다 크래시와 필인)을 자동으로 만들어 드럼 세트 합주자로 넣을 수 있음 (AI 명령, `--auto-drums`). AI 답 대기 시간 300초.
+- **v2.4.5**: 악보 보기를 프로그램 오른쪽에 따로 띄우는 창(크기 조절, '창 합치기'). 재생 위치 따라가기 버그 고침(재생선이 뒤로 튀며 화면이 왔다 갔다 하던 것, 쪽 어긋남 등).
 - 결과 텍스트 저장, 악보별 저장, 초기화, 보라/포도주 색 테마, 설정 기억
 - **자동 업데이트**: GitHub 릴리스(태그 `vX.Y`, 자산 `MabiMML_vX.Y_PDF.exe` 또는 고정 이름 `MabiMML_PDF.exe`)를 하루 한 번 확인
 - **AI 명령**: 웹서버 중계(`https://nambebmabi.com/mabimml/ai`)로 Claude 에게 묻고 설정만 바꿉니다. **앱과 저장소에는 API 키가 없습니다.** 요청 형식은 파이썬판 v1.6 `ai.ask_relay` 와 바이트까지 같습니다 (`docs/AI_중계_요구사항.md`).
@@ -70,7 +71,7 @@ cargo test
 `%LOCALAPPDATA%\MabiMMLudiveris_<해시>` 에 한 번만 풀어 쓰고, 새 판이 나오면 이전 폴더는 지웁니다.
 
 ```bash
-cargo build --release && target/release/mabimml-pack.exe target/release/mabimml.exe <audiveris 폴더> MabiMML_v2.4.4_PDF.exe
+cargo build --release && target/release/mabimml-pack.exe target/release/mabimml.exe <audiveris 폴더> MabiMML_v2.4.5_PDF.exe
 ```
 
 릴리스 자산은 `MabiMML_vX.Y_PDF.exe` 와 같은 파일의 고정 이름 `MabiMML_PDF.exe`, 그리고 `MabiMML_vX.Y_LICENSES.txt` 입니다.
