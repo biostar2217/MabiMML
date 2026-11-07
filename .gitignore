@@ -1,25 +1,16 @@
-# 비밀: 실제 API 키와 빌드 때 생기는 가린 키 파일
-mabimml/assets/api_key.txt
-mabimml/_k.py
+# 비밀: API 키는 앱·저장소 어디에도 두지 않는다 (AI 명령은 웹서버 중계를 쓴다)
+api_key.txt
 *.key
 .env
 .env.*
+_k.rs
+mabimml/assets/api_key.txt
 
-# 파이썬 / 빌드 산출물
-__pycache__/
-*.pyc
-.venv*/
-build/
-dist/
-_build/
-배포/
+# 빌드 산출물
+/target/
 *.exe
 *.zip
-*.spec.bak
-
-# 큰 외부 프로그램과 설치된 패키지 (README 의 '개발 환경' 참고)
-audiveris/
-vendor/
+*.pdb
 
 # 사용자 곡·인식 결과
 *.mxl
@@ -27,4 +18,4 @@ vendor/
 *.midi
 *.mml
 *.pdf
-!라이선스/*
+!tests/sample.musicxml
