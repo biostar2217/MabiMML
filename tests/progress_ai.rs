@@ -262,3 +262,34 @@ fn ai_player_instruments_and_drums() {
     let (_, rej) = ai::validate(&ai::changes_to_dict(&bad, &c), &c);
     assert_eq!(rej.len(), 1);
 }
+
+#[test]
+fn ai_mml_edits_parse() {
+    let c = ai::Choices::new();
+    let data = serde_json::json!({"changes": [], "reply": "고쳤어요",
+        "mml_edits": [{"sheet": 2, "part": "화음1", "mml": "MML@t120 c4 d4;"}, {"sheet": 1, "part": "없는파트", "mml": "c"}]});
+    let d = ai::changes_to_dict(&data, &c);
+    let (ok, rejected) = ai::validate(&d, &c);
+    assert!(ok.is_empty() && rejected.is_empty());
+    assert_eq!(ai::mml_edits(&d), vec![(1usize, 1usize, "t120c4d4".to_string())]);
+}
+
+/// 실제 중계 서버로 MML 고치기를 한 번 묻는다: MABIMML_LIVE_AI=1 cargo test --test progress_ai live_mml_edit -- --nocapture
+#[test]
+fn live_mml_edit() {
+    if std::env::var("MABIMML_LIVE_AI").is_err() {
+        return;
+    }
+    let c = ai::Choices::new();
+    let state = serde_json::json!({"instrument": "그대로 (류트 등)"});
+    let info = serde_json::json!({"파일": "test.mid", "악보": [{"장": 1, "글자 수": [16, 8, 0], "한도": [1600, 1200, 900]}]});
+    let mml = serde_json::json!({"악보 1": {"멜로디": "t120l4cdefgab>c", "화음1": "l2<c<g", "화음2": ""}});
+    let body = ai::build_request("멜로디의 마지막 음(높은 도)만 한 옥타브 낮춰 줘", &state, &info, Some(&mml), &c);
+    let data = ai::ask_relay(&body, mabimml::VERSION, ai::RELAY_URL).unwrap();
+    let d = ai::changes_to_dict(&data, &c);
+    println!("답: {:?}", d);
+    let edits = ai::mml_edits(&d);
+    assert!(!edits.is_empty(), "{:?}", d);
+    let (notes, _, _) = mabimml::mml_parser::parse_part(&edits[0].2).unwrap();
+    println!("고친 멜로디: {} -> 음 {:?}", edits[0].2, notes.iter().map(|n| n.pitch).collect::<Vec<_>>());
+}

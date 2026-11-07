@@ -289,6 +289,8 @@ pub struct App {
     ai_entry: String,
     ai_label: String,
     ai_undo: Option<serde_json::Map<String, Value>>,
+    /// AI 가 MML 을 고치기 전의 결과 글 (되돌리기)
+    ai_undo_texts: Option<Vec<String>>,
     ai_rx: Option<Receiver<Result<serde_json::Map<String, Value>, String>>>,
     // 업데이트
     update_rx: Option<(Receiver<updater::CheckResult>, bool)>,
@@ -372,6 +374,7 @@ impl App {
             ai_entry: String::new(),
             ai_label: AI_HINT.into(),
             ai_undo: None,
+            ai_undo_texts: None,
             ai_rx: None,
             update_rx: None,
             download: None,
@@ -724,6 +727,7 @@ impl App {
         self.direct_status.clear();
         self.ai_entry.clear();
         self.ai_undo = None;
+        self.ai_undo_texts = None;
         self.ai_label = AI_HINT.into();
         self.path.clear();
         self.file_label = FILE_HINT.into();
@@ -1565,16 +1569,68 @@ impl App {
     fn ai_mml(&self) -> Option<Value> {
         self.result.as_ref()?;
         let mut sheets = serde_json::Map::new();
+        let res = self.result.as_ref()?;
         for (i, text) in self.score_texts.iter().enumerate() {
             let t = text.trim();
             let parts = if t.is_empty() { vec![] } else { split_parts(t) };
             let mut m = serde_json::Map::new();
+            if let Some(sc) = res.scores.get(i) {
+                if sc.player != 0 {
+                    m.insert("합주자".into(), json!(sc.player));
+                }
+                if !sc.instrument.is_empty() {
+                    m.insert("악기".into(), json!(sc.instrument));
+                }
+            }
             for (k, name) in PART_NAMES.iter().enumerate() {
                 m.insert(name.to_string(), json!(parts.get(k).cloned().unwrap_or_default()));
             }
             sheets.insert(format!("악보 {}", i + 1), Value::Object(m));
         }
         Some(Value::Object(sheets))
+    }
+
+    /// AI 가 고친 MML 을 결과 글에 넣는다. (고친 곳 수, 못 넣은 이유들)
+    fn apply_mml_edits(&mut self, edits: &[(usize, usize, String)]) -> (usize, Vec<String>) {
+        let before = self.score_texts.clone();
+        let limits = self.result.as_ref().map(|r| r.limits).unwrap_or([i64::MAX; 3]);
+        let mut done = 0;
+        let mut problems = Vec::new();
+        for (sheet, part, mml) in edits {
+            let Some(text) = self.score_texts.get(*sheet).cloned() else {
+                problems.push(format!("악보 {} 없음", sheet + 1));
+                continue;
+            };
+            if let Err(e) = parse_part(mml) {
+                problems.push(format!("악보 {} {}: MML 오류 ({})", sheet + 1, PART_NAMES[*part], e));
+                continue;
+            }
+            let mut parts = split_clipboard(text.trim());
+            while parts.len() < 3 {
+                parts.push(String::new());
+            }
+            if parts[*part] == *mml {
+                continue;
+            }
+            let len = mml.chars().count() as i64;
+            if len > limits[*part] {
+                problems.push(format!("악보 {} {}: 글자 수 {}이 한도 {}를 넘음", sheet + 1, PART_NAMES[*part], len, limits[*part]));
+            }
+            parts[*part] = mml.clone();
+            while parts.len() > 1 && parts.last().map(|p| p.is_empty()).unwrap_or(false) && parts.len() > 3 {
+                parts.pop();
+            }
+            self.score_texts[*sheet] = format!("MML@{};", parts.join(","));
+            done += 1;
+        }
+        if done > 0 {
+            self.ai_undo_texts = Some(before);
+            self.ai_undo = None;
+            if self.player.is_playing() {
+                self.player.stop();
+            }
+        }
+        (done, problems)
     }
 
     fn poll_ai(&mut self) {
@@ -1587,11 +1643,24 @@ impl App {
                 let choices = self.ai_choices();
                 let (changes, rejected) = ai::validate(&data, &choices);
                 let reply = data.get("reply").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let edits = ai::mml_edits(&data);
+                let mut note = reply;
                 if !changes.is_empty() {
                     self.ai_undo = Some(self.ai_state());
+                    self.ai_undo_texts = None;
                     self.ai_set(&changes);
+                    if !edits.is_empty() {
+                        note += "  (설정을 바꿔 MML이 다시 만들어지므로 MML 고침은 적용하지 않았습니다. 한 번 더 명령해 주세요)";
+                    }
+                } else if !edits.is_empty() {
+                    let (done, problems) = self.apply_mml_edits(&edits);
+                    if done > 0 {
+                        note += &format!("  (MML {}곳을 고쳤습니다. 마음에 안 들면 '되돌리기')", done);
+                    }
+                    if !problems.is_empty() {
+                        note += &format!("  (적용 못 함: {})", problems.join(", "));
+                    }
                 }
-                let mut note = reply;
                 if !rejected.is_empty() {
                     note += &format!("  (범위 밖이라 무시: {})", rejected.join(", "));
                 }
@@ -2000,9 +2069,14 @@ impl App {
                     self.ai_run();
                 }
             });
-            ui.add_enabled_ui(self.ai_undo.is_some(), |ui| {
+            ui.add_enabled_ui(self.ai_undo.is_some() || self.ai_undo_texts.is_some(), |ui| {
                 if ui.button("되돌리기").clicked() {
-                    if let Some(u) = self.ai_undo.take() {
+                    if let Some(t) = self.ai_undo_texts.take() {
+                        if t.len() == self.score_texts.len() {
+                            self.score_texts = t;
+                        }
+                        self.ai_label = "AI가 고친 MML을 되돌렸습니다".into();
+                    } else if let Some(u) = self.ai_undo.take() {
                         self.ai_set(&u);
                         self.ai_label = "AI가 바꾼 설정을 되돌렸습니다".into();
                     }
@@ -2083,7 +2157,8 @@ impl App {
             let i = self.tab.min(self.score_texts.len() - 1);
             let res = self.result.clone().unwrap();
             ui.horizontal(|ui| {
-                let lens = res.scores[i].lengths();
+                // 고친 글(직접 또는 AI)의 글자 수
+                let lens: Vec<i64> = split_clipboard(self.score_texts[i].trim()).iter().map(|p| p.chars().count() as i64).collect();
                 for k in 0..3 {
                     length_meter(ui, &p, PART_NAMES[k], lens.get(k).copied().unwrap_or(0), res.limits[k]);
                 }
