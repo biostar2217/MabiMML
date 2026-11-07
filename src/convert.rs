@@ -1127,40 +1127,48 @@ fn convert_ensemble(song: &Song, opts: &Options) -> Res<ConvResult> {
     let (_, (parts, tempos, limits, grid), mut warnings, moved) = best.unwrap();
     let n = parts.len() / 3;
     let shift = -instrument_shift(&opts.instrument);
-    let mut scores: Vec<Score> = Vec::new();
     let mut empty_players = Vec::new();
-    for (p, chunk) in parts.chunks(3).enumerate() {
-        let end = max_end(chunk);
-        if chunk.iter().all(|v| v.iter().all(|x| x.vel == 0.0)) || end <= 0 {
-            empty_players.push((p + 1).to_string());
-            let mut sc = Score::new(vec![String::new(); 3], 0.0, 0.0);
-            sc.player = p as i64 + 1;
-            scores.push(sc);
-            continue;
+    let chunks: Vec<&[Vec<Note>]> = parts.chunks(3).collect();
+    let active: Vec<usize> = (0..chunks.len())
+        .filter(|&p| {
+            let empty = chunks[p].iter().all(|v| v.iter().all(|x| x.vel == 0.0)) || max_end(chunks[p]) <= 0;
+            if empty {
+                empty_players.push((p + 1).to_string());
+            }
+            !empty
+        })
+        .collect();
+    let mut per: Vec<Vec<Score>> = vec![Vec::new(); chunks.len()];
+    let mut all_fit = true;
+    for &p in &active {
+        let whole = encode_segment(chunks[p], &tempos, 0, max_end(chunks[p]), opts)?;
+        all_fit &= fits(&whole, &limits);
+        per[p] = vec![whole];
+    }
+    if !all_fit && opts.fit == "none" {
+        warnings.push("글자 수가 랭크 제한을 넘습니다".into());
+    } else if !all_fit {
+        // 모든 합주자를 같은 마디에서 자르고, 장마다 세 파트 길이를 그 구간 길이로 맞춘다 (장을 바꿀 때 싱크가 맞도록)
+        let o = Options { book: true, tempo_all_parts: true, ..opts.clone() };
+        let end = max_end(&parts);
+        let bars = song_bars(song, &grid, end as f64);
+        let groups: Vec<&[Vec<Note>]> = active.iter().map(|&p| chunks[p]).collect();
+        let split = split_sheets_together(&groups, &tempos, &limits, bars, &o, &mut warnings)?;
+        let pages = split.first().map(|v| v.len()).unwrap_or(0);
+        for (&p, v) in active.iter().zip(split) {
+            per[p] = v;
         }
-        let whole = encode_segment(chunk, &tempos, 0, end, opts)?;
-        let mine = if opts.fit == "none" || fits(&whole, &limits) {
-            if !fits(&whole, &limits) {
-                let w = "글자 수가 랭크 제한을 넘습니다".to_string();
-                if !warnings.contains(&w) {
-                    warnings.push(w);
-                }
-            }
-            vec![whole]
-        } else {
-            let o = if opts.jabchiel && opts.fit == "split" && !opts.book {
-                Options { book: true, tempo_all_parts: true, ..opts.clone() }
-            } else {
-                opts.clone()
-            };
-            let bars = song_bars(song, &grid, end as f64);
-            let v = split_sheets(chunk, &tempos, &limits, bars, &o, &mut warnings)?;
-            if opts.fit == "split" && v.len() > 1 {
-                warnings.push(format!("합주자 {}: 글자 수 제한 때문에 악보 {}장으로 나눴습니다. 순서대로 연주하세요", p + 1, v.len()));
-            }
-            v
-        };
-        for mut sc in mine {
+        if opts.fit == "split" && pages > 1 {
+            warnings.push(format!(
+                "글자 수 제한 때문에 모든 합주자 악보를 같은 마디에서 {}장으로 나눴습니다. 장마다 모두 함께 시작하세요 (장 길이도 모두 같습니다)",
+                pages
+            ));
+        }
+    }
+    let mut scores: Vec<Score> = Vec::new();
+    for (p, v) in per.into_iter().enumerate() {
+        let v = if v.is_empty() { vec![Score::new(vec![String::new(); 3], 0.0, 0.0)] } else { v };
+        for mut sc in v {
             sc.player = p as i64 + 1;
             scores.push(sc);
         }
@@ -1193,19 +1201,33 @@ fn split_sheets(
     parts: &[Vec<Note>],
     tempos: &[(i64, i64)],
     limits: &[i64; 3],
-    mut bars: Vec<i64>,
+    bars: Vec<i64>,
     opts: &Options,
     warnings: &mut Vec<String>,
 ) -> Res<Vec<Score>> {
+    Ok(split_sheets_together(&[parts], tempos, limits, bars, opts, warnings)?.remove(0))
+}
+
+/// 여러 합주자(세 파트씩)를 모두 같은 마디에서 잘라, 모든 사람이 한도에 맞는 장으로 나눈다.
+/// 돌려주는 값: 합주자마다 악보 목록 (장 수가 모두 같고 k 번째 장은 같은 구간).
+fn split_sheets_together(
+    groups: &[&[Vec<Note>]],
+    tempos: &[(i64, i64)],
+    limits: &[i64; 3],
+    mut bars: Vec<i64>,
+    opts: &Options,
+    warnings: &mut Vec<String>,
+) -> Res<Vec<Vec<Score>>> {
     let book_fix = opts.book && opts.ensemble_fix;
     let opts = &if book_fix { Options { ensemble_fix: false, ..opts.clone() } } else { opts.clone() };
-    let mut scores: Vec<Score> = Vec::new();
+    let mut out: Vec<Vec<Score>> = vec![Vec::new(); groups.len()];
     let mut i = 0usize;
-    let seg = |a: i64, b: i64| encode_segment(parts, tempos, a, b, opts);
+    let seg = |a: i64, b: i64, o: &Options| -> Res<Vec<Score>> { groups.iter().map(|g| encode_segment(g, tempos, a, b, o)).collect() };
+    let ok = |v: &Vec<Score>| v.iter().all(|sc| fits(sc, limits));
     while i + 1 < bars.len() {
         let lo = i + 1;
         let best;
-        if !fits(&seg(bars[i], bars[lo])?, limits) {
+        if !ok(&seg(bars[i], bars[lo], opts)?) {
             // 한 마디가 한도를 넘으면 박 단위로 잘라 다시 시도한다
             let first = bars[i] - bars[i].rem_euclid(96) + 96;
             let beats: Vec<i64> = (first..bars[lo]).step_by(96).collect();
@@ -1219,14 +1241,14 @@ fn split_sheets(
             let hi = bars.len() - 1;
             let mut b = lo;
             let mut step = 1;
-            while b + step <= hi && fits(&seg(bars[i], bars[b + step])?, limits) {
+            while b + step <= hi && ok(&seg(bars[i], bars[b + step], opts)?) {
                 b += step;
                 step *= 2;
             }
             let (mut left, mut right) = (b as i64 + 1, hi.min(b + step) as i64);
             while left <= right {
                 let mid = ((left + right) / 2) as usize;
-                if fits(&seg(bars[i], bars[mid])?, limits) {
+                if ok(&seg(bars[i], bars[mid], opts)?) {
                     b = mid;
                     left = mid as i64 + 1;
                 } else {
@@ -1235,7 +1257,9 @@ fn split_sheets(
             }
             best = b;
         }
-        scores.push(seg(bars[i], bars[best])?);
+        for (g, sc) in seg(bars[i], bars[best], opts)?.into_iter().enumerate() {
+            out[g].push(sc);
+        }
         i = best;
         report_split_progress(i, bars.len());
         if opts.fit == "truncate" {
@@ -1245,14 +1269,16 @@ fn split_sheets(
             break;
         }
     }
-    if book_fix && !scores.is_empty() {
-        let last = scores.last().unwrap().clone();
-        let fixed = encode_segment(parts, tempos, last.start as i64, last.end as i64, &Options { ensemble_fix: true, ..opts.clone() })?;
-        if fits(&fixed, limits) {
-            *scores.last_mut().unwrap() = fixed;
+    if book_fix && !out[0].is_empty() {
+        let last = out[0].last().unwrap().clone();
+        let fixed = seg(last.start as i64, last.end as i64, &Options { ensemble_fix: true, ..opts.clone() })?;
+        if ok(&fixed) {
+            for (g, sc) in fixed.into_iter().enumerate() {
+                *out[g].last_mut().unwrap() = sc;
+            }
         }
     }
-    Ok(scores)
+    Ok(out)
 }
 
 thread_local! {

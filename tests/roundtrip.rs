@@ -620,4 +620,18 @@ fn ensemble_players() {
     let u = convert_song(&long, &Options { rank: "무제한".into(), players: 2, ..opts() }).unwrap();
     assert!(u.limits[0] < 100000 && u.scores.iter().all(|sc| sc.lengths().iter().zip(u.limits.iter()).all(|(l, m)| l <= m)));
     assert!(u.warnings.iter().any(|w| w.contains("1랭크")));
+    // 여러 장이면 모든 합주자가 같은 마디에서 잘리고, 장마다 세 파트 길이가 구간 길이와 같다 (장 바꿀 때 싱크)
+    let m = convert_song(&long, &Options { rank: "연습".into(), players: 2, jabchiel: false, ..opts() }).unwrap();
+    let p1: Vec<&Score> = m.scores.iter().filter(|s| s.player == 1).collect();
+    let p2: Vec<&Score> = m.scores.iter().filter(|s| s.player == 2).collect();
+    assert!(p1.len() > 1 && p1.len() == p2.len(), "{} {}", p1.len(), p2.len());
+    for (a, b) in p1.iter().zip(p2.iter()) {
+        assert_eq!((a.start, a.end), (b.start, b.end));
+        for sc in [a, b] {
+            for mml in &sc.parts {
+                assert!((parse_part(mml).unwrap().2 - (sc.end - sc.start)).abs() < 1e-6);
+            }
+        }
+    }
+    assert!(m.scores.iter().all(|sc| sc.lengths().iter().zip(m.limits.iter()).all(|(l, x)| l <= x)));
 }
