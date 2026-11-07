@@ -616,4 +616,8 @@ fn ensemble_players() {
     let (parts, _) = scores_to_notes(&e.scores).unwrap();
     let total: usize = parts.iter().map(|p| p.iter().filter(|n| n.vel > 0.0).count()).sum();
     assert_eq!(total, 1600);
+    // '무제한'이어도 합주 악보는 게임 한도(1랭크)로 나눈다
+    let u = convert_song(&long, &Options { rank: "무제한".into(), players: 2, ..opts() }).unwrap();
+    assert!(u.limits[0] < 100000 && u.scores.iter().all(|sc| sc.lengths().iter().zip(u.limits.iter()).all(|(l, m)| l <= m)));
+    assert!(u.warnings.iter().any(|w| w.contains("1랭크")));
 }

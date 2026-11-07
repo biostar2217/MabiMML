@@ -1316,6 +1316,7 @@ impl App {
         c.insert("triplet".into(), TRIPLET_LABELS.iter().map(|x| x.0.to_string()).collect());
         c.insert("volume".into(), VOLUME_LABELS.iter().map(|x| x.0.to_string()).collect());
         c.insert("fit".into(), FIT_LABELS.iter().map(|x| x.0.to_string()).collect());
+        c.insert("players".into(), PLAYER_CHOICES.iter().map(|x| x.to_string()).collect());
         c
     }
 
@@ -1327,7 +1328,8 @@ impl App {
             "tempo_all_parts": o.tempo_all, "no_song": o.no_song, "split_players": s.split_players,
             "keep_original": s.keep_original, "ensemble_fix": s.ensemble_fix, "instrument": s.instrument,
             "quality": o.quality, "rank": o.rank, "sustain": s.sustain, "gap_mode": s.gap_mode, "triplet": o.triplet,
-            "volume": o.volume, "fit": o.fit, "part_volume": s.part_vol
+            "volume": o.volume, "fit": o.fit, "part_volume": s.part_vol,
+            "ensemble": s.ensemble, "players": s.players
         });
         v.as_object().cloned().unwrap()
     }
@@ -1353,6 +1355,8 @@ impl App {
                 "triplet" => if let Some(s) = st { self.other.triplet = s },
                 "volume" => if let Some(s) = st { self.other.volume = s },
                 "fit" => if let Some(s) = st { self.other.fit = s },
+                "ensemble" => if let Some(b) = b { self.saved.ensemble = b },
+                "players" => if let Some(s) = st.filter(|s| PLAYER_CHOICES.contains(&s.as_str())) { self.saved.players = s },
                 "part_volume" => {
                     if let Some(a) = v.as_array() {
                         for (j, x) in a.iter().take(3).enumerate() {

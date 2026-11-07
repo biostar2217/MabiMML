@@ -24,7 +24,7 @@ impl std::fmt::Display for AIError {
     }
 }
 
-pub const SETTINGS: [(&str, &str); 10] = [
+pub const SETTINGS: [(&str, &str); 11] = [
     ("speed_percent", "정수, 빠르기 퍼센트 10~400 (100이 원곡)"),
     ("fixed_bpm", "정수, 곡 전체 고정 템포 0~255 (0은 원곡 템포)"),
     ("transpose", "정수, 음 높이(반음, 절대값) -48~48. 12가 한 옥타브"),
@@ -35,6 +35,7 @@ pub const SETTINGS: [(&str, &str); 10] = [
     ("split_players", "true/false, 4파트 이상 모바일 MML을 두 사람 악보로"),
     ("keep_original", "true/false, 붙여넣은 3파트 MML을 편곡 없이 그대로 나누기"),
     ("ensemble_fix", "true/false, 64비트 합주 밀림 보정"),
+    ("ensemble", "true/false, 합주: 곡을 여러 합주자(각자 멜로디·화음1·화음2)로 나누기. 인원은 players"),
 ];
 
 fn limits(name: &str) -> Option<(i64, i64)> {

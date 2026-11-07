@@ -1087,6 +1087,15 @@ fn balance_parts(parts: &mut [Vec<Note>], tempos: &[(i64, i64)], limits: &[i64; 
 
 /// 합주: 곡을 여러 사람이 함께 치도록 나눈다. 합주자마다 멜로디·화음1·화음2 악보가 따로 생긴다.
 fn convert_ensemble(song: &Song, opts: &Options) -> Res<ConvResult> {
+    // 합주 악보는 게임에 올려야 하므로 '무제한'이어도 게임의 가장 큰 한도(1랭크)로 나눈다
+    let unlimited = opts.rank == "무제한" && opts.custom_limits.is_none();
+    let fixed;
+    let opts = if unlimited {
+        fixed = Options { rank: "1".into(), ..opts.clone() };
+        &fixed
+    } else {
+        opts
+    };
     let auto = opts.players == 0;
     let candidates: Vec<usize> = if auto { AUTO_PLAYERS.collect() } else { vec![opts.players] };
     // 인원마다 편곡해 보고: 뺀 음표가 가장 적은 쪽(조금 차이는 같게 봄) 중에서 한 장에 안 들어가는 합주자가 적고 인원이 적은 것
@@ -1165,6 +1174,9 @@ fn convert_ensemble(song: &Song, opts: &Options) -> Res<ConvResult> {
         head += &format!(" (긴 파트 {}개는 뒷부분을 다른 합주자에게 넘겼습니다)", moved);
     }
     warnings.insert(0, head);
+    if unlimited {
+        warnings.insert(1, "합주 악보는 게임에 올릴 수 있게 '무제한' 대신 1랭크 글자 수 한도로 나눴습니다".into());
+    }
     if !empty_players.is_empty() {
         warnings.push(format!("합주자 {}는 칠 음이 없습니다. 인원을 줄여도 됩니다", empty_players.join(", ")));
     }
