@@ -1,4 +1,4 @@
-# 마비노기 MML 변환기 v2.0 (Rust판)
+# 마비노기 MML 변환기 v2.1 (Rust판)
 
 MIDI · MusicXML · 악보 PDF/이미지 · 이미 만든 MML 을 PC판 마비노기 작곡 악보(`MML@멜로디,화음1,화음2;`)로 바꿔 주는 프로그램입니다.
 파이썬판 v1.6 의 모든 기능을 Rust 로 처음부터 다시 만들었고, **같은 입력·같은 설정이면 결과 MML 이 파이썬판과 글자 하나까지 같습니다** (아래 비교표).
@@ -16,11 +16,14 @@ MIDI · MusicXML · 악보 PDF/이미지 · 이미 만든 MML 을 PC판 마비�
 - 원본 MML 붙여넣기 · **MML 직접 입력 창**(조각 칸 추가·이어 붙이기), 모바일 MML 6파트, 두 사람 악보로 나누기
 - **자브키엘 악보집 옵션**(여러 장일 때 장마다 세 파트 길이·템포 맞춤), 64비트 합주 밀림 보정
 - **미리듣기**: Windows 기본 신시사이저로 연주 악기와 비슷한 소리로, 템포 변화를 실제 시간으로 풀어 재생. 미리듣기 MIDI 저장
+- **악보 보기와 재생 위치 바 (v2.1)**: 창 오른쪽에 재생할 MML 을 큰보표 악보로 그려 재생 위치(빨간 선)와 지금 나는 음을 보여 줍니다. 결과창의 MML 을 고치면 악보가 바로 바뀝니다. 창 아래 재생 위치 바를 끌거나 악보를 누르면 그 자리로 옮겨 듣습니다.
 - 결과 텍스트 저장, 악보별 저장, 초기화, 보라/포도주 색 테마, 설정 기억
 - **자동 업데이트**: GitHub 릴리스(태그 `vX.Y`, 자산 `MabiMML_vX.Y_PDF.exe` 또는 고정 이름 `MabiMML_PDF.exe`)를 하루 한 번 확인
 - **AI 명령**: 웹서버 중계(`https://nambebmabi.com/mabimml/ai`)로 Claude 에게 묻고 설정만 바꿉니다. **앱과 저장소에는 API 키가 없습니다.** 요청 형식은 파이썬판 v1.6 `ai.ask_relay` 와 바이트까지 같습니다 (`docs/AI_중계_요구사항.md`).
 
 ## 화면
+![악보 보기와 재생 위치](screenshots/5_악보보기_재생위치.png)
+
 | 곡 불러온 화면 | 불러오는 중 창 (PDF 인식) | 포도주 테마 |
 |---|---|---|
 | ![](screenshots/2_곡_불러온_화면.png) | ![](screenshots/3_불러오는_중_창.png) | ![](screenshots/4_포도주_테마.png) |
@@ -57,7 +60,7 @@ cargo test
 `%LOCALAPPDATA%\MabiMMLudiveris_<해시>` 에 한 번만 풀어 쓰고, 새 판이 나오면 이전 폴더는 지웁니다.
 
 ```bash
-cargo build --release && target/release/mabimml-pack.exe target/release/mabimml.exe <audiveris 폴더> MabiMML_v2.0_PDF.exe
+cargo build --release && target/release/mabimml-pack.exe target/release/mabimml.exe <audiveris 폴더> MabiMML_v2.1_PDF.exe
 ```
 
 릴리스 자산은 `MabiMML_vX.Y_PDF.exe` 와 같은 파일의 고정 이름 `MabiMML_PDF.exe`, 그리고 `MabiMML_vX.Y_LICENSES.txt` 입니다.

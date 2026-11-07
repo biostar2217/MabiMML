@@ -21,6 +21,7 @@ use crate::mobile_io::{clean_part, fragments_of, has_several_parts, is_mml_text,
 use crate::model::Song;
 use crate::omr::set_audiveris_path;
 use crate::player::PianoPlayer;
+use crate::sheet::{self, Sheet};
 use crate::progress::{self, fmt_time, Progress, Snapshot};
 use crate::ranks::{rank_order, UNLIMITED};
 use crate::theme::{self, Palette};
@@ -263,6 +264,23 @@ pub struct App {
     pending_files: Vec<String>,
     shots: Option<Shots>,
     log_rx: Option<Receiver<String>>,
+    // 악보 보기와 재생 위치
+    sheet: Option<Sheet>,
+    sheet_key: String,
+    sheet_view: String,
+    sheet_err: String,
+    sheet_label: String,
+    sheet_open: bool,
+    sheet_follow: bool,
+    sheet_line: Option<usize>,
+    /// 멈춰 있을 때 다음 재생을 시작할 위치 (밀리초)
+    seek_ms: f64,
+    /// 재생 위치 바를 끄는 중인 위치
+    seek_drag: Option<f64>,
+    was_playing: bool,
+    last_pos: f64,
+    /// 재생기가 마지막으로 알려 준 위치와 그때 시각 (재생기는 음이 나올 때만 위치를 바꾸므로 그 사이를 시계로 메운다)
+    pos_base: (f64, Instant),
 }
 
 impl App {
@@ -321,6 +339,19 @@ impl App {
             pending_files: files,
             shots,
             log_rx: None,
+            sheet: None,
+            sheet_key: String::new(),
+            sheet_view: String::new(),
+            sheet_err: String::new(),
+            sheet_label: String::new(),
+            sheet_open: true,
+            sheet_follow: true,
+            sheet_line: None,
+            seek_ms: 0.0,
+            seek_drag: None,
+            was_playing: false,
+            last_pos: 0.0,
+            pos_base: (-1.0, Instant::now()),
         };
         app.last_fingerprint = app.fingerprint();
         app
@@ -625,6 +656,8 @@ impl App {
 
     fn reset_all(&mut self) {
         self.player.stop();
+        self.seek_ms = 0.0;
+        self.was_playing = false;
         self.song = None;
         self.result = None;
         self.roles.clear();
@@ -690,6 +723,10 @@ impl App {
     fn show_result(&mut self, res: ConvResult) {
         let stopped = self.player.is_playing();
         if stopped {
+            if let Some(ms) = self.player.position_ms() {
+                self.seek_ms = ms as f64;
+            }
+            self.was_playing = false;
             self.player.stop();
         }
         self.score_texts = res.scores.iter().map(|s| s.clipboard()).collect();
@@ -777,13 +814,252 @@ impl App {
             }
         };
         let shift = self.result.as_ref().unwrap().sound_shift;
-        match self.player.play(&scores, shift, self.preview_prog()) {
+        self.refresh_sheet();
+        let total = self.sheet.as_ref().map(|s| s.total_ms()).unwrap_or(0.0);
+        if self.seek_ms >= total - 100.0 {
+            self.seek_ms = 0.0;
+        }
+        let from = self.seek_ms.max(0.0) as u64;
+        match self.player.play_from(&scores, shift, self.preview_prog(), from) {
             Ok(skipped) => {
+                self.last_pos = from as f64;
+                self.pos_base = (from as f64, Instant::now());
+                self.was_playing = true;
+                self.sheet_line = None;
                 self.status = format!("{} 재생 중{}", label, if skipped > 0 { format!(" · 범위 밖 음 {}개는 건너뜀", skipped) } else { String::new() });
             }
             Err(e) => self.error("재생 실패", &e.to_string()),
         }
     }
+
+    // ---------- 악보 보기와 재생 위치 ----------
+
+    /// 결과창의 글자가 바뀌었으면 악보를 다시 만든다 (고친 MML이 바로 보인다).
+    fn refresh_sheet(&mut self) {
+        if self.result.is_none() || self.score_texts.is_empty() {
+            if self.sheet.is_some() {
+                self.sheet = None;
+                self.sheet_key.clear();
+                self.sheet_err.clear();
+            }
+            return;
+        }
+        let all = self.score_texts.len() > 1 && self.other.play_all;
+        let view = format!("{}|{}|{}", self.path, all, if all { 0 } else { self.tab });
+        let key = format!("{}|{}", view, self.score_texts.join("\u{1}"));
+        if key == self.sheet_key {
+            return;
+        }
+        self.sheet_key = key;
+        if view != self.sheet_view {
+            self.sheet_view = view;
+            self.sheet_line = None;
+            if !self.player.is_playing() {
+                self.seek_ms = 0.0;
+            }
+        }
+        let bar = self
+            .song
+            .as_ref()
+            .and_then(|s| s.timesigs.first())
+            .map(|&(_, num, den)| if num > 0 && den > 0 { 384.0 * num as f64 / den as f64 } else { 384.0 })
+            .unwrap_or(384.0);
+        match self.preview_scores() {
+            Ok((scores, label, _)) => {
+                let names: Vec<String> = if all { (0..scores.len()).map(|i| format!("악보 {}", i + 1)).collect() } else { vec![String::new(); scores.len()] };
+                match Sheet::build(&scores, names, bar) {
+                    Ok(sh) => {
+                        self.sheet = Some(sh);
+                        self.sheet_err.clear();
+                        self.sheet_label = label;
+                    }
+                    Err(e) => self.sheet_err = e,
+                }
+            }
+            Err(e) => self.sheet_err = e,
+        }
+    }
+
+    /// 화면에 보일 재생 위치 (밀리초)
+    fn current_ms(&self) -> f64 {
+        if let Some(d) = self.seek_drag {
+            return d;
+        }
+        if self.was_playing {
+            return self.last_pos;
+        }
+        self.seek_ms
+    }
+
+    /// 재생 위치를 옮긴다. 재생 중이면 그 자리부터 이어서 듣고, 멈춰 있으면 다음 재생을 거기서 시작한다.
+    fn commit_seek(&mut self, ms: f64) {
+        let ms = ms.max(0.0);
+        if self.player.is_playing() {
+            self.player.seek(ms as u64);
+            self.last_pos = ms;
+            self.pos_base = (ms, Instant::now());
+        } else {
+            self.seek_ms = ms;
+        }
+        self.sheet_line = None;
+    }
+
+    /// 재생 위치를 읽고, 곡이 끝났는지 본다.
+    fn track_playback(&mut self) {
+        let playing = self.player.is_playing();
+        if playing {
+            if let Some(ms) = self.player.position_ms() {
+                let ms = ms as f64;
+                if ms != self.pos_base.0 {
+                    self.pos_base = (ms, Instant::now());
+                }
+                let total = self.player.length_ms().map(|l| l as f64).unwrap_or(f64::MAX);
+                self.last_pos = (self.pos_base.0 + self.pos_base.1.elapsed().as_secs_f64() * 1000.0).min(total);
+            }
+        } else if self.was_playing {
+            let total = self.sheet.as_ref().map(|s| s.total_ms()).unwrap_or(0.0);
+            let len = self.player.length_ms().map(|l| l as f64).unwrap_or(total);
+            // 끝까지 들었으면 처음으로, 도중에 멈췄으면 그 자리에서 다시 시작
+            self.seek_ms = if self.last_pos >= len.min(total).max(1.0) - 300.0 { 0.0 } else { self.last_pos };
+        }
+        self.was_playing = playing;
+    }
+
+    fn seek_bar(&mut self, ctx: &egui::Context) {
+        let p = self.pal;
+        egui::TopBottomPanel::bottom("seekbar")
+            .frame(egui::Frame::none().fill(p.sub).inner_margin(egui::Margin::symmetric(10.0, 6.0)).stroke(egui::Stroke::new(1.0f32, p.line)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let playing = self.player.is_playing();
+                    if self.accent(ui, if playing { "■" } else { "▶" }).on_hover_text(if playing { "정지" } else { "여기서부터 듣기" }).clicked() {
+                        self.toggle_play();
+                    }
+                    let (total, bars) = match &self.sheet {
+                        Some(sh) => (sh.total_ms(), sh.bars()),
+                        None => (0.0, 0),
+                    };
+                    let cur = self.current_ms().clamp(0.0, total.max(0.0));
+                    let bar_no = self.sheet.as_ref().map(|sh| ((sh.ms_to_unit(cur) / sh.bar).floor() as usize + 1).min(bars)).unwrap_or(0);
+                    ui.label(RichText::new(format!("{} / {}", fmt_clock(cur), fmt_clock(total))).font(egui::FontId::monospace(13.0)));
+                    let right_w = 190.0;
+                    let w = (ui.available_width() - right_w).max(80.0);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::click_and_drag());
+                    let painter = ui.painter_at(rect.expand(8.0));
+                    let track = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width() - 12.0, 6.0));
+                    painter.rect_filled(track, 3.0, p.panel);
+                    painter.rect_stroke(track, 3.0, egui::Stroke::new(1.0f32, p.line));
+                    if let Some(sh) = &self.sheet {
+                        // 악보가 여러 장이면 경계에 눈금
+                        if sh.starts.len() > 1 && total > 0.0 {
+                            for (t, _) in sh.starts.iter().skip(1) {
+                                let x = track.left() + (sh.unit_to_ms(*t) / total) as f32 * track.width();
+                                painter.line_segment([egui::pos2(x, track.top() - 4.0), egui::pos2(x, track.bottom() + 4.0)], egui::Stroke::new(1.5f32, p.wine_soft));
+                            }
+                        }
+                    }
+                    let frac = if total > 0.0 { (cur / total) as f32 } else { 0.0 };
+                    let kx = track.left() + frac * track.width();
+                    let mut done = track;
+                    done.set_right(kx);
+                    painter.rect_filled(done, 3.0, p.wine);
+                    let hot = resp.hovered() || resp.dragged();
+                    painter.circle_filled(egui::pos2(kx, track.center().y), if hot { 8.0 } else { 7.0 }, p.wine);
+                    painter.circle_filled(egui::pos2(kx, track.center().y), 3.0, Color32::WHITE);
+                    if total > 0.0 {
+                        let to_ms = |x: f32| (((x - track.left()) / track.width()).clamp(0.0, 1.0) as f64) * total;
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            let ms = to_ms(pos.x);
+                            if resp.drag_stopped() || resp.clicked() {
+                                self.seek_drag = None;
+                                self.commit_seek(ms);
+                            } else if resp.dragged() || resp.is_pointer_button_down_on() {
+                                self.seek_drag = Some(ms);
+                            }
+                        } else if self.seek_drag.is_some() && !resp.dragged() {
+                            self.seek_drag = None;
+                        }
+                        if let Some(h) = resp.hover_pos() {
+                            let ms = to_ms(h.x);
+                            let label = match &self.sheet {
+                                Some(sh) => format!("{} · {}마디", fmt_clock(ms), (sh.ms_to_unit(ms) / sh.bar).floor() as usize + 1),
+                                None => fmt_clock(ms),
+                            };
+                            resp.clone().on_hover_text_at_pointer(label);
+                        }
+                        if resp.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        } else if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                    }
+                    ui.label(RichText::new(if bars > 0 { format!("{} / {}마디", bar_no, bars) } else { "- 마디".into() }).color(p.muted));
+                    ui.checkbox(&mut self.sheet_open, "악보 보기");
+                });
+            });
+    }
+
+    fn sheet_panel(&mut self, ctx: &egui::Context) {
+        if !self.sheet_open {
+            return;
+        }
+        let p = self.pal;
+        egui::SidePanel::right("sheet")
+            .resizable(true)
+            .default_width(480.0)
+            .min_width(280.0)
+            .max_width(1000.0)
+            .frame(egui::Frame::none().fill(p.bg).inner_margin(egui::Margin { left: 6.0, right: 8.0, top: 6.0, bottom: 6.0 }))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("악보 보기").font(theme::bold(13.0)).color(p.wine));
+                    if self.sheet.is_some() {
+                        ui.label(RichText::new(&self.sheet_label).color(p.muted));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.checkbox(&mut self.sheet_follow, "재생 위치 따라가기");
+                    });
+                });
+                ui.horizontal(|ui| {
+                    for (k, name) in PART_NAMES.iter().enumerate() {
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(r.center(), 4.5, sheet::PART_COLORS[k]);
+                        ui.label(RichText::new(*name).size(12.0));
+                        ui.add_space(4.0);
+                    }
+                    ui.label(RichText::new("· 악보를 누르면 그 자리로 이동").size(12.0).color(p.muted));
+                });
+                if !self.sheet_err.is_empty() {
+                    ui.label(RichText::new(format!("고친 MML을 읽지 못해 이전 악보를 보여 줍니다: {}", self.sheet_err)).size(12.0).color(theme::OVER));
+                }
+                let mut clicked = None;
+                egui::Frame::none().fill(Color32::WHITE).stroke(egui::Stroke::new(1.0f32, p.line)).inner_margin(6.0).show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    let Some(sh) = &self.sheet else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(RichText::new("파일을 열면 여기에 악보가 그려집니다").color(p.muted));
+                        });
+                        return;
+                    };
+                    if sh.is_empty() {
+                        ui.label(RichText::new("음표가 없습니다").color(p.muted));
+                        return;
+                    }
+                    let show_head = self.was_playing || self.seek_drag.is_some() || self.seek_ms > 0.0;
+                    let cur = self.current_ms();
+                    let head = show_head.then(|| sh.ms_to_unit(cur));
+                    let follow = self.sheet_follow && show_head;
+                    let line = &mut self.sheet_line;
+                    egui::ScrollArea::vertical().id_salt("sheet_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        clicked = sheet::show(ui, sh, &p, head, if follow { Some(line) } else { None }).map(|t| sh.unit_to_ms(t));
+                    });
+                });
+                if let Some(ms) = clicked {
+                    self.commit_seek(ms);
+                }
+            });
+    }
+
 
     fn play_label(&self) -> String {
         if self.player.is_playing() {
@@ -1762,7 +2038,14 @@ impl App {
             2 => {
                 if busy { again = true; wait_ms = 300; } else { wait_ms = 900; }
             }
-            3 => shot = Some("2_곡_불러온_화면.png"),
+            3 => {
+                // 재생 위치 표시가 보이도록 곡의 1/5 쯤으로 옮겨 둔다
+                if let Some(sh) = &self.sheet {
+                    self.seek_ms = sh.total_ms() * 0.2;
+                    self.sheet_line = None;
+                }
+                shot = Some("2_곡_불러온_화면.png");
+            }
             4 => {
                 if let Some(b) = big {
                     self.other.re_ocr = true;
@@ -1830,6 +2113,12 @@ impl App {
             }
         }
     }
+}
+
+/// 밀리초 -> 분:초
+fn fmt_clock(ms: f64) -> String {
+    let s = (ms / 1000.0).max(0.0) as u64;
+    format!("{}:{:02}", s / 60, s % 60)
 }
 
 fn group_thousands(n: usize) -> String {
@@ -1945,11 +2234,15 @@ impl eframe::App for App {
                 ctx.request_repaint_after(Duration::from_millis(60));
             }
         }
-        if self.player.is_playing() {
-            ctx.request_repaint_after(Duration::from_millis(500));
+        self.track_playback();
+        self.refresh_sheet();
+        if self.was_playing || self.seek_drag.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
 
         self.banner(ctx);
+        self.seek_bar(ctx);
+        self.sheet_panel(ctx);
         let height = ctx.screen_rect().height();
         let compact = height < 800.0;
         if self.compact != Some(compact) {
@@ -1986,8 +2279,8 @@ pub fn run(files: Vec<String>) -> eframe::Result<()> {
     let pal = theme::palette(&saved.color_theme);
     let mut vb = egui::ViewportBuilder::default()
         .with_title(format!("마비노기 MML 변환기 v{}", VERSION))
-        .with_inner_size([960.0, 900.0])
-        .with_min_inner_size([800.0, 620.0])
+        .with_inner_size([1460.0, 900.0])
+        .with_min_inner_size([1080.0, 620.0])
         .with_drag_and_drop(true)
         .with_app_id("MabiMML.Converter");
     if let Some(icon) = theme::icon_data(pal.icon_png) {
