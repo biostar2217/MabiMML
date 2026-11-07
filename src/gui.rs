@@ -95,6 +95,8 @@ pub struct Saved {
     pub auto_drums: bool,
     /// 자동 드럼 모양
     pub drum_style: String,
+    /// 악보 보기를 따로 띄운 창으로 (기본)
+    pub sheet_window: bool,
 }
 
 impl Default for Saved {
@@ -121,6 +123,7 @@ impl Default for Saved {
             player_insts: Vec::new(),
             auto_drums: false,
             drum_style: crate::convert::DRUM_STYLES[0].into(),
+            sheet_window: true,
         }
     }
 }
@@ -135,7 +138,7 @@ impl Saved {
             "sustain": self.sustain, "split_players": self.split_players,
             "ensemble": self.ensemble, "players": self.players, "ensemble_by": self.ensemble_by,
             "compact": self.compact, "drums": self.drums, "player_insts": self.player_insts,
-            "auto_drums": self.auto_drums, "drum_style": self.drum_style
+            "auto_drums": self.auto_drums, "drum_style": self.drum_style, "sheet_window": self.sheet_window
         })
     }
 
@@ -163,6 +166,7 @@ impl Saved {
         if let Some(v) = gb("compact") { s.compact = v; }
         if let Some(v) = gb("drums") { s.drums = v; }
         if let Some(v) = gs("drum_style", &|v| crate::convert::DRUM_STYLES.contains(&v)) { s.drum_style = v; }
+        if let Some(v) = gb("sheet_window") { s.sheet_window = v; }
         if !old {
             if let Some(v) = gb("ensemble_fix") { s.ensemble_fix = v; }
             if let Some(v) = gb("v0_tempo") { s.v0_tempo = v; }
@@ -330,6 +334,8 @@ pub struct App {
     sheet_window: bool,
     /// 따로 띄운 창의 처음 위치 (띄울 때 한 번 정한다)
     sheet_win_pos: Option<egui::Pos2>,
+    /// 따로 띄운 창의 처음 크기
+    sheet_win_size: egui::Vec2,
     /// 여러 합주자를 함께 볼 때 합주자마다 큰보표를 따로 그린다
     sheet_split: bool,
     sheet_line: Option<usize>,
@@ -415,6 +421,7 @@ impl App {
             sheet_follow: true,
             sheet_window: false,
             sheet_win_pos: None,
+            sheet_win_size: egui::vec2(1200.0, 900.0),
             sheet_split: true,
             sheet_line: None,
             sheet_page: 0,
@@ -425,10 +432,8 @@ impl App {
             pos_base: (-1.0, Instant::now()),
         };
         app.last_fingerprint = app.fingerprint();
-        // 시험용: 악보 보기를 따로 띄운 창으로 시작
-        if std::env::var_os("MABIMML_SHOT_SHEETWIN").is_some() {
-            app.sheet_window = true;
-        }
+        // 악보 보기를 따로 띄운 창으로 시작 (설정에 기억. 시험용 화면 찍기는 기본으로 붙여서)
+        app.sheet_window = app.saved.sheet_window && (std::env::var_os("MABIMML_SHOTS").is_none() || std::env::var_os("MABIMML_SHOT_SHEETWIN").is_some());
         app
     }
 
@@ -1251,19 +1256,23 @@ impl App {
     /// 악보 보기를 프로그램 오른쪽에 따로 띄운 창으로 보여 준다 (크기를 마음대로 키울 수 있다)
     fn sheet_viewport(&mut self, ctx: &egui::Context) {
         let p = self.pal;
-        const SHEET_W: f32 = 760.0;
+        // 처음부터 프로그램 창만큼 크게 (폭은 프로그램 창과 같게, 화면이 모자라면 나눠 쓴다)
+        let main_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::vec2(1200.0, 900.0));
+        let monitor_w = ctx.input(|i| i.viewport().monitor_size.map(|m| m.x)).unwrap_or(f32::MAX);
+        let sheet_w: f32 = main_size.x.min((monitor_w / 2.0).max(700.0)).max(700.0);
         if self.sheet_win_pos.is_none() {
+            self.sheet_win_size = egui::vec2(sheet_w, main_size.y.max(600.0));
             // 프로그램 바로 오른쪽에 띄운다. 화면 밖으로 나가면 프로그램을 왼쪽으로 옮기고 폭을 줄여 나란히 놓는다
             let (outer, inner, monitor) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect, i.viewport().monitor_size));
             let pos = match (outer, monitor) {
-                (Some(r), Some(m)) if r.right() + 4.0 + SHEET_W > m.x => {
-                    let main_w = (m.x - SHEET_W - 12.0).max(1080.0);
+                (Some(r), Some(m)) if r.right() + 4.0 + sheet_w > m.x => {
+                    let main_w = (m.x - sheet_w - 12.0).max(1080.0);
                     let inner_h = inner.map(|i| i.height()).unwrap_or(r.height());
                     let top = r.top().max(0.0);
                     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::OuterPosition(egui::pos2(0.0, top)));
                     ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::InnerSize(egui::vec2(main_w, inner_h)));
                     let outer_w = main_w + (r.width() - inner.map(|i| i.width()).unwrap_or(r.width()));
-                    egui::pos2((outer_w + 4.0).min((m.x - SHEET_W).max(0.0)), top)
+                    egui::pos2((outer_w + 4.0).min((m.x - sheet_w).max(0.0)), top)
                 }
                 (Some(r), _) => egui::pos2(r.right() + 4.0, r.top()),
                 _ => egui::pos2(100.0, 100.0),
@@ -1272,7 +1281,7 @@ impl App {
         }
         let mut b = egui::ViewportBuilder::default()
             .with_title(format!("악보 보기 - 마비노기 MML 변환기 v{}", VERSION))
-            .with_inner_size([SHEET_W, 900.0])
+            .with_inner_size(self.sheet_win_size)
             .with_min_inner_size([360.0, 360.0]);
         if let Some(pos) = self.sheet_win_pos {
             b = b.with_position(pos);
@@ -1291,6 +1300,8 @@ impl App {
             }
             if ctx.input(|i| i.viewport().close_requested()) {
                 self.sheet_window = false;
+                self.saved.sheet_window = false;
+                self.save_settings();
             }
         });
     }
@@ -1309,6 +1320,8 @@ impl App {
                         let tip = if self.sheet_window { "악보 보기를 프로그램 안 오른쪽으로 되돌립니다" } else { "악보 보기를 프로그램 오른쪽에 따로 띄워 크게 봅니다" };
                         if ui.button(label).on_hover_text(tip).clicked() {
                             self.sheet_window = !self.sheet_window;
+                            self.saved.sheet_window = self.sheet_window;
+                            self.save_settings();
                             self.sheet_win_pos = None;
                             self.sheet_line = None;
                         }
@@ -1351,6 +1364,8 @@ impl App {
                     let page = &mut self.sheet_page;
                     // 긴 곡은 쪽으로 나눠 그린다. 쪽 계산과 그리기에 같은 폭을 쓴다 (세로 막대 자리를 뺀 폭)
                     let w = (ui.available_width() - 16.0).max(200.0);
+                    // 합주자가 많으면 보표를 세로로 줄여 한 줄(모든 합주자)이 화면에 들어가게
+                    sheet::fit_scale(sh, ui.available_height() - 34.0);
                     if follow {
                         sheet::follow_page(sh, w, head, *line, page);
                     }
