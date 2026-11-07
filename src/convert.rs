@@ -10,12 +10,12 @@ use crate::arrange::{
     apply_sustain, fill_short_gaps, fold_pitch, melody_score, monophonize, quantize_tracks, raise_low_notes,
     remove_unison_clashes, skyline, split_voices, BeatGrid,
 };
-use crate::encoder::{encode_part, VolumeMode};
+use crate::encoder::{encode_part, EncodeStyle, VolumeMode};
 use crate::midi_io::{read_midi, write_midi};
 use crate::mml_parser::{octave_problems, parse_part};
 use crate::mml_split::{out_of_game_range, split_mml, transpose_mml};
 use crate::mobile_io::{is_mml_text, read_mobile_mml};
-use crate::model::{pitch_name, Note, Song, Track, UNITS_PER_WHOLE};
+use crate::model::{pitch_name, sort_start_desc_pitch, Note, Song, Track, UNITS_PER_WHOLE};
 use crate::musicxml_io::read_musicxml;
 use crate::omr::{self, OmrError};
 use crate::progress::{self, Progress};
@@ -29,7 +29,7 @@ pub const DETAIL_COARSE: [(i64, i64); 2] = [(16, 2), (16, 3)];
 pub const DETAIL_FALLBACK: (i64, i64) = (32, 2);
 pub const INSTRUMENT_DEFAULT: &str = "그대로 (류트 등)";
 /// 연주 악기: (이름, MML에 더할 반음, 미리듣기 GM 악기 번호)
-pub const INSTRUMENTS: [(&str, i64, i64); 21] = [
+pub const INSTRUMENTS: [(&str, i64, i64); 33] = [
     (INSTRUMENT_DEFAULT, 0, 24),
     ("류트", 0, 24),
     ("우쿨렐레", 0, 24),
@@ -51,15 +51,47 @@ pub const INSTRUMENTS: [(&str, i64, i64); 21] = [
     ("축제 휘슬", -12, 78),
     ("가야금", 0, 107),
     ("베이스", 0, 33),
+    ("전기기타", 0, 30),
+    ("10주년 류트", 0, 24),
+    ("10주년 우쿨렐레", 0, 24),
+    ("10주년 만돌린", 0, 25),
+    ("10주년 휘슬", 0, 78),
+    ("10주년 플룻", 0, 73),
+    ("축제 류트", 0, 24),
+    ("축제 우쿨렐레", 0, 24),
+    ("축제 만돌린", 0, 25),
+    ("되새", 0, 123),
+    ("팔색조", 0, 123),
+    ("물총새", 0, 123),
 ];
-/// 적을 수 있는 음역이 좁은 악기: (이름, 가장 낮은 음, 가장 높은 음). 가야금은 1~4옥타브가 평음(5~8옥타브는 농현).
+/// 적을 수 있는 음역이 정해진 악기: (이름, 가장 낮은 음, 가장 높은 음).
+/// 휘슬·론카도라·플룻·샬루모·튜바는 마비꼬 악기 표, 가야금·전기기타는 1~4옥타브가 기본 소리(5~8옥타브는 농현/디스토션).
 /// 베이스는 자료가 없어 가야금과 같은 4옥타브용으로 둔다.
-pub const INSTRUMENT_RANGES: [(&str, i64, i64); 2] = [("가야금", 24, 71), ("베이스", 24, 71)];
+pub const INSTRUMENT_RANGES: [(&str, i64, i64); 8] = [
+    ("휘슬", 72, 88),
+    ("론카도라", 60, 95),
+    ("플룻", 60, 95),
+    ("샬루모", 36, 71),
+    ("튜바", 24, 71),
+    ("가야금", 24, 71),
+    ("베이스", 24, 71),
+    ("전기기타", 24, 71),
+];
+/// 한 파트(멜로디)만 쓰고 볼륨은 v11까지인 악기 (마비꼬 표의 핸드 차임 = 우리 목록의 실로폰)
+pub const ONE_PART_INSTRUMENTS: [&str; 1] = ["실로폰"];
+/// 마비노기 드럼 세트 (조옮김 없음)
+pub const DRUM_KIT: &str = "드럼 세트";
 
 pub fn instrument_range(name: &str) -> Option<(i64, i64)> {
     INSTRUMENT_RANGES.iter().find(|r| r.0 == name).map(|r| (r.1, r.2))
 }
-const LOW_LIMIT_INSTRUMENTS: [&str; 4] = [INSTRUMENT_DEFAULT, "류트", "우쿨렐레", "만돌린"];
+
+pub fn is_one_part(name: &str) -> bool {
+    ONE_PART_INSTRUMENTS.contains(&name)
+}
+
+const LOW_LIMIT_INSTRUMENTS: [&str; 10] =
+    [INSTRUMENT_DEFAULT, "류트", "우쿨렐레", "만돌린", "10주년 류트", "10주년 우쿨렐레", "10주년 만돌린", "축제 류트", "축제 우쿨렐레", "축제 만돌린"];
 
 pub fn instrument_shift(name: &str) -> i64 {
     INSTRUMENTS.iter().find(|i| i.0 == name).map(|i| i.1).unwrap_or(0)
@@ -286,6 +318,10 @@ pub struct Options {
     pub by_instrument: bool,
     /// 미리 분석한 양자화 격자 (악기별 합주에서 모든 묶음이 같은 격자를 쓰도록)
     pub shared_grid: Option<BeatGrid>,
+    /// 옥타브 경계 음을 c-, b+ 로 적어 글자 수를 줄인다
+    pub flats: bool,
+    /// 멀리 떨어진 한 음을 n번호로 적어 글자 수를 줄인다
+    pub n_numbers: bool,
 }
 
 impl Default for Options {
@@ -322,6 +358,8 @@ impl Default for Options {
             players: 1,
             by_instrument: false,
             shared_grid: None,
+            flats: true,
+            n_numbers: true,
         }
     }
 }
@@ -574,7 +612,11 @@ pub fn arrange_players(song: &Song, opts: &Options, players: usize, warnings: &m
     let mut roles: BTreeMap<usize, String> = opts.roles.clone().unwrap_or_default();
     let tracks = &song.tracks;
     for (i, t) in tracks.iter().enumerate() {
-        roles.entry(i).or_insert_with(|| if t.is_drum && !opts.include_drums { "skip".into() } else { "auto".into() });
+        roles.entry(i).or_insert_with(|| if t.is_drum { "skip".into() } else { "auto".into() });
+        // 드럼 트랙은 음높이 파트에 자동으로 넣지 않는다 (GM 드럼 번호는 음높이가 아님). 합주에서는 드럼 세트 합주자로 따로 나온다
+        if t.is_drum && roles[&i] == "auto" {
+            roles.insert(i, "skip".into());
+        }
     }
     let used: Vec<usize> = (0..tracks.len()).filter(|&i| roles[&i] != "skip" && !tracks[i].notes.is_empty()).collect();
     if used.is_empty() {
@@ -591,8 +633,9 @@ pub fn arrange_players(song: &Song, opts: &Options, players: usize, warnings: &m
     if offset != 0 {
         warnings.push(format!("연주 악기: {} → 한 옥타브 낮춰 적음", opts.instrument));
     }
-    if opts.instrument == "실로폰" {
-        warnings.push("실로폰은 화음 파트가 안 날 수 있습니다".into());
+    let one = is_one_part(&opts.instrument);
+    if one {
+        warnings.push(format!("{}(핸드 차임)은 한 파트 악기라 멜로디만 적고 볼륨은 v11까지 씁니다", opts.instrument));
     }
     let lift = LOW_LIMIT_INSTRUMENTS.contains(&opts.instrument.as_str());
     let range = instrument_range(&opts.instrument);
@@ -619,6 +662,7 @@ pub fn arrange_players(song: &Song, opts: &Options, players: usize, warnings: &m
             }
         }
         let mut folded = 0;
+        let mut folded_at: Vec<f64> = Vec::new();
         for &i in &used {
             let v: Vec<Note> = qmap[&i]
                 .iter()
@@ -626,6 +670,7 @@ pub fn arrange_players(song: &Song, opts: &Options, players: usize, warnings: &m
                     let mut p = n.pitch + best;
                     if p < lo || p > hi {
                         folded += 1;
+                        folded_at.push(n.start);
                     }
                     while p < lo {
                         p += 12;
@@ -643,7 +688,15 @@ pub fn arrange_players(song: &Song, opts: &Options, players: usize, warnings: &m
             w += &format!(": 곡 전체를 {}옥타브 {}", best.abs() / 12, if best < 0 { "낮췄습니다" } else { "높였습니다" });
         }
         if folded > 0 {
-            w += &format!("{} 음역 밖 음 {}개는 옥타브를 옮겼습니다", if best != 0 { "," } else { ":" }, folded);
+            let ends = used.iter().flat_map(|i| qmap[i].iter().map(|n| n.end)).fold(0.0, f64::max);
+            let bars = song_bars(song, &grid, ends);
+            let nums: BTreeSet<usize> = folded_at.iter().map(|&u| bars.partition_point(|&b| (b as f64) <= u)).collect();
+            let nums: Vec<String> = nums.into_iter().map(|n| n.to_string()).collect();
+            let mut shown = nums.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+            if nums.len() > 8 {
+                shown += &format!(" 외 {}곳", nums.len() - 8);
+            }
+            w += &format!("{} 음역 밖 음 {}개는 옥타브를 옮겼습니다 (마디 {})", if best != 0 { "," } else { ":" }, folded, shown);
         }
         if best != 0 || folded > 0 {
             warnings.push(w);
@@ -686,7 +739,7 @@ pub fn arrange_players(song: &Song, opts: &Options, players: usize, warnings: &m
         parts[k] = p;
         dropped += d;
     }
-    let mut free: Vec<usize> = (0..np).filter(|k| !manual.contains(k) && limits[*k % 3] > 0).collect();
+    let mut free: Vec<usize> = (0..np).filter(|k| !manual.contains(k) && limits[*k % 3] > 0 && (!one || k % 3 == 0)).collect();
     let mut auto_tracks: Vec<usize> = used.iter().copied().filter(|i| roles[i] == "auto").collect();
     if !auto_tracks.is_empty() {
         if free.is_empty() {
@@ -726,6 +779,13 @@ pub fn arrange_players(song: &Song, opts: &Options, players: usize, warnings: &m
         }
     }
     for k in 0..np {
+        if one && k % 3 != 0 && !parts[k].is_empty() {
+            let w = format!("{}은(는) 한 파트 악기라 {} 파트를 비웠습니다", opts.instrument, PART_NAMES[k % 3]);
+            if !warnings.contains(&w) {
+                warnings.push(w);
+            }
+            parts[k] = vec![];
+        }
         if limits[k % 3] == 0 && !parts[k].is_empty() {
             let w = format!("이 랭크는 {} 파트를 쓸 수 없어 비웠습니다", PART_NAMES[k % 3]);
             if !warnings.contains(&w) {
@@ -907,11 +967,28 @@ pub fn encode_segment(parts: &[Vec<Note>], tempos: &[(i64, i64)], s: i64, e: i64
         tempo_plan(parts, &pts, s, e)
     };
     let vm = VolumeMode::parse(&opts.volume_mode);
+    let style = EncodeStyle {
+        max_volume: if is_one_part(&opts.instrument) { 11 } else { 15 },
+        flats: opts.flats,
+        n_numbers: opts.n_numbers,
+    };
     let mut out = Vec::new();
     for k in 0..parts.len() {
         out.push(
-            encode_part(&parts[k], s, e, &plan[k], vm, opts.volume_threshold, opts.fixed_volume, opts.part_volume[k], opts.v0_tempo, opts.book)
-                .map_err(msg)?,
+            encode_part(
+                &parts[k],
+                s,
+                e,
+                &plan[k],
+                vm,
+                opts.volume_threshold,
+                opts.fixed_volume,
+                opts.part_volume[k % 3],
+                opts.v0_tempo,
+                opts.book,
+                style,
+            )
+            .map_err(msg)?,
         );
     }
     if opts.ensemble_fix {
@@ -1070,6 +1147,12 @@ pub fn convert_song(song: &Song, opts: &Options) -> Res<ConvResult> {
         return convert_ensemble(song, opts);
     }
     let mut warnings = Vec::new();
+    let auto_drums = song.tracks.iter().enumerate().any(|(i, t)| {
+        t.is_drum && !t.notes.is_empty() && opts.roles.as_ref().and_then(|r| r.get(&i)).map(|r| r == "auto").unwrap_or(false)
+    });
+    if auto_drums {
+        warnings.push("드럼 트랙은 혼자 칠 악보에 넣지 않았습니다. 합주를 켜면 마비노기 드럼 세트 합주자로 따로 나옵니다".into());
+    }
     let (parts, tempos, limits, grid) = arrange(song, opts, &mut warnings)?;
     let shift = -instrument_shift(&opts.instrument);
     let end = max_end(&parts);
@@ -1199,12 +1282,170 @@ fn pick_players(song: &Song, opts: &Options, candidates: &[usize], stop_early: b
     Ok((arranged, w, moved))
 }
 
-/// 합주: 음 높이로 나눈다 (모든 합주자가 같은 연주 악기).
+
+/// GM 드럼 음 번호 -> 마비노기 드럼 세트 음 (MIDI 음 번호로: o2f=41 ...). 약하게 친 스네어는 스네어 고스트(o3d).
+pub fn drum_kit_note(gm: i64, vel: f64) -> Option<i64> {
+    Some(match gm {
+        35 | 36 => 41,                         // o2f 킥
+        41 | 43 | 45 => 43,                    // o2g 로우탐
+        38 | 40 | 39 => if vel < 50.0 { 50 } else { 45 }, // o2a 스네어 / o3d 고스트
+        37 => 48,                              // o3c 사이드 스틱
+        56 => 47,                              // o2b 림샷 (카우벨 자리에)
+        47 | 48 => 52,                         // o3e 미들탐
+        50 => 53,                              // o3f 하이탐
+        46 => 55,                              // o3g 오픈 하이햇
+        42 | 54 => 57,                         // o3a 클로즈드 하이햇
+        44 => 59,                              // o3b 풋 하이햇
+        49 | 57 | 52 | 55 => 60,               // o4c 크래시
+        51 | 59 => 64,                         // o4e 라이드
+        53 => 65,                              // o4f 라이드 컵
+        _ => return None,
+    })
+}
+
+/// 마비노기 드럼 세트 음 -> 미리듣기용 GM 드럼 음
+pub fn drum_preview_note(kit: i64) -> i64 {
+    match kit {
+        41 => 36,
+        43 => 45,
+        45 => 38,
+        47 => 37,
+        48 => 37,
+        50 => 38,
+        52 => 47,
+        53 => 50,
+        55 => 46,
+        57 => 42,
+        59 => 44,
+        60 | 62 => 49,
+        64 => 51,
+        65 => 53,
+        p => p,
+    }
+}
+
+/// MIDI 드럼 트랙을 마비노기 드럼 세트 세 파트로 옮긴다 (조옮김 없음). 드럼 트랙이 없으면 None.
+fn drum_parts(
+    song: &Song,
+    opts: &Options,
+    grid: &BeatGrid,
+    tempos: &[(i64, i64)],
+    limits: &[i64; 3],
+    warnings: &mut Vec<String>,
+) -> Option<Vec<Vec<Note>>> {
+    let skip = |i: usize| opts.roles.as_ref().and_then(|r| r.get(&i)).map(|r| r == "skip").unwrap_or(false);
+    let drums: Vec<&Track> = song.tracks.iter().enumerate().filter(|(i, t)| t.is_drum && !t.notes.is_empty() && !skip(*i)).map(|(_, t)| t).collect();
+    if drums.is_empty() || !opts.include_drums {
+        return None;
+    }
+    let mut g = grid.clone();
+    g.frozen = true;
+    let q = quantize_tracks(&drums, &mut g);
+    let mut notes: Vec<Note> = Vec::new();
+    let mut unknown = 0;
+    for n in q.into_iter().flatten() {
+        match drum_kit_note(n.pitch, n.vel) {
+            Some(p) => {
+                let mut m = n.with_pitch(p);
+                if p == 50 {
+                    m.vel = 42.0; // 고스트: v4~6
+                } else if p == 45 && n.vel >= 100.0 {
+                    m.vel = m.vel.max(119.0); // 강한 스네어: v14~15
+                }
+                m.hold = 0.0;
+                notes.push(m);
+            }
+            None => unknown += 1,
+        }
+    }
+    sort_start_desc_pitch(&mut notes);
+    notes.dedup_by(|a, b| a.start == b.start && a.pitch == b.pitch);
+    // 오픈 하이햇 바로 뒤(8분음표 안) 클로즈드 하이햇: 게임에서 두 소리가 겹친다
+    let opens: Vec<f64> = notes.iter().filter(|n| n.pitch == 55).map(|n| n.start).collect();
+    let quick = notes.iter().filter(|n| n.pitch == 57 && opens.iter().any(|&o| o < n.start && n.start - o <= 48.0)).count();
+    // 드럼은 길이가 소리에 상관없으므로 다음 타격까지 늘려 쉼표 글자를 없앤다 (한 마디까지)
+    let make = |nv: usize| -> (Vec<Vec<Note>>, usize) {
+        let (voices, dropped) = split_voices(&notes, nv);
+        let mut parts: Vec<Vec<Note>> = voices
+            .into_iter()
+            .map(|mut v| {
+                for k in 0..v.len().saturating_sub(1) {
+                    let gap = v[k + 1].start - v[k].start;
+                    if gap > 0.0 && gap <= 384.0 {
+                        v[k].end = v[k + 1].start;
+                    }
+                }
+                v
+            })
+            .collect();
+        if !opts.tempo_all_parts {
+            parts = per_player(&parts, |c| silence_after_tempo(c, tempos));
+        }
+        (parts, dropped)
+    };
+    // 한 사람이 한 장에 못 치면 드럼 합주자를 두 명으로 (윗소리·아랫소리)
+    let (mut parts, mut dropped) = make(3);
+    let kit = player_opts(opts, Some(DRUM_KIT));
+    let end = max_end(&parts);
+    let fits_one = |p: &[Vec<Note>]| -> bool {
+        let e = max_end(p);
+        e <= 0 || encode_segment(p, tempos, 0, e, &kit).map(|sc| fits(&sc, limits)).unwrap_or(true)
+    };
+    if end > 0 && opts.fit != "none" && !fits_one(&parts) {
+        let (p6, d6) = make(6);
+        if p6.chunks(3).all(fits_one) {
+            parts = p6;
+            dropped = d6;
+        }
+    }
+    let mut w = format!("드럼 트랙 {}개를 마비노기 드럼 세트로 옮겼습니다 (조옮김 없음)", drums.len());
+    if unknown > 0 {
+        w += &format!(". 드럼 세트에 없는 소리 {}개는 뺐습니다", unknown);
+    }
+    if dropped > 0 {
+        w += &format!(". 동시에 4개 넘게 친 드럼 음 {}개는 뺐습니다", dropped);
+    }
+    warnings.push(w);
+    if quick > 0 {
+        warnings.push(format!("오픈 하이햇 바로 뒤에 클로즈드 하이햇이 {}곳 있습니다. 게임에서는 두 소리가 겹쳐 들릴 수 있습니다 (하프 오픈 하이햇은 없음)", quick));
+    }
+    Some(parts)
+}
+
+/// 합주에 쓸 양자화 격자를 드럼이 아닌 트랙 전체로 한 번 분석한다
+fn shared_grid_for(song: &Song, opts: &Options) -> Res<BeatGrid> {
+    let mut grid = BeatGrid::new(opts.grid, &opts.triplet)?;
+    let skip = |i: usize| opts.roles.as_ref().and_then(|r| r.get(&i)).map(|r| r == "skip").unwrap_or(false);
+    let mut pts = Vec::new();
+    for (i, t) in song.tracks.iter().enumerate() {
+        if t.is_drum || skip(i) {
+            continue;
+        }
+        for n in &t.notes {
+            pts.push(n.start);
+            pts.push(n.end);
+        }
+    }
+    grid.analyze(&pts);
+    grid.frozen = true;
+    Ok(grid)
+}
+
+/// 합주: 음 높이로 나눈다 (모든 합주자가 같은 연주 악기). 드럼 트랙은 드럼 세트 합주자로 따로.
 fn convert_by_pitch(song: &Song, opts: &Options) -> Res<ConvResult> {
     let auto = opts.players == 0;
     let candidates: Vec<usize> = if auto { AUTO_PLAYERS.collect() } else { vec![opts.players] };
-    let ((parts, tempos, limits, grid), warnings, moved) = pick_players(song, opts, &candidates, auto)?;
+    let grid = shared_grid_for(song, opts)?;
+    let o = Options { shared_grid: Some(grid), ..opts.clone() };
+    let ((mut parts, tempos, limits, grid), mut warnings, moved) = pick_players(song, &o, &candidates, auto)?;
     let n = parts.len() / 3;
+    let mut insts = vec![String::new(); n];
+    if let Some(d) = drum_parts(song, opts, &grid, &tempos, &limits, &mut warnings) {
+        for _ in 0..d.len() / 3 {
+            insts.push(DRUM_KIT.into());
+        }
+        parts.extend(d);
+    }
     let mut head = if auto {
         format!("합주 {}명 (자동): 합주자마다 멜로디·화음1·화음2 악보가 따로 있습니다. 모두 동시에 시작하세요", n)
     } else {
@@ -1213,7 +1454,10 @@ fn convert_by_pitch(song: &Song, opts: &Options) -> Res<ConvResult> {
     if moved > 0 {
         head += &format!(" (긴 파트 {}개는 뒷부분을 다른 합주자에게 넘겼습니다)", moved);
     }
-    let insts = vec![String::new(); n];
+    if insts.len() > n {
+        let who: Vec<String> = (n + 1..=insts.len()).map(|p| p.to_string()).collect();
+        head += &format!(" + 드럼 세트 합주자 {}", who.join("·"));
+    }
     finish_ensemble(song, opts, parts, &tempos, limits, &grid, warnings, &insts, head)
 }
 
@@ -1332,8 +1576,8 @@ fn convert_by_instrument(song: &Song, opts: &Options) -> Res<ConvResult> {
     let song_end = song.end_unit();
     let score_of = |g: &(&str, Vec<usize>)| g.1.iter().map(|&i| melody_score(&song.tracks[i], song_end)).fold(f64::NEG_INFINITY, f64::max);
     groups.sort_by(|a, b| score_of(b).partial_cmp(&score_of(a)).unwrap_or(std::cmp::Ordering::Equal));
-    if drums > 0 {
-        warnings.push(format!("드럼 트랙 {}개는 악기별 합주에서 뺐습니다", drums));
+    if drums > 0 && !opts.include_drums {
+        warnings.push(format!("드럼 트랙 {}개는 뺐습니다", drums));
     }
     let mut parts: Vec<Vec<Note>> = Vec::new();
     let mut insts: Vec<String> = Vec::new();
@@ -1362,6 +1606,15 @@ fn convert_by_instrument(song: &Song, opts: &Options) -> Res<ConvResult> {
         tempos = t;
         limits = l;
     }
+    if let Some(d) = drum_parts(song, opts, &grid, &tempos, &limits, &mut warnings) {
+        let first = insts.len() + 1;
+        for _ in 0..d.len() / 3 {
+            insts.push(DRUM_KIT.into());
+        }
+        parts.extend(d);
+        let who = if insts.len() > first { format!("합주자 {}~{}", first, insts.len()) } else { format!("합주자 {}", first) };
+        lines.push(format!("{}: {}", who, DRUM_KIT));
+    }
     let mut head = format!(
         "원곡 악기별 합주 {}명: 합주자마다 그 악기로 연주하세요 ({}). 모두 동시에 시작하세요",
         insts.len(),
@@ -1374,6 +1627,18 @@ fn convert_by_instrument(song: &Song, opts: &Options) -> Res<ConvResult> {
         warnings.push(format!("합주자가 {}명입니다. 사람이 모자라면 '음 높이로 나누기'를 쓰세요", insts.len()));
     }
     finish_ensemble(song, opts, parts, &tempos, limits, &grid, warnings, &insts, head)
+}
+
+/// 합주자 한 명의 악보를 적을 설정: 그 사람의 연주 악기(볼륨 한도 등). 드럼은 볼륨 차이 3 이상만 적어 글자를 아낀다.
+fn player_opts(o: &Options, inst: Option<&str>) -> Options {
+    match inst {
+        Some(i) if !i.is_empty() => Options {
+            instrument: i.to_string(),
+            volume_threshold: if i == DRUM_KIT { o.volume_threshold.max(3) } else { o.volume_threshold },
+            ..o.clone()
+        },
+        _ => o.clone(),
+    }
 }
 
 /// 합주자별 파트를 악보로 만든다: 여러 장이면 모든 합주자를 같은 마디에서 자른다.
@@ -1391,6 +1656,12 @@ fn finish_ensemble(
 ) -> Res<ConvResult> {
     let tempos = tempos.to_vec();
     let shift = -instrument_shift(&opts.instrument);
+    // 한 사람이라도 악기가 따로 있으면(드럼 등) 나머지는 설정의 연주 악기로 적어 둔다 (미리듣기 소리)
+    let insts: Vec<String> = if insts.iter().any(|i| !i.is_empty()) {
+        insts.iter().map(|i| if i.is_empty() { opts.instrument.clone() } else { i.clone() }).collect()
+    } else {
+        insts.to_vec()
+    };
     let mut empty_players = Vec::new();
     let chunks: Vec<&[Vec<Note>]> = parts.chunks(3).collect();
     let active: Vec<usize> = (0..chunks.len())
@@ -1405,7 +1676,7 @@ fn finish_ensemble(
     let mut per: Vec<Vec<Score>> = vec![Vec::new(); chunks.len()];
     let mut all_fit = true;
     for &p in &active {
-        let whole = encode_segment(chunks[p], &tempos, 0, max_end(chunks[p]), opts)?;
+        let whole = encode_segment(chunks[p], &tempos, 0, max_end(chunks[p]), &player_opts(opts, insts.get(p).map(|s| s.as_str())))?;
         all_fit &= fits(&whole, &limits);
         per[p] = vec![whole];
     }
@@ -1417,7 +1688,8 @@ fn finish_ensemble(
         let end = max_end(&parts);
         let bars = song_bars(song, grid, end as f64);
         let groups: Vec<&[Vec<Note>]> = active.iter().map(|&p| chunks[p]).collect();
-        let split = split_sheets_together(&groups, &tempos, &limits, bars, &o, &mut warnings)?;
+        let group_insts: Vec<Option<String>> = active.iter().map(|&p| insts.get(p).cloned()).collect();
+        let split = split_sheets_together(&groups, &group_insts, &tempos, &limits, bars, &o, &mut warnings)?;
         let pages = split.first().map(|v| v.len()).unwrap_or(0);
         for (&p, v) in active.iter().zip(split) {
             per[p] = v;
@@ -1450,6 +1722,95 @@ fn finish_ensemble(
     Ok(ConvResult { scores, limits, parts_notes: notes, tempos: res_tempos, warnings, sound_shift: shift })
 }
 
+/// 모바일 한 파트 글자 수 한도
+pub const MOBILE_LIMIT: i64 = 2400;
+/// 모바일 한 사람의 파트 수
+pub const MOBILE_PARTS: usize = 6;
+
+/// 모바일용 악보 (한 장에 최대 6파트)
+#[derive(Clone, Debug)]
+pub struct MobileExport {
+    pub sheets: Vec<Vec<String>>,
+    pub warnings: Vec<String>,
+}
+
+impl MobileExport {
+    pub fn clipboard(sheet: &[String]) -> String {
+        format!("MML@{};", sheet.join(","))
+    }
+
+    pub fn text(&self) -> String {
+        let mut out = Vec::new();
+        let n = self.sheets.len();
+        for (i, sh) in self.sheets.iter().enumerate() {
+            let head = if n > 1 { format!("[모바일 악보 {}/{}]", i + 1, n) } else { "[모바일 악보]".into() };
+            let lens: Vec<String> = sh
+                .iter()
+                .enumerate()
+                .map(|(k, p)| format!("{} {}/{}", crate::mobile_io::PART_LABELS[k], p.chars().count(), MOBILE_LIMIT))
+                .collect();
+            out.push(format!("{} 글자 수: {}", head, lens.join(" / ")));
+            out.push(Self::clipboard(sh));
+            out.push(String::new());
+        }
+        if !self.warnings.is_empty() {
+            out.push("[참고]".into());
+            out.extend(self.warnings.iter().map(|w| format!("- {}", w)));
+        }
+        out.join("\n")
+    }
+}
+
+/// 모바일용으로 내보낸다: 한 사람 6파트, 파트마다 2400자, 빈틈 메우기를 켜고, 템포는 음표 사이(빈 파트)에만 적는다.
+/// 모바일에서 되는지 확실하지 않은 c-/b+ 표기는 쓰지 않고, n번호는 쓴다.
+pub fn mobile_export(song: &Song, opts: &Options) -> Res<MobileExport> {
+    let o = Options {
+        rank: "1".into(),
+        custom_limits: Some([MOBILE_LIMIT; 3]),
+        fill_gaps: "on".into(),
+        players: 2,
+        by_instrument: false,
+        split_players: false,
+        keep_original: false,
+        include_drums: false,
+        tempo_all_parts: false,
+        jabchiel: false,
+        book: false,
+        flats: false,
+        n_numbers: true,
+        ..opts.clone()
+    };
+    let res = convert_by_pitch(song, &o)?;
+    let a: Vec<&Score> = res.scores.iter().filter(|s| s.player == 1).collect();
+    let b: Vec<&Score> = res.scores.iter().filter(|s| s.player == 2).collect();
+    let pages = a.len().max(b.len());
+    let mut sheets = Vec::new();
+    for i in 0..pages {
+        let mut parts: Vec<String> = Vec::new();
+        for sc in [a.get(i), b.get(i)].into_iter().flatten() {
+            parts.extend(sc.parts.iter().cloned());
+        }
+        while parts.len() > 1 && parts.last().map(|p| p.is_empty()).unwrap_or(false) {
+            parts.pop();
+        }
+        parts.truncate(MOBILE_PARTS);
+        sheets.push(parts);
+    }
+    let mut warnings: Vec<String> = vec![format!(
+        "모바일용: 한 사람 최대 {}파트, 파트마다 {}자. 음표 사이 빈틈을 메우고 템포는 쉬는 파트에만 적었습니다",
+        MOBILE_PARTS, MOBILE_LIMIT
+    )];
+    if pages > 1 {
+        warnings.push(format!("글자 수 때문에 {}장으로 나눴습니다 (모든 파트를 같은 마디에서)", pages));
+    }
+    for w in res.warnings.iter().skip(1) {
+        if !w.starts_with("글자 수 제한 때문에 모든 합주자") && !w.starts_with("합주자 ") {
+            warnings.push(w.clone());
+        }
+    }
+    Ok(MobileExport { sheets, warnings })
+}
+
 /// 마디 위치(bars)에서 잘라 글자 수 한도에 맞는 악보 여러 장으로 나눈다.
 fn split_sheets(
     parts: &[Vec<Note>],
@@ -1459,13 +1820,14 @@ fn split_sheets(
     opts: &Options,
     warnings: &mut Vec<String>,
 ) -> Res<Vec<Score>> {
-    Ok(split_sheets_together(&[parts], tempos, limits, bars, opts, warnings)?.remove(0))
+    Ok(split_sheets_together(&[parts], &[None], tempos, limits, bars, opts, warnings)?.remove(0))
 }
 
 /// 여러 합주자(세 파트씩)를 모두 같은 마디에서 잘라, 모든 사람이 한도에 맞는 장으로 나눈다.
 /// 돌려주는 값: 합주자마다 악보 목록 (장 수가 모두 같고 k 번째 장은 같은 구간).
 fn split_sheets_together(
     groups: &[&[Vec<Note>]],
+    insts: &[Option<String>],
     tempos: &[(i64, i64)],
     limits: &[i64; 3],
     mut bars: Vec<i64>,
@@ -1476,7 +1838,9 @@ fn split_sheets_together(
     let opts = &if book_fix { Options { ensemble_fix: false, ..opts.clone() } } else { opts.clone() };
     let mut out: Vec<Vec<Score>> = vec![Vec::new(); groups.len()];
     let mut i = 0usize;
-    let seg = |a: i64, b: i64, o: &Options| -> Res<Vec<Score>> { groups.iter().map(|g| encode_segment(g, tempos, a, b, o)).collect() };
+    let seg = |a: i64, b: i64, o: &Options| -> Res<Vec<Score>> {
+        groups.iter().enumerate().map(|(i, g)| encode_segment(g, tempos, a, b, &player_opts(o, insts.get(i).cloned().flatten().as_deref()))).collect()
+    };
     let ok = |v: &Vec<Score>| v.iter().all(|sc| fits(sc, limits));
     while i + 1 < bars.len() {
         let lo = i + 1;
@@ -1638,11 +2002,18 @@ pub fn preview_midi(scores: &[Score], shift: i64, program: i64, flat_tempo: bool
             let (parts, t) = scores_to_notes(&mine)?;
             let sh = if inst.is_empty() { shift } else { -instrument_shift(&inst) };
             let mut notes: Vec<Note> = parts.into_iter().flatten().collect();
+            let drum = inst == DRUM_KIT;
             for n in notes.iter_mut() {
-                n.pitch += sh;
+                n.pitch = if drum { drum_preview_note(n.pitch) } else { n.pitch + sh };
             }
             tracks.push(notes);
-            progs.push(if program < 0 { if inst.is_empty() { 0 } else { preview_program(&inst) } } else { program });
+            progs.push(if drum {
+                128 // 드럼 채널
+            } else if program < 0 {
+                if inst.is_empty() { 0 } else { preview_program(&inst) }
+            } else {
+                program
+            });
             for (u, b) in t {
                 if let Some(e) = tempos.iter_mut().find(|e| e.0 == u) {
                     e.1 = b;

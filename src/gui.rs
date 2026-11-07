@@ -83,6 +83,8 @@ pub struct Saved {
     pub ensemble: bool,
     pub players: String,
     pub ensemble_by: String,
+    /// 글자 수 줄이기 (n번호, c-/b+)
+    pub compact: bool,
 }
 
 impl Default for Saved {
@@ -104,6 +106,7 @@ impl Default for Saved {
             ensemble: false,
             players: PLAYER_CHOICES[0].into(),
             ensemble_by: ENSEMBLE_BY[0].into(),
+            compact: true,
         }
     }
 }
@@ -116,7 +119,8 @@ impl Saved {
             "gap_mode": self.gap_mode, "align": self.align, "part_vol0": self.part_vol[0], "part_vol1": self.part_vol[1],
             "part_vol2": self.part_vol[2], "ensemble_fix": self.ensemble_fix, "v0_tempo": self.v0_tempo,
             "sustain": self.sustain, "split_players": self.split_players,
-            "ensemble": self.ensemble, "players": self.players, "ensemble_by": self.ensemble_by
+            "ensemble": self.ensemble, "players": self.players, "ensemble_by": self.ensemble_by,
+            "compact": self.compact
         })
     }
 
@@ -141,6 +145,7 @@ impl Saved {
         if let Some(v) = gb("ensemble") { s.ensemble = v; }
         if let Some(v) = gs("players", &|v| PLAYER_CHOICES.contains(&v)) { s.players = v; }
         if let Some(v) = gs("ensemble_by", &|v| ENSEMBLE_BY.contains(&v)) { s.ensemble_by = v; }
+        if let Some(v) = gb("compact") { s.compact = v; }
         if !old {
             if let Some(v) = gb("ensemble_fix") { s.ensemble_fix = v; }
             if let Some(v) = gb("v0_tempo") { s.v0_tempo = v; }
@@ -411,6 +416,8 @@ impl App {
             split_players: s.split_players,
             players: if s.ensemble { s.players.parse().unwrap_or(0) } else { 1 },
             by_instrument: s.ensemble && s.ensemble_by == ENSEMBLE_BY[1],
+            flats: s.compact,
+            n_numbers: s.compact,
             keep_original: s.keep_original,
             jabchiel: s.jabchiel,
             roles: Some(roles),
@@ -647,7 +654,7 @@ impl App {
             if song.omr_reused { "  (기존 인식 결과 사용)" } else if omr { "  (악보 인식 완료)" } else { "" }
         );
         self.path = path.to_string();
-        self.roles = song.tracks.iter().map(|t| if t.is_drum || t.notes.is_empty() { "제외".into() } else { "자동".into() }).collect();
+        self.roles = song.tracks.iter().map(|t| if t.notes.is_empty() { "제외".into() } else { "자동".into() }).collect();
         self.song = Some(song);
         self.status.clear();
         self.last_fingerprint = self.fingerprint();
@@ -1262,6 +1269,34 @@ impl App {
         }
     }
 
+    fn mobile_export(&mut self, ctx: &egui::Context) {
+        let Some(song) = self.song.clone() else {
+            self.info("안내", "먼저 파일을 여세요");
+            return;
+        };
+        match crate::convert::mobile_export(&song, &self.convert_options()) {
+            Ok(m) => {
+                if let Some(first) = m.sheets.first() {
+                    let t = crate::convert::MobileExport::clipboard(first);
+                    self.copy(ctx, &t);
+                }
+                let name = format!("{}_모바일.txt", stem(&self.path));
+                let saved = rfd::FileDialog::new()
+                    .add_filter("텍스트", &["txt"])
+                    .set_file_name(&name)
+                    .save_file()
+                    .map(|p| crate::pyfmt::write_text(&p, m.text() + "\n").map(|_| p));
+                let n = m.sheets.len();
+                self.status = match saved {
+                    Some(Ok(p)) => format!("모바일용 {}장: 첫 장을 클립보드에 복사했고 전체는 {} 에 저장했습니다", n, p.display()),
+                    Some(Err(e)) => format!("모바일용 첫 장은 복사했지만 저장하지 못했습니다: {}", e),
+                    None => format!("모바일용 {}장 중 첫 장을 클립보드에 복사했습니다", n),
+                };
+            }
+            Err(e) => self.error("모바일용 내보내기 실패", &e.to_string()),
+        }
+    }
+
     fn save_split(&mut self) {
         let Some(res) = self.result.clone() else { return };
         if let Some(folder) = rfd::FileDialog::new().set_title("악보를 저장할 폴더 선택").pick_folder() {
@@ -1602,6 +1637,10 @@ impl App {
             if ui.button("초기화").clicked() {
                 self.dialogs.push(Dialog::ConfirmReset);
             }
+            if ui.button("모바일용 저장…").on_hover_text("한 사람 6파트, 파트마다 2400자, 빈틈 메우기로 바꿔 저장합니다. 첫 장은 클립보드에 복사").clicked() {
+                let ctx = ui.ctx().clone();
+                self.mobile_export(&ctx);
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Audiveris 위치 설정…").clicked() {
                     self.pick_audiveris();
@@ -1749,6 +1788,9 @@ impl App {
                 ui.checkbox(&mut self.saved.ensemble_fix, "64비트 합주 밀림 보정");
                 ui.add_space(12.0);
                 ui.checkbox(&mut self.saved.split_players, "모바일 MML을 두 사람 악보로 (1~3, 4~6파트)");
+                ui.add_space(12.0);
+                ui.checkbox(&mut self.saved.compact, "글자 수 줄이기 (n번호, c-·b+ 표기)")
+                    .on_hover_text("멀리 떨어진 한 음은 n번호로, 옥타브 경계 음은 c-·b+ 로 적어 옥타브 바꿈 글자를 줄입니다");
             });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.saved.ensemble, "합주")

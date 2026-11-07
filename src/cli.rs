@@ -20,6 +20,8 @@ MIDI / MusicXML / 악보 PDF 파일을 PC판 마비노기 MML(MML@멜로디,화�
   --split-players            모바일 MML의 1~3파트, 4~6파트를 두 사람 PC 악보로 나눔
   --players N|auto           합주: N명(2~8)이 함께 치도록 나눔. auto 는 음을 빼지 않고 한 사람 한 장에 들어가는 인원
   --by-instrument            합주를 원곡 악기(트랙)별로 나누고 합주자마다 어울리는 마비노기 악기를 정함 (합주 켜짐)
+  --mobile                   모바일용으로 내보냄 (한 사람 6파트, 파트마다 2400자, 빈틈 메우기)
+  --no-compact               글자 수 줄이기(n번호, c-/b+ 표기)를 쓰지 않음
   --instrument 악기          연주 악기 (높게 나는 악기는 낮춰 적음)
   --no-low-limit             o2e 아래 음을 올리지 않음
   --fill-gaps auto|on|off    짧은 빈틈 메우기
@@ -68,6 +70,8 @@ struct Args {
     split_players: bool,
     players: Option<usize>,
     by_instrument: bool,
+    mobile: bool,
+    no_compact: bool,
     instrument: String,
     no_low_limit: bool,
     fill_gaps: String,
@@ -154,6 +158,8 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             "--rearrange" => a.rearrange = true,
             "--split-players" => a.split_players = true,
             "--by-instrument" => a.by_instrument = true,
+            "--mobile" => a.mobile = true,
+            "--no-compact" => a.no_compact = true,
             "--players" => {
                 let v = val(&mut i)?;
                 a.players = Some(if v.trim().eq_ignore_ascii_case("auto") {
@@ -348,11 +354,31 @@ pub fn main(argv: &[String]) -> i32 {
         jabchiel: !a.no_jabchiel,
         roles: Some(roles),
         include_drums: a.drums,
+        flats: !a.no_compact,
+        n_numbers: !a.no_compact,
         ..Default::default()
     };
     if opts.rank == "무제한" || crate::ranks::limits_for(&opts.rank, opts.no_song, None).is_err() {
         eprintln!("알 수 없는 랭크: {} (사용 가능: {})", opts.rank, rank_order().join(", "));
         return 2;
+    }
+    if a.mobile {
+        let m = match crate::convert::mobile_export(&song, &opts) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{}", e);
+                return 1;
+            }
+        };
+        let text = m.text();
+        println!("{}", text);
+        if let Some(o) = &a.output {
+            if let Err(e) = crate::pyfmt::write_text(o, text + "\n") {
+                eprintln!("저장 실패: {}", e);
+                return 1;
+            }
+        }
+        return 0;
     }
     let res = match convert_song(&song, &opts) {
         Ok(r) => r,

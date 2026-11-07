@@ -238,7 +238,7 @@ fn lecture_rules() {
     assert_eq!(r.parts_notes[0][0].pitch, 39);
     assert!(r.warnings.iter().any(|w| w.contains("안 날 수") && w.contains("마디 1")));
     assert_eq!(one(vec![n(0.0, 96.0, 39, 100.0)], "", Options { instrument: "만돌린".into(), ..opts() }).parts_notes[0][0].pitch, 51);
-    assert!(one(base.clone(), "", Options { instrument: "실로폰".into(), ..opts() }).warnings.iter().any(|w| w.contains("화음 파트가 안 날 수")));
+    assert!(one(base.clone(), "", Options { instrument: "실로폰".into(), ..opts() }).warnings.iter().any(|w| w.contains("한 파트 악기")));
     // 낮은 음
     let low = vec![n(0.0, 96.0, 39, 100.0), n(384.0, 480.0, 40, 100.0), n(768.0, 864.0, 28, 100.0)];
     let r = one(low.clone(), "", opts());
@@ -682,4 +682,64 @@ fn ensemble_by_instrument_and_narrow_instruments() {
     .unwrap();
     assert!(g.parts_notes[0].iter().all(|x| (24..=71).contains(&x.pitch)));
     assert!(g.warnings.iter().any(|w| w.contains("가야금")));
+}
+
+#[test]
+fn drums_mobile_compact_one_part() {
+    // 드럼: GM 번호를 드럼 세트 음으로 (킥 36 -> o2f, 스네어 38 -> o2a, 약한 스네어 -> o3d 고스트, 클로즈드 하이햇 42 -> o3a)
+    let mut drum_notes = vec![];
+    for b in 0..8 {
+        let t = (b * 96) as f64;
+        drum_notes.push(n(t, t + 24.0, if b % 2 == 0 { 36 } else { 38 }, if b == 3 { 30.0 } else { 110.0 }));
+        drum_notes.push(n(t, t + 24.0, 42, 80.0));
+    }
+    let mut dt = Track::new("Drums", drum_notes);
+    dt.is_drum = true;
+    let mel = Track::new("m", (0..8).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 72 + i as i64, 100.0)).collect());
+    let song = Song { tracks: vec![mel, dt], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let solo = convert_song(&song, &Options { roles: Some([(0, "auto".to_string()), (1, "auto".to_string())].into_iter().collect()), ..opts() }).unwrap();
+    assert!(solo.warnings.iter().any(|w| w.contains("드럼 트랙은 혼자")));
+    assert!(solo.parts_notes.iter().flatten().all(|x| x.pitch >= 72));
+    let e = convert_song(&song, &Options { players: 2, include_drums: true, ..opts() }).unwrap();
+    let drum: Vec<&Score> = e.scores.iter().filter(|s| s.instrument == "드럼 세트").collect();
+    assert_eq!(drum.len(), 1, "{:?}", e.warnings);
+    let (dn, _) = scores_to_notes(&[drum[0].clone()]).unwrap();
+    let pitches: std::collections::BTreeSet<i64> = dn.iter().flatten().filter(|x| x.vel > 0.0).map(|x| x.pitch).collect();
+    assert_eq!(pitches.into_iter().collect::<Vec<_>>(), vec![41, 45, 50, 57]);
+    let (bytes, _) = mabimml::convert::preview_midi(&e.scores, 0, -1, true).unwrap();
+    assert!(bytes.windows(3).any(|w| w[0] == 0x99 && w[1] == 36), "드럼은 10번 채널로");
+
+    // 모바일: 6파트까지, 파트마다 2400자 안
+    let mut rng = Rng(5);
+    let dense: Vec<Note> = (0..1200)
+        .flat_map(|i| {
+            let t = (i * 48) as f64;
+            [72, 64, 55, 48].iter().map(move |&p| (t, p)).collect::<Vec<_>>()
+        })
+        .map(|(t, p)| n(t, t + 48.0, p + rng.range(0, 4), 90.0))
+        .collect();
+    let big = Song { tracks: vec![Track::new("d", dense)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let m = mabimml::convert::mobile_export(&big, &opts()).unwrap();
+    assert!(!m.sheets.is_empty());
+    assert!(m.sheets.iter().all(|sh| sh.len() <= 6 && sh.len() >= 4 && sh.iter().all(|p| p.chars().count() <= 2400)), "{:?}", m.warnings);
+    assert!(m.sheets.iter().flatten().all(|p| !p.contains("c-") && !p.contains("b+")));
+    assert!(m.text().contains("MML@"));
+
+    // 글자 수 줄이기: 경계 음과 멀리 떨어진 한 음
+    let jumpy: Vec<Note> = (0..16)
+        .map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, match i % 4 { 1 => 59, 3 => 96, _ => 60 }, 100.0))
+        .collect();
+    let c = one(jumpy.clone(), "", opts());
+    let plain = one(jumpy.clone(), "", Options { flats: false, n_numbers: false, ..opts() });
+    let txt = &c.scores[0].parts[0];
+    assert!(txt.contains("c-") && txt.contains("n84"), "{}", txt);
+    assert!(txt.len() < plain.scores[0].parts[0].len());
+    let (back, _, _) = parse_part(txt).unwrap();
+    assert_eq!(back.iter().map(|x| x.pitch).collect::<Vec<_>>(), jumpy.iter().map(|x| x.pitch).collect::<Vec<_>>());
+
+    // 실로폰(핸드 차임): 멜로디 한 파트, 볼륨 v11까지
+    let chord: Vec<Note> = (0..8).flat_map(|i| [72, 67, 60].map(|p| n((i * 96) as f64, (i * 96 + 96) as f64, p, 127.0))).collect();
+    let x = one(chord, "", Options { instrument: "실로폰".into(), ..opts() });
+    assert!(x.scores[0].parts[1].is_empty() && x.scores[0].parts[2].is_empty());
+    assert!(x.scores[0].parts[0].contains("v11") && !x.scores[0].parts[0].contains("v15"));
 }
