@@ -344,6 +344,10 @@ pub struct Options {
     pub cut_end_sec: f64,
     /// 합주에서 뺄 합주자 (빼기 전 원래 번호, 1부터)
     pub drop_players: Vec<usize>,
+    /// 드럼 글자 아끼기 (고스트·잘게 친 하이햇 빼기, 볼륨 한 가지)
+    pub drum_compact: bool,
+    /// 드럼 합주자는 한도 안에서 여러 장을 한 장으로 합친다 (장을 덜 바꿈)
+    pub drum_merge: bool,
 }
 
 impl Default for Options {
@@ -389,6 +393,8 @@ impl Default for Options {
             cut_start_sec: 0.0,
             cut_end_sec: 0.0,
             drop_players: Vec::new(),
+            drum_compact: false,
+            drum_merge: false,
         }
     }
 }
@@ -1645,11 +1651,19 @@ fn drum_parts(
     let q = quantize_tracks(&drums, &mut g);
     let mut notes: Vec<Note> = Vec::new();
     let mut unknown = 0;
+    let mut thinned = 0;
     for n in q.into_iter().flatten() {
         match drum_kit_note(n.pitch, n.vel) {
             Some(p) => {
                 let mut m = n.with_pitch(p);
-                if p == 50 {
+                if opts.drum_compact {
+                    // 글자 아끼기: 고스트 스네어는 빼고, 하이햇·라이드는 8분음표 자리만, 볼륨은 한 가지로 (볼륨 글자가 안 붙게)
+                    if p == 50 || ((p == 57 || p == 64 || p == 55) && (m.start as i64).rem_euclid(48) != 0) {
+                        thinned += 1;
+                        continue;
+                    }
+                    m.vel = 100.0;
+                } else if p == 50 {
                     m.vel = 42.0; // 고스트: v4~6
                 } else if p == 45 && n.vel >= 100.0 {
                     m.vel = m.vel.max(119.0); // 강한 스네어: v14~15
@@ -1659,6 +1673,9 @@ fn drum_parts(
             }
             None => unknown += 1,
         }
+    }
+    if thinned > 0 {
+        warnings.push(format!("드럼 글자 아끼기: 고스트 스네어와 8분음표보다 잘게 친 하이햇 {}개를 빼고 볼륨을 한 가지로 적었습니다", thinned));
     }
     sort_start_desc_pitch(&mut notes);
     notes.dedup_by(|a, b| a.start == b.start && a.pitch == b.pitch);
@@ -2124,6 +2141,33 @@ fn finish_ensemble(
                 "글자 수 제한 때문에 모든 합주자 악보를 같은 마디에서 {}장으로 나눴습니다. 장마다 모두 함께 시작하세요 (장 길이도 모두 같습니다)",
                 pages
             ));
+        }
+    }
+    // 드럼 장 합치기: 드럼 합주자는 다른 합주자의 장 경계 중에서, 한도 안에 드는 만큼 여러 장을 한 장으로
+    if opts.drum_merge {
+        let drum_ps: Vec<usize> = (0..per.len()).filter(|&p| insts.get(p).map(|i| i == DRUM_KIT).unwrap_or(false) && per[p].len() > 1).collect();
+        for p in drum_ps {
+            let bounds: Vec<i64> = per[p].iter().map(|s| s.start as i64).chain(per[p].last().map(|s| s.end as i64)).collect();
+            let o = Options { book: true, tempo_all_parts: true, ..player_opts(opts, Some(DRUM_KIT)) };
+            let mut merged: Vec<Score> = Vec::new();
+            let mut i = 0;
+            while i + 1 < bounds.len() {
+                let mut j = i + 1;
+                while j + 1 < bounds.len() && fits(&encode_segment(chunks[p], &tempos, bounds[i], bounds[j + 1], &o)?, &limits) {
+                    j += 1;
+                }
+                merged.push(encode_segment(chunks[p], &tempos, bounds[i], bounds[j], &o)?);
+                i = j;
+            }
+            if merged.len() < per[p].len() {
+                warnings.push(format!(
+                    "드럼 장 합치기: 합주자 {}(드럼)은 {}장을 {}장으로 합쳤습니다. 다른 합주자가 장을 바꿀 때 잠깐 쉬는 만큼 드럼이 앞설 수 있어요",
+                    p + 1,
+                    per[p].len(),
+                    merged.len()
+                ));
+                per[p] = merged;
+            }
         }
     }
     let mut scores: Vec<Score> = Vec::new();

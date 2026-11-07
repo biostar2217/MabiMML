@@ -22,6 +22,8 @@ MIDI / MusicXML / 악보 PDF 파일을 PC판 마비노기 MML(MML@멜로디,화�
   --by-instrument            합주를 원곡 악기(트랙)별로 나누고 합주자마다 어울리는 마비노기 악기를 정함 (합주 켜짐)
   --auto-drums               합주에서 드럼 트랙이 없으면 박자에 맞춘 드럼을 만들어 드럼 세트 합주자로
   --drum-style 모양           자동 드럼 모양: 기본, 풍성하게, 단순하게
+  --drum-compact             드럼 글자 아끼기 (고스트·잘게 친 하이햇 빼기, 볼륨 한 가지)
+  --drum-merge               드럼 합주자는 한도 안에서 여러 장을 한 장으로 합침
   --mobile                   모바일용으로 내보냄 (한 사람 6파트, 파트마다 2400자, 빈틈 메우기)
   --no-compact               글자 수 줄이기(n번호, c-/b+ 표기)를 쓰지 않음
   --instrument 악기          연주 악기 (높게 나는 악기는 낮춰 적음)
@@ -75,6 +77,8 @@ struct Args {
     mobile: bool,
     auto_drums: bool,
     drum_style: Option<String>,
+    drum_compact: bool,
+    drum_merge: bool,
     no_compact: bool,
     instrument: String,
     no_low_limit: bool,
@@ -164,6 +168,8 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             "--by-instrument" => a.by_instrument = true,
             "--mobile" => a.mobile = true,
             "--auto-drums" => a.auto_drums = true,
+            "--drum-compact" => a.drum_compact = true,
+            "--drum-merge" => a.drum_merge = true,
             "--drum-style" => a.drum_style = Some(choice(val(&mut i)?, &["기본", "풍성하게", "단순하게"], "--drum-style")?),
             "--no-compact" => a.no_compact = true,
             "--players" => {
@@ -362,6 +368,8 @@ pub fn main(argv: &[String]) -> i32 {
         roles: Some(roles),
         include_drums: a.drums,
         auto_drums: a.auto_drums,
+        drum_compact: a.drum_compact,
+        drum_merge: a.drum_merge,
         drum_style: a.drum_style.clone().unwrap_or_else(|| "기본".into()),
         flats: !a.no_compact,
         n_numbers: !a.no_compact,
