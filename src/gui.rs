@@ -157,16 +157,12 @@ impl Saved {
         if let Some(v) = gb("low_limit") { s.low_limit = v; }
         if let Some(v) = gb("align") { s.align = v; }
         if let Some(v) = gb("split_players") { s.split_players = v; }
-        if let Some(v) = gb("ensemble") { s.ensemble = v; }
+        // 합주 켜기·자동 드럼·합주자별 악기는 곡마다 정하는 것이라 다음 실행에 이어 쓰지 않는다
         if let Some(v) = gs("players", &|v| PLAYER_CHOICES.contains(&v)) { s.players = v; }
         if let Some(v) = gs("ensemble_by", &|v| ENSEMBLE_BY.contains(&v)) { s.ensemble_by = v; }
         if let Some(v) = gb("compact") { s.compact = v; }
         if let Some(v) = gb("drums") { s.drums = v; }
-        if let Some(v) = gb("auto_drums") { s.auto_drums = v; }
         if let Some(v) = gs("drum_style", &|v| crate::convert::DRUM_STYLES.contains(&v)) { s.drum_style = v; }
-        if let Some(a) = saved.get("player_insts").and_then(|v| v.as_array()) {
-            s.player_insts = a.iter().take(8).map(|x| x.as_str().unwrap_or("").to_string()).collect();
-        }
         if !old {
             if let Some(v) = gb("ensemble_fix") { s.ensemble_fix = v; }
             if let Some(v) = gb("v0_tempo") { s.v0_tempo = v; }
@@ -564,6 +560,7 @@ impl App {
             return;
         }
         self.other.transpose = 0;
+        self.new_song_reset(path);
         self.file_label = format!("{} 읽는 중…", base_name(path));
         self.status.clear();
         let re_ocr = self.other.re_ocr;
@@ -682,6 +679,17 @@ impl App {
         }
     }
 
+    /// 새 곡을 열 때: 앞 곡에서 켠 합주(합주자·드럼·합주자별 악기)는 이어지지 않게 끈다
+    fn new_song_reset(&mut self, path: &str) {
+        if self.path != path && (self.saved.ensemble || self.saved.auto_drums || !self.saved.player_insts.is_empty()) {
+            self.saved.ensemble = false;
+            self.saved.auto_drums = false;
+            self.saved.player_insts.clear();
+            self.save_settings();
+            self.load_note = "새 곡이라 합주는 꺼 두었습니다. 필요하면 '연주 맞춤'에서 합주를 켜세요".into();
+        }
+    }
+
     fn after_convert_notes(&mut self) {
         if self.song.as_ref().map(|s| s.omr_reused).unwrap_or(false) {
             self.status += " · 기존 인식 결과 사용 (새로 하려면 '다시 인식'을 켜고 파일을 다시 여세요)";
@@ -730,6 +738,7 @@ impl App {
         match read_mobile_mml(text) {
             Ok(song) => {
                 self.other.transpose = 0;
+                self.new_song_reset("붙여넣은MML.txt");
                 self.loaded_now("붙여넣은MML.txt", song);
             }
             Err(e) => self.error("MML 읽기 실패", &e.to_string()),
