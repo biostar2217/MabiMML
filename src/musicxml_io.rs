@@ -187,7 +187,11 @@ pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
             if pi == 0 {
                 bars.push(pos);
             }
+            // 마디 안에서 가장 멀리 간 위치. 마지막 성부가 짧거나 <backup> 으로 끝나도
+            // 다음 마디는 여기서 시작해야 마디끼리 겹치지 않는다 (악보 인식 결과에 흔함).
+            let mut furthest = pos;
             for el in elements(&measure) {
+                furthest = furthest.max(pos);
                 let tag = name(&el);
                 if tag == "attributes" {
                     if let Some(d) = num_f(&el, "divisions") {
@@ -315,6 +319,7 @@ pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
                     }
                 }
             }
+            pos = pos.max(furthest);
         }
         sort_start_desc_pitch(&mut notes);
         let nm = names.get(&pid).cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("파트 {}", pi + 1));

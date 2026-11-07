@@ -554,3 +554,28 @@ fn omr_reuse_and_backup() {
     assert!(od.join("곡_인식_백업1.mxl").exists());
     assert!(mabimml::omr::existing_results(&pdfs).is_empty());
 }
+
+#[test]
+fn musicxml_measure_ending_with_backup_does_not_overlap_next() {
+    // 악보 인식 결과처럼 마디가 <backup> 으로 끝나거나 마지막 성부가 짧아도 다음 마디는 마디 끝에서 시작
+    let n = |step: &str, dur: i64, voice: i64| {
+        format!("<note><pitch><step>{}</step><octave>4</octave></pitch><duration>{}</duration><voice>{}</voice></note>", step, dur, voice)
+    };
+    let m1 = format!(
+        "<measure number=\"1\"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>{}<backup><duration>4</duration></backup>{}<backup><duration>2</duration></backup></measure>",
+        n("C", 4, 1),
+        n("E", 2, 2)
+    );
+    let m2 = format!("<measure number=\"2\">{}</measure>", n("G", 4, 1));
+    let m3 = format!("<measure number=\"3\">{}<backup><duration>4</duration></backup>{}</measure>", n("A", 4, 1), n("F", 1, 2));
+    let m4 = format!("<measure number=\"4\">{}</measure>", n("B", 4, 1));
+    let xml = format!(
+        "<score-partwise><part-list><score-part id=\"P1\"><part-name>p</part-name></score-part></part-list><part id=\"P1\">{}{}{}{}</part></score-partwise>",
+        m1, m2, m3, m4
+    );
+    let song = mabimml::musicxml_io::read_musicxml_text(&xml).unwrap();
+    assert_eq!(song.bars.as_ref().unwrap(), &vec![0.0, 384.0, 768.0, 1152.0]);
+    let starts = |pc: i64| song.tracks[0].notes.iter().filter(|x| x.pitch == 60 + pc).map(|x| x.start).collect::<Vec<_>>();
+    assert_eq!(starts(7), vec![384.0]);
+    assert_eq!(starts(11), vec![1152.0]);
+}
