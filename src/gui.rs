@@ -300,6 +300,10 @@ pub struct App {
     ai_undo: Option<serde_json::Map<String, Value>>,
     /// AI 가 MML 을 고치기 전의 결과 글 (되돌리기)
     ai_undo_texts: Option<Vec<String>>,
+    /// 설정을 바꾼 뒤 새 MML 로 AI 에게 한 번 더 물을 명령 (설정과 MML 고침을 함께 할 때)
+    ai_followup: Option<String>,
+    /// 마지막으로 AI 에게 보낸 명령
+    ai_last_cmd: String,
     ai_rx: Option<Receiver<Result<serde_json::Map<String, Value>, String>>>,
     // 업데이트
     update_rx: Option<(Receiver<updater::CheckResult>, bool)>,
@@ -388,6 +392,8 @@ impl App {
             ai_label: AI_HINT.into(),
             ai_undo: None,
             ai_undo_texts: None,
+            ai_followup: None,
+            ai_last_cmd: String::new(),
             ai_rx: None,
             update_rx: None,
             download: None,
@@ -820,6 +826,10 @@ impl App {
         self.last_fingerprint = self.fingerprint();
         if replay {
             self.toggle_play();
+        }
+        // AI 가 설정을 바꾼 뒤 MML 도 고치기로 했으면 새 MML 로 이어서 묻는다
+        if let Some(cmd) = self.ai_followup.take() {
+            self.ai_run_cmd(&cmd);
         }
     }
 
@@ -1605,7 +1615,8 @@ impl App {
             "volume": o.volume, "fit": o.fit, "part_volume": s.part_vol,
             "ensemble": s.ensemble, "players": s.players, "ensemble_by": s.ensemble_by,
             "drums": s.drums, "player_instruments": s.player_insts.join(","), "auto_drums": s.auto_drums,
-            "drum_style": s.drum_style
+            "drum_style": s.drum_style,
+            "track_roles": self.roles.iter().enumerate().map(|(i, r)| format!("{}:{}", i + 1, r)).collect::<Vec<_>>().join(",")
         });
         v.as_object().cloned().unwrap()
     }
@@ -1637,6 +1648,19 @@ impl App {
                 "drums" => if let Some(b) = b { self.saved.drums = b },
                 "auto_drums" => if let Some(b) = b { self.saved.auto_drums = b },
                 "drum_style" => if let Some(s) = st.filter(|s| crate::convert::DRUM_STYLES.contains(&s.as_str())) { self.saved.drum_style = s },
+                "track_roles" => {
+                    if let Some(s) = st {
+                        for item in s.split(',') {
+                            if let Some((n, r)) = item.split_once(':') {
+                                if let Ok(n) = n.trim().parse::<usize>() {
+                                    if n >= 1 && n <= self.roles.len() && ROLE_LABELS.iter().any(|x| x.0 == r.trim()) {
+                                        self.roles[n - 1] = r.trim().to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 "player_instruments" => {
                     if let Some(s) = st {
                         self.saved.player_insts = s.split(',').take(8).map(|x| x.trim().to_string()).collect();
@@ -1660,10 +1684,16 @@ impl App {
 
     fn ai_run(&mut self) {
         let command = self.ai_entry.trim().to_string();
+        self.ai_run_cmd(&command);
+    }
+
+    fn ai_run_cmd(&mut self, command: &str) {
+        let command = command.trim().to_string();
         if command.is_empty() {
             self.ai_label = "명령을 적어 주세요".into();
             return;
         }
+        self.ai_last_cmd = command.clone();
         let relay = ai::relay_url();
         let choices = self.ai_choices();
         let info = self.ai_song_info();
@@ -1729,6 +1759,47 @@ impl App {
         let mut done = 0;
         let mut problems = Vec::new();
         for (sheet, part, mml) in edits {
+            if *part == 3 {
+                // 장 전체 (세 파트) 바꾸기 또는 새 장 붙이기
+                let mut parts = split_clipboard(mml.trim());
+                if parts.len() > 3 {
+                    problems.push(format!("악보 {}: 파트가 3개를 넘음", sheet + 1));
+                    continue;
+                }
+                while parts.len() < 3 {
+                    parts.push(String::new());
+                }
+                if let Some((k, e)) = parts.iter().enumerate().find_map(|(k, p)| parse_part(p).err().map(|e| (k, e))) {
+                    problems.push(format!("악보 {} {}: MML 오류 ({})", sheet + 1, PART_NAMES[k], e));
+                    continue;
+                }
+                for (k, p) in parts.iter().enumerate() {
+                    let len = p.chars().count() as i64;
+                    if len > limits[k] {
+                        problems.push(format!("악보 {} {}: 글자 수 {}이 한도 {}를 넘음", sheet + 1, PART_NAMES[k], len, limits[k]));
+                    }
+                }
+                let text = format!("MML@{};", parts.join(","));
+                if *sheet < self.score_texts.len() {
+                    self.score_texts[*sheet] = text;
+                    done += 1;
+                } else if *sheet == self.score_texts.len() {
+                    // 새 장: 마지막 장 다음에 붙인다 (같은 합주자)
+                    if let Some(res) = self.result.as_mut() {
+                        if let Some(last) = res.scores.last().cloned() {
+                            let mut sc = Score::new(parts.clone(), last.end, last.end);
+                            sc.player = last.player;
+                            sc.instrument = last.instrument.clone();
+                            res.scores.push(sc);
+                            self.score_texts.push(text);
+                            done += 1;
+                        }
+                    }
+                } else {
+                    problems.push(format!("악보 {} 없음", sheet + 1));
+                }
+                continue;
+            }
             let Some(text) = self.score_texts.get(*sheet).cloned() else {
                 problems.push(format!("악보 {} 없음", sheet + 1));
                 continue;
@@ -1755,9 +1826,22 @@ impl App {
             self.score_texts[*sheet] = format!("MML@{};", parts.join(","));
             done += 1;
         }
+        // 고친 장에서 파트 길이가 서로 다르면 알린다 (합주·다음 장이 어긋날 수 있음)
+        let mut touched: Vec<usize> = edits.iter().map(|e| e.0).collect();
+        touched.sort();
+        touched.dedup();
+        for i in touched {
+            if let Some(text) = self.score_texts.get(i) {
+                let lens: Vec<f64> = split_clipboard(text.trim()).iter().filter(|p| !p.is_empty()).filter_map(|p| parse_part(p).ok().map(|r| r.2)).collect();
+                if let (Some(lo), Some(hi)) = (lens.iter().cloned().reduce(f64::min), lens.iter().cloned().reduce(f64::max)) {
+                    if hi - lo > 1.0 {
+                        problems.push(format!("악보 {}: 파트 길이가 서로 달라요 ({:.1}~{:.1}박) 합주가 어긋날 수 있어요", i + 1, lo / 96.0, hi / 96.0));
+                    }
+                }
+            }
+        }
         if done > 0 {
             self.ai_undo_texts = Some(before);
-            self.ai_undo = None;
             if self.player.is_playing() {
                 self.player.stop();
             }
@@ -1780,9 +1864,23 @@ impl App {
                 if !changes.is_empty() {
                     self.ai_undo = Some(self.ai_state());
                     self.ai_undo_texts = None;
+                    let before = self.fingerprint();
                     self.ai_set(&changes);
-                    if !edits.is_empty() {
-                        note += "  (설정을 바꿔 MML이 다시 만들어지므로 MML 고침은 적용하지 않았습니다. 한 번 더 명령해 주세요)";
+                    // 설정과 MML 고침을 함께 원하면: 새 MML 이 만들어진 뒤 같은 명령으로 한 번 더 묻는다
+                    let wants_mml = !edits.is_empty() || data.get("reply").and_then(|v| v.as_str()).map(|r| r.contains("한 번 더")).unwrap_or(false);
+                    let already = self.ai_last_cmd.contains("앞 단계에서 설정은 이미 바꿨다");
+                    if wants_mml && !already && !self.ai_entry.trim().is_empty() {
+                        let cmd = format!(
+                            "{}\n(앞 단계에서 설정은 이미 바꿨다. 이제 새로 만들어진 MML 에서 설정으로 안 되는 부분만 mml_edits 로 고친다. changes 는 비운다)",
+                            self.ai_entry.trim()
+                        );
+                        if self.fingerprint() == before {
+                            self.ai_followup = None;
+                            self.ai_run_cmd(&cmd);
+                            return;
+                        }
+                        self.ai_followup = Some(cmd);
+                        note += "  (설정을 바꿨고, 새 MML이 만들어지면 이어서 MML도 고칩니다…)";
                     }
                 } else if !edits.is_empty() {
                     let (done, problems) = self.apply_mml_edits(&edits);
@@ -2209,8 +2307,12 @@ impl App {
             ui.add_enabled_ui(self.ai_undo.is_some() || self.ai_undo_texts.is_some(), |ui| {
                 if ui.button("되돌리기").clicked() {
                     if let Some(t) = self.ai_undo_texts.take() {
-                        if t.len() == self.score_texts.len() {
+                        if let Some(res) = self.result.as_mut() {
+                            res.scores.truncate(t.len().max(1));
+                        }
+                        if t.len() <= self.score_texts.len() {
                             self.score_texts = t;
+                            self.tab = self.tab.min(self.score_texts.len().saturating_sub(1));
                         }
                         self.ai_label = "AI가 고친 MML을 되돌렸습니다".into();
                     } else if let Some(u) = self.ai_undo.take() {

@@ -116,7 +116,7 @@ fn relay_body_shape() {
     let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["app", "version", "system", "messages", "max_tokens"]);
     assert_eq!(body["app"], "MabiMML");
-    assert!(body["max_tokens"].as_i64().unwrap() <= 8192);
+    assert!(body["max_tokens"].as_i64().unwrap() <= 32000);
     let system = body["system"].as_str().unwrap();
     assert!(system.contains("JSON 스키마") && system.contains("\"changes\""));
     let content = body["messages"][0]["content"].as_str().unwrap();
@@ -319,10 +319,16 @@ fn live_drum_edit() {
     }
     let info = serde_json::json!({"파일": "golden-hour.mid", "악보": res.scores.iter().enumerate().map(|(i, s)| serde_json::json!({"장": i + 1, "합주자": s.player, "악기": s.instrument, "글자 수": s.lengths(), "한도": res.limits})).collect::<Vec<_>>()});
     let state = serde_json::json!({"ensemble": true, "players": "1", "auto_drums": true});
-    let body = ai::build_request("합주자2 드럼을 좀더 다채롭게 해줬으면 좋겠어 악보새로만들어도돼", &state, &info, Some(&serde_json::Value::Object(sheets)), &c);
+    let body = ai::build_request(&std::env::var("MABIMML_AI_CMD").unwrap_or_else(|_| "합주자2 드럼을 좀더 다채롭게 해줬으면 좋겠어 악보새로만들어도돼".into()), &state, &info, Some(&serde_json::Value::Object(sheets)), &c);
     println!("보내는 글자 수: {}", ai::py_json(&ai::relay_body(&body, "2.4.5"), None).len());
     match ai::ask_relay(&body, mabimml::VERSION, ai::RELAY_URL) {
-        Ok(d) => println!("읽음: reply={:?} edits={}", d.get("reply"), d.get("mml_edits").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0)),
+        Ok(d) => {
+            println!("읽음: reply={:?} edits={}", d.get("reply"), d.get("mml_edits").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0));
+            for (sheet, part, mml) in ai::mml_edits(&ai::changes_to_dict(&d, &c)) {
+                let ok = if part == 3 { mabimml::mml_parser::split_clipboard(&mml).iter().all(|p| mabimml::mml_parser::parse_part(p).is_ok()) } else { mabimml::mml_parser::parse_part(&mml).is_ok() };
+                println!("고침: 악보 {} 파트 {} 글자 {} 문법 {}", sheet + 1, part, mml.chars().count(), ok);
+            }
+        }
         Err(e) => {
             println!("오류: {}", e.0);
             let raw = std::fs::read_to_string(std::env::temp_dir().join("mabimml_ai_last_answer.txt")).unwrap_or_default();
