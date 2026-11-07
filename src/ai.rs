@@ -299,7 +299,8 @@ pub fn read_relay_answer(answer: &Value) -> Result<Value, AIError> {
 /// 중계 서버로 묻고 모델의 JSON 답을 돌려준다. 오류는 한국어 AIError. (앱에는 키가 없다)
 pub fn ask_relay(params: &Value, version: &str, url: &str) -> Result<Value, AIError> {
     let tls = native_tls::TlsConnector::new().ok().map(std::sync::Arc::new);
-    let mut b = ureq::AgentBuilder::new().timeout(Duration::from_secs(120));
+    // 소넷·추론 높음은 답이 오래 걸릴 수 있어 넉넉히 기다린다 (중계 서버 쪽 시간 제한도 이보다 길어야 한다)
+    let mut b = ureq::AgentBuilder::new().timeout(Duration::from_secs(300));
     if let Some(t) = tls {
         b = b.tls_connector(t);
     }
