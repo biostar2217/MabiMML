@@ -831,3 +831,21 @@ fn drop_players_keeps_original_numbers() {
     assert_eq!(who, vec![(1, 1), (2, 3)], "{:?}", r.warnings);
     assert!(r.warnings.iter().any(|w| w.contains("뺐습니다")));
 }
+
+#[test]
+fn drum_merge_inserts_rests_at_sheet_changes() {
+    let mut rng = Rng(9);
+    let mel: Vec<Note> = (0..1600).map(|i| n((i * 24) as f64, (i * 24 + 24) as f64, 72 + rng.range(0, 11), 90.0)).collect();
+    let song = Song { tracks: vec![Track::new("m", mel)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let o = Options { rank: "연습".into(), players: 1, ensemble: true, auto_drums: true, drum_compact: true, drum_merge: true, drum_merge_rest: 1.0, ..opts() };
+    let r = convert_song(&song, &o).unwrap();
+    let mel_sheets: Vec<&Score> = r.scores.iter().filter(|s| s.player == 1).collect();
+    let drum: Vec<&Score> = r.scores.iter().filter(|s| s.instrument == "드럼 세트").collect();
+    assert!(mel_sheets.len() > 1 && drum.len() < mel_sheets.len(), "{} {}", mel_sheets.len(), drum.len());
+    // 드럼 첫 장 길이 = 합친 구간 + 장 경계마다 1박
+    let d = drum[0];
+    let covered = mel_sheets.iter().filter(|s| s.end <= d.start + (d.end - d.start) + 1.0 && s.start >= d.start).count();
+    let (_, _, len) = parse_part(&d.parts[0]).unwrap();
+    let plain: f64 = mel_sheets.iter().take(covered).map(|s| s.end - s.start).sum();
+    assert!((len - (plain + 96.0 * (covered as f64 - 1.0))).abs() < 1.0 || covered <= 1, "len {} plain {} covered {}", len, plain, covered);
+}

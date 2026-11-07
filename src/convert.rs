@@ -348,6 +348,8 @@ pub struct Options {
     pub drum_compact: bool,
     /// 드럼 합주자는 한도 안에서 여러 장을 한 장으로 합친다 (장을 덜 바꿈)
     pub drum_merge: bool,
+    /// 드럼 장을 합칠 때 다른 합주자가 장을 바꾸는 자리마다 넣을 쉼 (박)
+    pub drum_merge_rest: f64,
 }
 
 impl Default for Options {
@@ -395,6 +397,7 @@ impl Default for Options {
             drop_players: Vec::new(),
             drum_compact: false,
             drum_merge: false,
+            drum_merge_rest: 1.0,
         }
     }
 }
@@ -2149,22 +2152,53 @@ fn finish_ensemble(
         for p in drum_ps {
             let bounds: Vec<i64> = per[p].iter().map(|s| s.start as i64).chain(per[p].last().map(|s| s.end as i64)).collect();
             let o = Options { book: true, tempo_all_parts: true, ..player_opts(opts, Some(DRUM_KIT)) };
+            // 다른 합주자가 장을 바꾸는 자리마다 쉼표(gap)를 넣는다: 그 뒤 음과 템포를 gap 만큼 뒤로 민다
+            let gap = (opts.drum_merge_rest * 96.0).round().max(0.0) as i64;
+            let seg = |a: usize, b: usize| -> Res<Score> {
+                if gap == 0 || b <= a + 1 {
+                    return encode_segment(chunks[p], &tempos, bounds[a], bounds[b], &o);
+                }
+                let inner: Vec<i64> = bounds[a + 1..b].to_vec();
+                let shift = |u: f64| inner.iter().filter(|&&x| (x as f64) <= u + 1e-6).count() as f64 * gap as f64;
+                let parts2: Vec<Vec<Note>> = chunks[p]
+                    .iter()
+                    .map(|v| {
+                        v.iter()
+                            .filter(|n| n.end > bounds[a] as f64 && n.start < bounds[b] as f64)
+                            .map(|n| {
+                                // 장 경계를 넘는 음은 경계에서 자른다
+                                let next = inner.iter().map(|&x| x as f64).find(|&x| x > n.start + 1e-6).unwrap_or(f64::INFINITY);
+                                let e = n.end.min(next).min(bounds[b] as f64);
+                                let sh = shift(n.start);
+                                n.with_start_end(n.start + sh, e + sh)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let tempos2: Vec<(i64, i64)> = tempos.iter().map(|&(u, bpm)| (u + shift(u as f64) as i64, bpm)).collect();
+                encode_segment(&parts2, &tempos2, bounds[a], bounds[b] + gap * inner.len() as i64, &o)
+            };
             let mut merged: Vec<Score> = Vec::new();
             let mut i = 0;
             while i + 1 < bounds.len() {
                 let mut j = i + 1;
-                while j + 1 < bounds.len() && fits(&encode_segment(chunks[p], &tempos, bounds[i], bounds[j + 1], &o)?, &limits) {
+                while j + 1 < bounds.len() && fits(&seg(i, j + 1)?, &limits) {
                     j += 1;
                 }
-                merged.push(encode_segment(chunks[p], &tempos, bounds[i], bounds[j], &o)?);
+                merged.push(seg(i, j)?);
                 i = j;
             }
             if merged.len() < per[p].len() {
                 warnings.push(format!(
-                    "드럼 장 합치기: 합주자 {}(드럼)은 {}장을 {}장으로 합쳤습니다. 다른 합주자가 장을 바꿀 때 잠깐 쉬는 만큼 드럼이 앞설 수 있어요",
+                    "드럼 장 합치기: 합주자 {}(드럼)은 {}장을 {}장으로 합쳤습니다. {}",
                     p + 1,
                     per[p].len(),
-                    merged.len()
+                    merged.len(),
+                    if gap > 0 {
+                        format!("다른 합주자가 장을 바꾸는 자리마다 {}박 쉼을 넣었습니다 (게임에서 장 바꾸는 시간에 맞춰 '장 바꿈 쉼'을 조절하세요. 미리듣기에는 쉼이 안 들어갑니다)", opts.drum_merge_rest)
+                    } else {
+                        "다른 합주자가 장을 바꿀 때 잠깐 쉬는 만큼 드럼이 앞설 수 있어요".into()
+                    }
                 ));
                 per[p] = merged;
             }

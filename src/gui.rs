@@ -100,6 +100,8 @@ pub struct Saved {
     /// 드럼 글자 아끼기, 드럼 장 합치기
     pub drum_compact: bool,
     pub drum_merge: bool,
+    /// 드럼 장 합칠 때 장 바꿈마다 넣을 쉼 (박)
+    pub drum_merge_rest: f64,
 }
 
 impl Default for Saved {
@@ -129,6 +131,7 @@ impl Default for Saved {
             sheet_window: true,
             drum_compact: true,
             drum_merge: false,
+            drum_merge_rest: 1.0,
         }
     }
 }
@@ -144,7 +147,7 @@ impl Saved {
             "ensemble": self.ensemble, "players": self.players, "ensemble_by": self.ensemble_by,
             "compact": self.compact, "drums": self.drums, "player_insts": self.player_insts,
             "auto_drums": self.auto_drums, "drum_style": self.drum_style, "sheet_window": self.sheet_window,
-            "drum_compact": self.drum_compact, "drum_merge": self.drum_merge
+            "drum_compact": self.drum_compact, "drum_merge": self.drum_merge, "drum_merge_rest": self.drum_merge_rest
         })
     }
 
@@ -175,6 +178,7 @@ impl Saved {
         if let Some(v) = gb("sheet_window") { s.sheet_window = v; }
         if let Some(v) = gb("drum_compact") { s.drum_compact = v; }
         if let Some(v) = gb("drum_merge") { s.drum_merge = v; }
+        if let Some(v) = saved.get("drum_merge_rest").and_then(|v| v.as_f64()) { s.drum_merge_rest = v.clamp(0.0, 16.0); }
         if !old {
             if let Some(v) = gb("ensemble_fix") { s.ensemble_fix = v; }
             if let Some(v) = gb("v0_tempo") { s.v0_tempo = v; }
@@ -489,6 +493,7 @@ impl App {
             drum_style: s.drum_style.clone(),
             drum_compact: s.drum_compact,
             drum_merge: s.drum_merge,
+            drum_merge_rest: s.drum_merge_rest,
             flats: s.compact,
             n_numbers: s.compact,
             keep_original: s.keep_original,
@@ -2338,7 +2343,12 @@ impl App {
                     ui.checkbox(&mut self.saved.drum_compact, "드럼 글자 아끼기")
                         .on_hover_text("고스트 스네어와 8분음표보다 잘게 친 하이햇을 빼고 볼륨을 한 가지로 적어 드럼 MML 글자를 줄입니다");
                     ui.checkbox(&mut self.saved.drum_merge, "드럼 장 합치기")
-                        .on_hover_text("드럼 합주자는 한도 안에서 여러 장을 한 장으로 합칩니다. 다른 합주자가 장을 바꿀 때 잠깐 쉬는 만큼 드럼이 앞설 수 있어요");
+                        .on_hover_text("드럼 합주자는 한도 안에서 여러 장을 한 장으로 합칩니다. 다른 합주자가 장을 바꾸는 자리에는 아래 박 수만큼 쉼을 넣습니다");
+                    if self.saved.drum_merge {
+                        ui.label("장 바꿈 쉼");
+                        ui.add(egui::DragValue::new(&mut self.saved.drum_merge_rest).range(0.0..=16.0).speed(0.25).fixed_decimals(2).suffix("박"))
+                            .on_hover_text("다른 합주자가 다음 장을 시작하는 데 걸리는 시간만큼 드럼이 쉬게 합니다. 게임에서 해 보고 맞추세요");
+                    }
                 });
                 // 합주자 악기: 창 폭에 맞춰 한 줄에 몇 개씩 나눠 놓는다 (창 밖으로 잘리지 않게)
                 let per_row = (((ui.available_width() - 90.0) / 132.0).floor() as usize).clamp(1, 8);
