@@ -24,7 +24,7 @@ impl std::fmt::Display for AIError {
     }
 }
 
-pub const SETTINGS: [(&str, &str); 13] = [
+pub const SETTINGS: [(&str, &str); 14] = [
     ("speed_percent", "정수, 빠르기 퍼센트 10~400 (100이 원곡)"),
     ("fixed_bpm", "정수, 곡 전체 고정 템포 0~255 (0은 원곡 템포)"),
     ("transpose", "정수, 음 높이(반음, 절대값) -48~48. 12가 한 옥타브"),
@@ -37,6 +37,7 @@ pub const SETTINGS: [(&str, &str); 13] = [
     ("ensemble_fix", "true/false, 64비트 합주 밀림 보정"),
     ("ensemble", "true/false, 합주: 곡을 여러 합주자(각자 멜로디·화음1·화음2)로 나누기. 인원은 players (드럼 합주자는 인원에 안 셈)"),
     ("drums", "true/false, 합주에서 곡의 MIDI 드럼 트랙을 마비노기 드럼 세트 합주자로 따로 만들기. 곡 정보 트랙에 [드럼]이 있어야 생긴다. 드럼 트랙이 없으면 드럼 합주자를 만들 수 없다"),
+    ("auto_drums", "true/false, 합주에서 곡에 드럼 트랙이 없으면 곡 박자에 맞춘 드럼(킥·스네어·하이햇·크래시)을 자동으로 만들어 드럼 세트 합주자로 추가. 드럼을 넣어 달라는데 [드럼] 트랙이 없으면 이것을 켠다 (ensemble 도 켜야 함)"),
     ("player_instruments", "합주자별 연주 악기를 쉼표로, 합주자 1부터 (예: '전기기타,피아노'). 빈 칸은 기본 연주 악기. instrument 목록의 이름만 쓴다"),
 ];
 

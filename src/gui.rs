@@ -91,6 +91,8 @@ pub struct Saved {
     pub drums: bool,
     /// 합주자별 연주 악기 (빈 글자 = 기본)
     pub player_insts: Vec<String>,
+    /// 드럼 트랙이 없으면 드럼 자동 만들기
+    pub auto_drums: bool,
 }
 
 impl Default for Saved {
@@ -115,6 +117,7 @@ impl Default for Saved {
             compact: true,
             drums: true,
             player_insts: Vec::new(),
+            auto_drums: false,
         }
     }
 }
@@ -128,7 +131,8 @@ impl Saved {
             "part_vol2": self.part_vol[2], "ensemble_fix": self.ensemble_fix, "v0_tempo": self.v0_tempo,
             "sustain": self.sustain, "split_players": self.split_players,
             "ensemble": self.ensemble, "players": self.players, "ensemble_by": self.ensemble_by,
-            "compact": self.compact, "drums": self.drums, "player_insts": self.player_insts
+            "compact": self.compact, "drums": self.drums, "player_insts": self.player_insts,
+            "auto_drums": self.auto_drums
         })
     }
 
@@ -155,6 +159,7 @@ impl Saved {
         if let Some(v) = gs("ensemble_by", &|v| ENSEMBLE_BY.contains(&v)) { s.ensemble_by = v; }
         if let Some(v) = gb("compact") { s.compact = v; }
         if let Some(v) = gb("drums") { s.drums = v; }
+        if let Some(v) = gb("auto_drums") { s.auto_drums = v; }
         if let Some(a) = saved.get("player_insts").and_then(|v| v.as_array()) {
             s.player_insts = a.iter().take(8).map(|x| x.as_str().unwrap_or("").to_string()).collect();
         }
@@ -439,6 +444,7 @@ impl App {
             by_instrument: s.ensemble && s.ensemble_by == ENSEMBLE_BY[1],
             ensemble: s.ensemble,
             player_instruments: if s.ensemble { s.player_insts.clone() } else { vec![] },
+            auto_drums: s.ensemble && s.auto_drums,
             flats: s.compact,
             n_numbers: s.compact,
             keep_original: s.keep_original,
@@ -1510,7 +1516,7 @@ impl App {
             "quality": o.quality, "rank": o.rank, "sustain": s.sustain, "gap_mode": s.gap_mode, "triplet": o.triplet,
             "volume": o.volume, "fit": o.fit, "part_volume": s.part_vol,
             "ensemble": s.ensemble, "players": s.players, "ensemble_by": s.ensemble_by,
-            "drums": s.drums, "player_instruments": s.player_insts.join(",")
+            "drums": s.drums, "player_instruments": s.player_insts.join(","), "auto_drums": s.auto_drums
         });
         v.as_object().cloned().unwrap()
     }
@@ -1540,6 +1546,7 @@ impl App {
                 "players" => if let Some(s) = st.filter(|s| PLAYER_CHOICES.contains(&s.as_str())) { self.saved.players = s },
                 "ensemble_by" => if let Some(s) = st.filter(|s| ENSEMBLE_BY.contains(&s.as_str())) { self.saved.ensemble_by = s },
                 "drums" => if let Some(b) = b { self.saved.drums = b },
+                "auto_drums" => if let Some(b) = b { self.saved.auto_drums = b },
                 "player_instruments" => {
                     if let Some(s) = st {
                         self.saved.player_insts = s.split(',').take(8).map(|x| x.trim().to_string()).collect();
@@ -2012,6 +2019,8 @@ impl App {
             if self.saved.ensemble {
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.saved.drums, "드럼 트랙은 드럼 세트 합주자로");
+                    ui.checkbox(&mut self.saved.auto_drums, "드럼이 없으면 자동으로 만들기")
+                        .on_hover_text("곡에 드럼 트랙이 없으면 박자에 맞춘 드럼(킥·스네어·하이햇, 8마디마다 크래시)을 만들어 드럼 세트 합주자로 넣습니다");
                     ui.add_space(8.0);
                     ui.label("합주자 악기");
                     // 지금 결과의 합주자 수(드럼 제외)만큼, 없으면 고른 인원만큼

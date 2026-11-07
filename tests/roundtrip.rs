@@ -772,3 +772,25 @@ fn player_instruments_and_one_plus_drums() {
     assert_eq!(p.parts_notes[0][0].pitch, 48);
     assert!(p.warnings.iter().any(|w| w.contains("합주자 1: 피아노")));
 }
+
+#[test]
+fn auto_drums_follow_meter() {
+    // 4/4, 9마디 동안 음이 나는 곡에 드럼 트랙이 없을 때
+    let mel = Track::new("m", (0..36).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 72 + (i % 5) as i64, 100.0)).collect());
+    let song = Song { tracks: vec![mel], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let r = convert_song(&song, &Options { players: 1, ensemble: true, auto_drums: true, ..opts() }).unwrap();
+    let drum: Vec<&Score> = r.scores.iter().filter(|s| s.instrument == "드럼 세트").collect();
+    assert_eq!(drum.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings.iter().any(|w| w.contains("자동으로 만들었습니다")));
+    let (dn, _) = scores_to_notes(&[drum[0].clone()]).unwrap();
+    let mut hits: Vec<(i64, i64)> = dn.iter().flatten().filter(|x| x.vel > 0.0).map(|x| (x.start as i64, x.pitch)).collect();
+    hits.sort();
+    let bar1: Vec<(i64, i64)> = hits.iter().cloned().filter(|h| h.0 < 384).collect();
+    // 킥 o2f(41) 1·3박, 스네어 o2a(45) 2·4박, 하이햇 o3a(57) 8분음표, 첫 박 크래시 o4c(60)
+    for want in [(0, 41), (192, 41), (96, 45), (288, 45), (0, 60), (48, 57), (336, 57)] {
+        assert!(bar1.contains(&want), "{:?} 없음: {:?}", want, bar1);
+    }
+    // 8번째 마디 끝 필인(탐), 9번째 마디 첫 박 크래시
+    assert!(hits.iter().any(|h| h.0 >= 7 * 384 + 288 && h.0 < 8 * 384 && h.1 == 53), "{:?}", &hits[hits.len().saturating_sub(30)..]);
+    assert!(hits.contains(&(8 * 384, 60)));
+}

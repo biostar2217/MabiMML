@@ -334,6 +334,8 @@ pub struct Options {
     pub ensemble: bool,
     /// 합주자별 연주 악기 (합주자 1부터, 빈 글자 = 기본)
     pub player_instruments: Vec<String>,
+    /// 합주에서 드럼 트랙이 없으면 박자에 맞춘 드럼을 만들어 드럼 세트 합주자로
+    pub auto_drums: bool,
 }
 
 impl Default for Options {
@@ -374,6 +376,7 @@ impl Default for Options {
             n_numbers: true,
             ensemble: false,
             player_instruments: Vec::new(),
+            auto_drums: false,
         }
     }
 }
@@ -1342,7 +1345,137 @@ pub fn drum_preview_note(kit: i64) -> i64 {
     }
 }
 
+/// 드럼 트랙이 없는 곡에 곡 박자에 맞춘 드럼(GM 드럼 음)을 만든다.
+/// 음이 나는 마디에만: 4/4 는 킥 1·3박, 스네어 2·4박, 하이햇 8분음표(빠른 곡은 4분음표), 8마디마다 크래시와 그 앞 마디 끝에 필인,
+/// 3/4 는 킥 1박·하이햇, 6/8 등은 점4분음표 묶음으로. 베이스 음이 시작하는 8분음표 자리에 킥을 조금 더한다.
+fn generated_drum_track(song: &Song, grid: &BeatGrid) -> Option<Track> {
+    let notes: Vec<&Note> = song.tracks.iter().filter(|t| !t.is_drum).flat_map(|t| t.notes.iter()).filter(|n| n.vel > 0.0).collect();
+    if notes.is_empty() {
+        return None;
+    }
+    let end = notes.iter().map(|n| n.end).fold(0.0, f64::max);
+    let bars = song_bars(song, grid, end);
+    let tempo_at_u = |u: f64| {
+        let mut b = song.tempos.first().map(|t| t.1).unwrap_or(120.0);
+        for &(t, bpm) in &song.tempos {
+            if t <= u {
+                b = bpm;
+            }
+        }
+        b
+    };
+    let sig_at = |u: f64| {
+        let mut s = (4i64, 4i64);
+        for &(t, num, den) in &song.timesigs {
+            if t <= u + 1e-6 && num > 0 && den > 0 {
+                s = (num, den);
+            }
+        }
+        s
+    };
+    let bass: Vec<f64> = notes.iter().filter(|n| n.pitch < 55).map(|n| n.start).collect();
+    let mut out: Vec<Note> = Vec::new();
+    let hit = |out: &mut Vec<Note>, t: f64, p: i64, v: f64| out.push(Note::new(t, t + 24.0, p, v));
+    let mut active_run = 0usize;
+    for w in bars.windows(2) {
+        let (a, b) = (w[0] as f64, w[1] as f64);
+        if b - a < 24.0 {
+            continue;
+        }
+        let playing = notes.iter().any(|n| n.start < b && n.end > a);
+        if !playing {
+            active_run = 0;
+            continue;
+        }
+        let (num, den) = sig_at(a);
+        let beat = 384.0 / den as f64;
+        let fast = tempo_at_u(a) >= 170.0;
+        // 크래시: 음이 다시 시작한 첫 마디와 8마디마다
+        if active_run % 8 == 0 {
+            hit(&mut out, a, 49, 110.0);
+        }
+        let fill = active_run % 8 == 7 && den == 4 && num >= 4;
+        let mut kicks: Vec<f64> = Vec::new();
+        if den == 8 && num % 3 == 0 {
+            // 6/8, 9/8, 12/8: 점4분음표 묶음
+            let groups = num / 3;
+            for g in 0..groups {
+                let t = a + (g * 3) as f64 * beat;
+                if g % 2 == 0 {
+                    hit(&mut out, t, 36, 100.0);
+                    kicks.push(t);
+                } else {
+                    hit(&mut out, t, 38, 100.0);
+                }
+            }
+            for k in 0..num {
+                hit(&mut out, a + k as f64 * beat, 42, if k % 3 == 0 { 85.0 } else { 65.0 });
+            }
+        } else if num == 3 && den == 4 {
+            hit(&mut out, a, 36, 100.0);
+            kicks.push(a);
+            for k in 0..6 {
+                hit(&mut out, a + k as f64 * 48.0, 42, if k % 2 == 0 { 80.0 } else { 60.0 });
+            }
+        } else if den == 4 && (num == 2 || num == 4) {
+            for k in 0..num {
+                let t = a + k as f64 * beat;
+                if fill && k == num - 1 {
+                    // 필인: 마지막 박을 16분음표 탐·스네어로
+                    for (j, p) in [50i64, 47, 45, 38].iter().enumerate() {
+                        hit(&mut out, t + j as f64 * 24.0, *p, 100.0);
+                    }
+                    continue;
+                }
+                if k % 2 == 0 {
+                    hit(&mut out, t, 36, 100.0);
+                    kicks.push(t);
+                } else {
+                    hit(&mut out, t, 38, 105.0);
+                }
+            }
+            let step = if fast { 96.0 } else { 48.0 };
+            let mut t = a;
+            let stop = if fill { b - beat } else { b };
+            let mut k = 0;
+            while t < stop - 1.0 {
+                hit(&mut out, t, 42, if k % 2 == 0 { 85.0 } else { 65.0 });
+                t += step;
+                k += 1;
+            }
+        } else {
+            // 그 밖의 박자: 첫 박 킥, 박마다 하이햇
+            hit(&mut out, a, 36, 100.0);
+            kicks.push(a);
+            let mut t = a;
+            while t < b - 1.0 {
+                hit(&mut out, t, 42, 75.0);
+                t += beat;
+            }
+        }
+        // 베이스가 시작하는 8분음표 자리에 킥을 더한다 (마디당 둘까지)
+        let mut extra = 0;
+        for &s in bass.iter().filter(|&&s| s >= a && s < b) {
+            let q = a + ((s - a) / 48.0).round() * 48.0;
+            if (q - s).abs() < 6.0 && q < b && !kicks.iter().any(|&k| (k - q).abs() < 1.0) && extra < 2 && !(fill && q >= b - beat) {
+                hit(&mut out, q, 36, 90.0);
+                kicks.push(q);
+                extra += 1;
+            }
+        }
+        active_run += 1;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    let mut t = Track::new("자동 드럼", out);
+    t.is_drum = true;
+    t.channel = 9;
+    Some(t)
+}
+
 /// MIDI 드럼 트랙을 마비노기 드럼 세트 세 파트로 옮긴다 (조옮김 없음). 드럼 트랙이 없으면 None.
+/// opts.auto_drums 면 드럼 트랙이 없는 곡에 박자에 맞춘 드럼을 만들어 쓴다.
 fn drum_parts(
     song: &Song,
     opts: &Options,
@@ -1352,8 +1485,19 @@ fn drum_parts(
     warnings: &mut Vec<String>,
 ) -> Option<Vec<Vec<Note>>> {
     let skip = |i: usize| opts.roles.as_ref().and_then(|r| r.get(&i)).map(|r| r == "skip").unwrap_or(false);
-    let drums: Vec<&Track> = song.tracks.iter().enumerate().filter(|(i, t)| t.is_drum && !t.notes.is_empty() && !skip(*i)).map(|(_, t)| t).collect();
-    if drums.is_empty() || !opts.include_drums {
+    let mut drums: Vec<&Track> = song.tracks.iter().enumerate().filter(|(i, t)| t.is_drum && !t.notes.is_empty() && !skip(*i)).map(|(_, t)| t).collect();
+    let has_drum_track = song.tracks.iter().any(|t| t.is_drum && !t.notes.is_empty());
+    let made;
+    if !has_drum_track && opts.auto_drums {
+        made = generated_drum_track(song, grid);
+        if let Some(t) = &made {
+            drums.push(t);
+            warnings.push(
+                "드럼 트랙이 없어 곡 박자에 맞춘 드럼을 자동으로 만들었습니다 (킥·스네어·하이햇, 8마디마다 크래시와 필인, 베이스에 맞춘 킥)".into(),
+            );
+        }
+    }
+    if drums.is_empty() || !(opts.include_drums || opts.auto_drums) {
         return None;
     }
     let mut g = grid.clone();

@@ -20,6 +20,7 @@ MIDI / MusicXML / 악보 PDF 파일을 PC판 마비노기 MML(MML@멜로디,화�
   --split-players            모바일 MML의 1~3파트, 4~6파트를 두 사람 PC 악보로 나눔
   --players N|auto           합주: N명(2~8)이 함께 치도록 나눔. auto 는 음을 빼지 않고 한 사람 한 장에 들어가는 인원
   --by-instrument            합주를 원곡 악기(트랙)별로 나누고 합주자마다 어울리는 마비노기 악기를 정함 (합주 켜짐)
+  --auto-drums               합주에서 드럼 트랙이 없으면 박자에 맞춘 드럼을 만들어 드럼 세트 합주자로
   --mobile                   모바일용으로 내보냄 (한 사람 6파트, 파트마다 2400자, 빈틈 메우기)
   --no-compact               글자 수 줄이기(n번호, c-/b+ 표기)를 쓰지 않음
   --instrument 악기          연주 악기 (높게 나는 악기는 낮춰 적음)
@@ -71,6 +72,7 @@ struct Args {
     players: Option<usize>,
     by_instrument: bool,
     mobile: bool,
+    auto_drums: bool,
     no_compact: bool,
     instrument: String,
     no_low_limit: bool,
@@ -159,6 +161,7 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             "--split-players" => a.split_players = true,
             "--by-instrument" => a.by_instrument = true,
             "--mobile" => a.mobile = true,
+            "--auto-drums" => a.auto_drums = true,
             "--no-compact" => a.no_compact = true,
             "--players" => {
                 let v = val(&mut i)?;
@@ -355,6 +358,7 @@ pub fn main(argv: &[String]) -> i32 {
         jabchiel: !a.no_jabchiel,
         roles: Some(roles),
         include_drums: a.drums,
+        auto_drums: a.auto_drums,
         flats: !a.no_compact,
         n_numbers: !a.no_compact,
         ..Default::default()
