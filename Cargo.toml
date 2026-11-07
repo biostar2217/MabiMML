@@ -1,6 +1,6 @@
 [package]
 name = "mabimml"
-version = "2.4.2"
+version = "2.4.3"
 edition = "2021"
 authors = ["LT 남븝"]
 description = "마비노기 MML 변환기 (Rust판): MIDI / MusicXML / 악보 PDF / MML -> PC판 마비노기 MML"
