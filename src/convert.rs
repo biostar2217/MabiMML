@@ -1784,16 +1784,66 @@ fn convert_by_instrument(song: &Song, opts: &Options) -> Res<ConvResult> {
     if drums > 0 && !opts.include_drums {
         warnings.push(format!("드럼 트랙 {}개는 뺐습니다", drums));
     }
+    // 합주자 수를 정했으면(드럼 제외) 그 인원에 맞춰 압축한다:
+    // 악기 묶음이 인원보다 많으면 덜 중요한(뒤쪽) 묶음을 음높이가 가장 가까운 묶음에 합치고, 남는 인원은 음이 많은 묶음에 더 준다
+    let budget = opts.players;
+    let mut merged_notes: Vec<String> = Vec::new();
+    if budget >= 1 {
+        let avg = |idx: &[usize]| {
+            let ps: Vec<f64> = idx.iter().flat_map(|&i| song.tracks[i].notes.iter().map(|n| n.pitch as f64)).collect();
+            if ps.is_empty() { 60.0 } else { ps.iter().sum::<f64>() / ps.len() as f64 }
+        };
+        while groups.len() > budget {
+            let last = groups.pop().unwrap();
+            let a = avg(&last.1);
+            let k = (0..groups.len())
+                .min_by(|&x, &y| (avg(&groups[x].1) - a).abs().partial_cmp(&(avg(&groups[y].1) - a).abs()).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap();
+            merged_notes.push(format!("{}→{}", last.0, groups[k].0));
+            groups[k].1.extend(last.1);
+        }
+    }
+    // 묶음마다 필요한 인원 (음을 빼지 않고 한 장에 들어가는 1~4명)
+    let mut need: Vec<usize> = Vec::new();
+    for (inst, idx) in &groups {
+        let sub = Song { tracks: idx.iter().map(|&i| song.tracks[i].clone()).collect(), ..song.clone() };
+        let o = Options { instrument: inst.to_string(), roles: None, shared_grid: Some(grid.clone()), ..opts.clone() };
+        let ((p, _, _, _), _, _) = pick_players(&sub, &o, &[1, 2, 3, 4], true)?;
+        need.push(p.len() / 3);
+    }
+    let give: Vec<usize> = if budget >= 1 {
+        // 먼저 한 명씩, 남는 인원은 모자란 정도가 큰 묶음부터
+        let mut g = vec![1usize; groups.len()];
+        let mut left = budget.saturating_sub(groups.len());
+        while left > 0 {
+            let Some(k) = (0..groups.len()).filter(|&k| g[k] < need[k]).max_by_key(|&k| (need[k] - g[k], usize::MAX - k)) else { break };
+            g[k] += 1;
+            left -= 1;
+        }
+        g
+    } else {
+        need.clone()
+    };
+    if budget >= 1 && (!merged_notes.is_empty() || give.iter().zip(&need).any(|(g, n)| g < n)) {
+        let mut w = format!("합주자 {}명에 맞춰 압축했습니다", budget);
+        if !merged_notes.is_empty() {
+            w += &format!(": 악기 묶음 합침 {}", merged_notes.join(", "));
+        }
+        if give.iter().zip(&need).any(|(g, n)| g < n) {
+            w += ". 한 사람이 칠 수 있는 음이 모자라 겹치는 음 일부를 뺐습니다";
+        }
+        warnings.push(w);
+    }
     let mut parts: Vec<Vec<Note>> = Vec::new();
     let mut insts: Vec<String> = Vec::new();
     let mut tempos: Vec<(i64, i64)> = Vec::new();
     let mut limits = [0i64; 3];
     let mut moved_all = 0;
     let mut lines = Vec::new();
-    for (inst, idx) in &groups {
+    for (gi, (inst, idx)) in groups.iter().enumerate() {
         let sub = Song { tracks: idx.iter().map(|&i| song.tracks[i].clone()).collect(), ..song.clone() };
         let o = Options { instrument: inst.to_string(), roles: None, shared_grid: Some(grid.clone()), ..opts.clone() };
-        let ((p, t, l, _), w, moved) = pick_players(&sub, &o, &[1, 2, 3, 4], true)?;
+        let ((p, t, l, _), w, moved) = pick_players(&sub, &o, &[give[gi]], false)?;
         let n = p.len() / 3;
         let first = insts.len() + 1;
         let who = if n > 1 { format!("합주자 {}~{}", first, first + n - 1) } else { format!("합주자 {}", first) };

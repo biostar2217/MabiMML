@@ -457,6 +457,7 @@ impl App {
             sustain: lookup(&SUSTAIN_LABELS, &s.sustain).into(),
             split_players: s.split_players,
             players: if s.ensemble { s.players.parse().unwrap_or(0) } else { 1 },
+            // (원곡 악기별에서도 합주자 수를 쓴다: 자동이면 필요한 만큼, 숫자면 그 인원에 맞춰 압축)
             by_instrument: s.ensemble && s.ensemble_by == ENSEMBLE_BY[1],
             ensemble: s.ensemble,
             player_instruments: if s.ensemble { s.player_insts.clone() } else { vec![] },
@@ -2200,19 +2201,19 @@ impl App {
                 ui.add_enabled_ui(self.saved.ensemble, |ui| {
                     ui.label("나누기");
                     Self::combo(ui, "ensemble_by", &mut self.saved.ensemble_by, &ENSEMBLE_BY, 120.0);
-                    let by_inst = self.saved.ensemble_by == ENSEMBLE_BY[1];
-                    ui.add_enabled_ui(!by_inst, |ui| {
-                        ui.label("합주자 수");
-                        Self::combo(ui, "players", &mut self.saved.players, &PLAYER_CHOICES, 60.0);
-                    });
-                    let hint = if by_inst {
-                        "원곡 트랙의 악기마다 합주자를 따로 두고 어울리는 마비노기 악기를 정합니다 (인원은 자동)"
-                    } else {
-                        "자동: 음을 빼지 않고 한 사람이 악보 한 장에 들어가는 가장 적은 인원 (2~8명)"
-                    };
-                    ui.label(RichText::new(hint).color(p.muted).size(12.0));
+                    ui.label("합주자 수");
+                    Self::combo(ui, "players", &mut self.saved.players, &PLAYER_CHOICES, 60.0);
                 });
             });
+            if self.saved.ensemble {
+                // 설명은 따로 한 줄 (길어서 창 밖으로 밀리지 않게 줄바꿈)
+                let hint = if self.saved.ensemble_by == ENSEMBLE_BY[1] {
+                    "원곡 트랙의 악기마다 합주자를 두고 어울리는 마비노기 악기를 정합니다. 합주자 수를 정하면 그 인원에 맞춰 악기를 합쳐 압축합니다 (자동은 필요한 만큼)"
+                } else {
+                    "자동: 음을 빼지 않고 한 사람이 악보 한 장에 들어가는 가장 적은 인원 (2~8명). 드럼 합주자는 인원에 세지 않습니다"
+                };
+                ui.add(egui::Label::new(RichText::new(hint).color(p.muted).size(12.0)).wrap());
+            }
             if self.saved.ensemble {
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.saved.drums, "드럼 트랙은 드럼 세트 합주자로");
@@ -2221,7 +2222,10 @@ impl App {
                     if self.saved.auto_drums {
                         Self::combo(ui, "drum_style", &mut self.saved.drum_style, &crate::convert::DRUM_STYLES, 80.0);
                     }
-                    ui.add_space(8.0);
+                });
+                // 합주자 악기: 창 폭에 맞춰 한 줄에 몇 개씩 나눠 놓는다 (창 밖으로 잘리지 않게)
+                let per_row = (((ui.available_width() - 90.0) / 132.0).floor() as usize).clamp(1, 8);
+                ui.horizontal(|ui| {
                     ui.label("합주자 악기");
                     // 지금 결과의 합주자 수(드럼 제외)만큼, 없으면 고른 인원만큼
                     let shown = self
@@ -2236,13 +2240,19 @@ impl App {
                     }
                     let mut names: Vec<&str> = vec![PLAYER_INST_DEFAULT];
                     names.extend(INSTRUMENTS.iter().map(|x| x.0));
-                    for k in 0..shown {
-                        ui.label(format!("{}", k + 1));
-                        let mut v = if self.saved.player_insts[k].is_empty() { PLAYER_INST_DEFAULT.to_string() } else { self.saved.player_insts[k].clone() };
-                        if Self::combo(ui, &format!("pinst{}", k), &mut v, &names, 96.0) {
-                            self.saved.player_insts[k] = if v == PLAYER_INST_DEFAULT { String::new() } else { v };
+                    ui.vertical(|ui| {
+                        for row in (0..shown).collect::<Vec<_>>().chunks(per_row) {
+                            ui.horizontal(|ui| {
+                                for &k in row {
+                                    ui.label(format!("{}", k + 1));
+                                    let mut v = if self.saved.player_insts[k].is_empty() { PLAYER_INST_DEFAULT.to_string() } else { self.saved.player_insts[k].clone() };
+                                    if Self::combo(ui, &format!("pinst{}", k), &mut v, &names, 96.0) {
+                                        self.saved.player_insts[k] = if v == PLAYER_INST_DEFAULT { String::new() } else { v };
+                                    }
+                                }
+                            });
                         }
-                    }
+                    });
                 });
             }
             ui.checkbox(&mut self.saved.keep_original, "붙여넣은 3파트 MML은 원본 그대로 나누기 (편곡 없음. 랭크, 한도, 글자 수 초과 시, 조옮김만 적용)");
@@ -2797,6 +2807,11 @@ impl App {
                     // 시험용: 여러 장을 이어서 보기
                     if std::env::var_os("MABIMML_SHOT_ALL").is_some() {
                         self.other.play_all = true;
+                    }
+                    // 시험용: 곡을 연 뒤 합주를 켠다 (새 곡이면 합주가 꺼지므로)
+                    if std::env::var_os("MABIMML_SHOT_ENSEMBLE_ON").is_some() && !self.saved.ensemble {
+                        self.saved.ensemble = true;
+                        again = true;
                     }
                     wait_ms = 900;
                 }
