@@ -322,6 +322,10 @@ pub struct Options {
     pub flats: bool,
     /// 멀리 떨어진 한 음을 n번호로 적어 글자 수를 줄인다
     pub n_numbers: bool,
+    /// 합주 켜짐 (합주자 1명 + 드럼처럼 players 가 1이어도 합주로 만든다)
+    pub ensemble: bool,
+    /// 합주자별 연주 악기 (합주자 1부터, 빈 글자 = 기본)
+    pub player_instruments: Vec<String>,
 }
 
 impl Default for Options {
@@ -360,6 +364,8 @@ impl Default for Options {
             shared_grid: None,
             flats: true,
             n_numbers: true,
+            ensemble: false,
+            player_instruments: Vec::new(),
         }
     }
 }
@@ -1143,7 +1149,7 @@ pub fn convert_song(song: &Song, opts: &Options) -> Res<ConvResult> {
         res.warnings.insert(0, format!("원곡 느낌 자동 맞춤: {}분음표 격자, 볼륨 변화 {} 이상 기록", grid, step));
         return Ok(res);
     }
-    if opts.players != 1 {
+    if opts.players != 1 || opts.ensemble {
         return convert_ensemble(song, opts);
     }
     let mut warnings = Vec::new();
@@ -1458,6 +1464,7 @@ fn convert_by_pitch(song: &Song, opts: &Options) -> Res<ConvResult> {
         let who: Vec<String> = (n + 1..=insts.len()).map(|p| p.to_string()).collect();
         head += &format!(" + 드럼 세트 합주자 {}", who.join("·"));
     }
+    apply_player_instruments(&mut parts, &mut insts, opts, &mut warnings);
     finish_ensemble(song, opts, parts, &tempos, limits, &grid, warnings, &insts, head)
 }
 
@@ -1626,7 +1633,59 @@ fn convert_by_instrument(song: &Song, opts: &Options) -> Res<ConvResult> {
     if insts.len() > 8 {
         warnings.push(format!("합주자가 {}명입니다. 사람이 모자라면 '음 높이로 나누기'를 쓰세요", insts.len()));
     }
+    apply_player_instruments(&mut parts, &mut insts, opts, &mut warnings);
     finish_ensemble(song, opts, parts, &tempos, limits, &grid, warnings, &insts, head)
+}
+
+/// 사용자가 정한 합주자별 연주 악기를 적용한다: 그 악기 옥타브로 옮기고, 음역을 맞추고, 한 파트 악기면 화음 파트를 비운다.
+fn apply_player_instruments(parts: &mut [Vec<Note>], insts: &mut [String], opts: &Options, warnings: &mut Vec<String>) {
+    for (p, chunk) in parts.chunks_mut(3).enumerate() {
+        let Some(want) = opts.player_instruments.get(p).map(|s| s.trim().to_string()) else { continue };
+        if want.is_empty() || insts.get(p).map(|i| i == DRUM_KIT).unwrap_or(false) || !INSTRUMENTS.iter().any(|i| i.0 == want) {
+            continue;
+        }
+        let base = insts.get(p).filter(|i| !i.is_empty()).cloned().unwrap_or_else(|| opts.instrument.clone());
+        if base == want {
+            if let Some(slot) = insts.get_mut(p) {
+                *slot = want;
+            }
+            continue;
+        }
+        let shift = instrument_shift(&want) - instrument_shift(&base);
+        let range = instrument_range(&want);
+        let mut folded = 0;
+        for part in chunk.iter_mut() {
+            for n in part.iter_mut() {
+                let mut q = fold_pitch(n.pitch + shift);
+                if let Some((lo, hi)) = range {
+                    if q < lo || q > hi {
+                        folded += 1;
+                    }
+                    while q < lo {
+                        q += 12;
+                    }
+                    while q > hi {
+                        q -= 12;
+                    }
+                }
+                n.pitch = q;
+            }
+        }
+        let mut w = format!("합주자 {}: {}(으)로 연주", p + 1, want);
+        if folded > 0 {
+            w += &format!(", 음역 밖 음 {}개는 옥타브를 옮겼습니다", folded);
+        }
+        if is_one_part(&want) && chunk.iter().skip(1).any(|v| v.iter().any(|n| n.vel != 0.0)) {
+            for v in chunk.iter_mut().skip(1) {
+                v.clear();
+            }
+            w += ", 한 파트 악기라 화음 파트는 비웠습니다";
+        }
+        warnings.push(w);
+        if let Some(slot) = insts.get_mut(p) {
+            *slot = want;
+        }
+    }
 }
 
 /// 합주자 한 명의 악보를 적을 설정: 그 사람의 연주 악기(볼륨 한도 등). 드럼은 볼륨 차이 3 이상만 적어 글자를 아낀다.

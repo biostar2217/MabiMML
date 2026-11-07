@@ -40,7 +40,9 @@ pub const PREVIEW_SOUNDS: [&str; 2] = ["연주 악기 따라", "피아노"];
 pub const SETTINGS_VERSION: i64 = 2;
 pub const GAP_LABELS: [(&str, &str); 3] = [("MIDI만", "auto"), ("항상", "on"), ("끄기", "off")];
 /// 합주 인원 고르기: 자동 = 음을 빼지 않고 한 사람 한 장에 들어가는 가장 적은 인원
-pub const PLAYER_CHOICES: [&str; 8] = ["자동", "2", "3", "4", "5", "6", "7", "8"];
+pub const PLAYER_CHOICES: [&str; 9] = ["자동", "1", "2", "3", "4", "5", "6", "7", "8"];
+/// 합주자별 악기 고르기의 '기본' (설정의 연주 악기)
+const PLAYER_INST_DEFAULT: &str = "기본";
 /// 합주를 나누는 방식
 pub const ENSEMBLE_BY: [&str; 2] = ["음 높이로 나누기", "원곡 악기별로"];
 /// 듣기 범위
@@ -85,6 +87,10 @@ pub struct Saved {
     pub ensemble_by: String,
     /// 글자 수 줄이기 (n번호, c-/b+)
     pub compact: bool,
+    /// 합주에서 MIDI 드럼 트랙을 드럼 세트 합주자로
+    pub drums: bool,
+    /// 합주자별 연주 악기 (빈 글자 = 기본)
+    pub player_insts: Vec<String>,
 }
 
 impl Default for Saved {
@@ -107,6 +113,8 @@ impl Default for Saved {
             players: PLAYER_CHOICES[0].into(),
             ensemble_by: ENSEMBLE_BY[0].into(),
             compact: true,
+            drums: true,
+            player_insts: Vec::new(),
         }
     }
 }
@@ -120,7 +128,7 @@ impl Saved {
             "part_vol2": self.part_vol[2], "ensemble_fix": self.ensemble_fix, "v0_tempo": self.v0_tempo,
             "sustain": self.sustain, "split_players": self.split_players,
             "ensemble": self.ensemble, "players": self.players, "ensemble_by": self.ensemble_by,
-            "compact": self.compact
+            "compact": self.compact, "drums": self.drums, "player_insts": self.player_insts
         })
     }
 
@@ -146,6 +154,10 @@ impl Saved {
         if let Some(v) = gs("players", &|v| PLAYER_CHOICES.contains(&v)) { s.players = v; }
         if let Some(v) = gs("ensemble_by", &|v| ENSEMBLE_BY.contains(&v)) { s.ensemble_by = v; }
         if let Some(v) = gb("compact") { s.compact = v; }
+        if let Some(v) = gb("drums") { s.drums = v; }
+        if let Some(a) = saved.get("player_insts").and_then(|v| v.as_array()) {
+            s.player_insts = a.iter().take(8).map(|x| x.as_str().unwrap_or("").to_string()).collect();
+        }
         if !old {
             if let Some(v) = gb("ensemble_fix") { s.ensemble_fix = v; }
             if let Some(v) = gb("v0_tempo") { s.v0_tempo = v; }
@@ -422,12 +434,14 @@ impl App {
             split_players: s.split_players,
             players: if s.ensemble { s.players.parse().unwrap_or(0) } else { 1 },
             by_instrument: s.ensemble && s.ensemble_by == ENSEMBLE_BY[1],
+            ensemble: s.ensemble,
+            player_instruments: if s.ensemble { s.player_insts.clone() } else { vec![] },
             flats: s.compact,
             n_numbers: s.compact,
             keep_original: s.keep_original,
             jabchiel: s.jabchiel,
             roles: Some(roles),
-            include_drums: true,
+            include_drums: s.drums,
             ..Default::default()
         }
     }
@@ -1456,7 +1470,8 @@ impl App {
             "keep_original": s.keep_original, "ensemble_fix": s.ensemble_fix, "instrument": s.instrument,
             "quality": o.quality, "rank": o.rank, "sustain": s.sustain, "gap_mode": s.gap_mode, "triplet": o.triplet,
             "volume": o.volume, "fit": o.fit, "part_volume": s.part_vol,
-            "ensemble": s.ensemble, "players": s.players, "ensemble_by": s.ensemble_by
+            "ensemble": s.ensemble, "players": s.players, "ensemble_by": s.ensemble_by,
+            "drums": s.drums, "player_instruments": s.player_insts.join(",")
         });
         v.as_object().cloned().unwrap()
     }
@@ -1485,6 +1500,12 @@ impl App {
                 "ensemble" => if let Some(b) = b { self.saved.ensemble = b },
                 "players" => if let Some(s) = st.filter(|s| PLAYER_CHOICES.contains(&s.as_str())) { self.saved.players = s },
                 "ensemble_by" => if let Some(s) = st.filter(|s| ENSEMBLE_BY.contains(&s.as_str())) { self.saved.ensemble_by = s },
+                "drums" => if let Some(b) = b { self.saved.drums = b },
+                "player_instruments" => {
+                    if let Some(s) = st {
+                        self.saved.player_insts = s.split(',').take(8).map(|x| x.trim().to_string()).collect();
+                    }
+                }
                 "part_volume" => {
                     if let Some(a) = v.as_array() {
                         for (j, x) in a.iter().take(3).enumerate() {
@@ -1524,10 +1545,15 @@ impl App {
     fn ai_song_info(&self) -> Value {
         let Some(song) = &self.song else { return json!({"열린 곡": "없음"}) };
         let tracks: Vec<String> = song.tracks.iter().zip(self.roles.iter()).enumerate()
-            .map(|(i, (t, r))| format!("{}. {} ({}) 배정: {}", i + 1, t.name, t.describe(), r)).collect();
+            .map(|(i, (t, r))| format!("{}. {}{} ({}) 배정: {}", i + 1, t.name, if t.is_drum { " [드럼]" } else { "" }, t.describe(), r)).collect();
         let mut info = json!({"파일": base_name(&self.path), "트랙": tracks});
         if let Some(res) = &self.result {
-            let sheets: Vec<Value> = res.scores.iter().enumerate().map(|(i, s)| json!({"장": i + 1, "글자 수": s.lengths(), "한도": res.limits})).collect();
+            let sheets: Vec<Value> = res
+                .scores
+                .iter()
+                .enumerate()
+                .map(|(i, s)| json!({"장": i + 1, "합주자": s.player, "악기": s.instrument, "글자 수": s.lengths(), "한도": res.limits}))
+                .collect();
             info["악보"] = json!(sheets);
             info["안내"] = json!(res.warnings);
             let t: Vec<i64> = res.tempos.iter().map(|t| t.1).take(20).collect();
@@ -1879,6 +1905,33 @@ impl App {
                     ui.label(RichText::new(hint).color(p.muted).size(12.0));
                 });
             });
+            if self.saved.ensemble {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.saved.drums, "드럼 트랙은 드럼 세트 합주자로");
+                    ui.add_space(8.0);
+                    ui.label("합주자 악기");
+                    // 지금 결과의 합주자 수(드럼 제외)만큼, 없으면 고른 인원만큼
+                    let shown = self
+                        .result
+                        .as_ref()
+                        .map(|r| r.players().into_iter().filter(|&pl| !r.scores.iter().any(|s| s.player == pl && s.instrument == crate::convert::DRUM_KIT)).count())
+                        .filter(|&n| n > 0)
+                        .unwrap_or_else(|| self.saved.players.parse().unwrap_or(2))
+                        .clamp(1, 8);
+                    if self.saved.player_insts.len() < shown {
+                        self.saved.player_insts.resize(shown, String::new());
+                    }
+                    let mut names: Vec<&str> = vec![PLAYER_INST_DEFAULT];
+                    names.extend(INSTRUMENTS.iter().map(|x| x.0));
+                    for k in 0..shown {
+                        ui.label(format!("{}", k + 1));
+                        let mut v = if self.saved.player_insts[k].is_empty() { PLAYER_INST_DEFAULT.to_string() } else { self.saved.player_insts[k].clone() };
+                        if Self::combo(ui, &format!("pinst{}", k), &mut v, &names, 96.0) {
+                            self.saved.player_insts[k] = if v == PLAYER_INST_DEFAULT { String::new() } else { v };
+                        }
+                    }
+                });
+            }
             ui.checkbox(&mut self.saved.keep_original, "붙여넣은 3파트 MML은 원본 그대로 나누기 (편곡 없음. 랭크, 한도, 글자 수 초과 시, 조옮김만 적용)");
             ui.checkbox(&mut self.saved.jabchiel, "자브키엘 악보집용 (여러 장일 때 장마다 세 파트 길이를 맞추고 템포를 모든 파트에)");
             if ui.checkbox(&mut self.update_on_start, "시작할 때 업데이트 확인 (하루 한 번)").changed() {

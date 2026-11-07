@@ -242,3 +242,23 @@ fn live_relay_once() {
     println!("답: {:?}", got);
     assert_eq!(ok.get("speed_percent").and_then(|v| v.as_i64()), Some(110));
 }
+
+#[test]
+fn ai_player_instruments_and_drums() {
+    let mut c = ai::Choices::new();
+    c.insert("players".into(), vec!["자동".into(), "1".into(), "2".into()]);
+    let data = serde_json::json!({"changes": [
+        {"name": "ensemble", "value": "true"},
+        {"name": "players", "value": "1"},
+        {"name": "drums", "value": "true"},
+        {"name": "player_instruments", "value": "전기기타"}
+    ], "reply": "ok"});
+    let d = ai::changes_to_dict(&data, &c);
+    let (ok, rejected) = ai::validate(&d, &c);
+    assert!(rejected.is_empty(), "{:?}", rejected);
+    assert_eq!(ok.get("player_instruments").and_then(|v| v.as_str()), Some("전기기타"));
+    assert_eq!(ok.get("drums").and_then(|v| v.as_bool()), Some(true));
+    let bad = serde_json::json!({"changes": [{"name": "player_instruments", "value": "드럼,피아노"}], "reply": ""});
+    let (_, rej) = ai::validate(&ai::changes_to_dict(&bad, &c), &c);
+    assert_eq!(rej.len(), 1);
+}

@@ -350,6 +350,7 @@ pub fn main(argv: &[String]) -> i32 {
         sustain: if a.no_pedal { "off".into() } else { a.sustain.clone() },
         split_players: a.split_players,
         players: if a.by_instrument { a.players.unwrap_or(0) } else { a.players.unwrap_or(1) },
+        ensemble: a.players.is_some() || a.by_instrument,
         by_instrument: a.by_instrument,
         jabchiel: !a.no_jabchiel,
         roles: Some(roles),

@@ -743,3 +743,28 @@ fn drums_mobile_compact_one_part() {
     assert!(x.scores[0].parts[1].is_empty() && x.scores[0].parts[2].is_empty());
     assert!(x.scores[0].parts[0].contains("v11") && !x.scores[0].parts[0].contains("v15"));
 }
+
+#[test]
+fn player_instruments_and_one_plus_drums() {
+    let mut drum_notes = vec![];
+    for b in 0..8 {
+        drum_notes.push(n((b * 96) as f64, (b * 96 + 24) as f64, 36, 100.0));
+    }
+    let mut dt = Track::new("Drums", drum_notes);
+    dt.is_drum = true;
+    let mel = Track::new("m", (0..8).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 60 + i as i64, 100.0)).collect());
+    let song = Song { tracks: vec![mel, dt], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    // 합주자 1명(전기기타) + 드럼
+    let r = convert_song(
+        &song,
+        &Options { players: 1, ensemble: true, include_drums: true, player_instruments: vec!["전기기타".into()], ..opts() },
+    )
+    .unwrap();
+    let who: Vec<(i64, String)> = r.scores.iter().map(|s| (s.player, s.instrument.clone())).collect();
+    assert_eq!(who, vec![(1, "전기기타".to_string()), (2, "드럼 세트".to_string())], "{:?}", r.warnings);
+    // 피아노로 바꾸면 한 옥타브 낮춰 적는다
+    let p = convert_song(&song, &Options { players: 1, ensemble: true, player_instruments: vec!["피아노".into()], ..opts() }).unwrap();
+    assert_eq!(p.scores[0].instrument, "피아노");
+    assert_eq!(p.parts_notes[0][0].pitch, 48);
+    assert!(p.warnings.iter().any(|w| w.contains("합주자 1: 피아노")));
+}

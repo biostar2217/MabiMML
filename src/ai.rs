@@ -24,7 +24,7 @@ impl std::fmt::Display for AIError {
     }
 }
 
-pub const SETTINGS: [(&str, &str); 11] = [
+pub const SETTINGS: [(&str, &str); 13] = [
     ("speed_percent", "정수, 빠르기 퍼센트 10~400 (100이 원곡)"),
     ("fixed_bpm", "정수, 곡 전체 고정 템포 0~255 (0은 원곡 템포)"),
     ("transpose", "정수, 음 높이(반음, 절대값) -48~48. 12가 한 옥타브"),
@@ -35,7 +35,9 @@ pub const SETTINGS: [(&str, &str); 11] = [
     ("split_players", "true/false, 4파트 이상 모바일 MML을 두 사람 악보로"),
     ("keep_original", "true/false, 붙여넣은 3파트 MML을 편곡 없이 그대로 나누기"),
     ("ensemble_fix", "true/false, 64비트 합주 밀림 보정"),
-    ("ensemble", "true/false, 합주: 곡을 여러 합주자(각자 멜로디·화음1·화음2)로 나누기. 인원은 players"),
+    ("ensemble", "true/false, 합주: 곡을 여러 합주자(각자 멜로디·화음1·화음2)로 나누기. 인원은 players (드럼 합주자는 인원에 안 셈)"),
+    ("drums", "true/false, 합주에서 곡의 MIDI 드럼 트랙을 마비노기 드럼 세트 합주자로 따로 만들기. 곡 정보 트랙에 [드럼]이 있어야 생긴다. 드럼 트랙이 없으면 드럼 합주자를 만들 수 없다"),
+    ("player_instruments", "합주자별 연주 악기를 쉼표로, 합주자 1부터 (예: '전기기타,피아노'). 빈 칸은 기본 연주 악기. instrument 목록의 이름만 쓴다"),
 ];
 
 fn limits(name: &str) -> Option<(i64, i64)> {
@@ -357,6 +359,17 @@ pub fn validate(data: &Map<String, Value>, choices: &Choices) -> (Map<String, Va
             let ok = value.as_array().map(|a| a.len() == 3 && a.iter().all(|v| v.as_i64().map(|x| (-7..=7).contains(&x)).unwrap_or(false))).unwrap_or(false);
             if !ok {
                 rejected.push(format!("part_volume={} (세 파트 각각 -7~7)", show(value)));
+                continue;
+            }
+        } else if key == "player_instruments" {
+            let ok = value.as_str().map(|s| {
+                s.split(',').all(|x| {
+                    let x = x.trim();
+                    x.is_empty() || crate::convert::INSTRUMENTS.iter().any(|i| i.0 == x)
+                })
+            });
+            if ok != Some(true) {
+                rejected.push(format!("player_instruments={} (악기 이름을 쉼표로)", show(value)));
                 continue;
             }
         } else if let Some(opts) = choices.get(key) {
