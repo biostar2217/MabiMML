@@ -43,7 +43,6 @@ pub const GAP_LABELS: [(&str, &str); 3] = [("MIDI만", "auto"), ("항상", "on")
 pub const PLAYER_CHOICES: [&str; 8] = ["자동", "2", "3", "4", "5", "6", "7", "8"];
 /// 듣기 범위
 const LISTEN_PLAYER: usize = 0;
-const LISTEN_ALL: usize = 4;
 pub const SUSTAIN_LABELS: [(&str, &str); 3] = [("모든 음 늘리기", "all"), ("베이스만 늘리기", "bass"), ("끄기", "off")];
 const AI_HINT: &str = "예: '조금 빠르게, 한 옥타브 낮춰서 피아노로', '화음2가 너무 길어 한 장에 맞춰줘'";
 const FILE_HINT: &str = "파일을 열거나 창에 끌어다 놓으세요";
@@ -245,6 +244,8 @@ pub struct App {
     tab: usize,
     /// 듣기 범위: 0 이 악보(세 파트), 1~3 멜로디·화음1·화음2만, 4 합주 전체
     listen: usize,
+    /// 합주에서 듣기에서 뺀 합주자 (비어 있으면 모두 듣는다)
+    muted: std::collections::BTreeSet<i64>,
     warnings: String,
     status: String,
     file_label: String,
@@ -325,6 +326,7 @@ impl App {
             score_texts: vec![],
             tab: 0,
             listen: 0,
+            muted: Default::default(),
             warnings: String::new(),
             status: String::new(),
             file_label: FILE_HINT.into(),
@@ -794,29 +796,44 @@ impl App {
     fn listen_names(&self) -> Vec<String> {
         let mut v: Vec<String> = vec!["세 파트 모두".into()];
         v.extend(PART_NAMES.iter().map(|n| format!("{}만", n)));
-        if self.is_ensemble() {
-            v.push("합주 전체".into());
-        }
         v
+    }
+
+    /// 듣기에 넣은 합주자들 (합주가 아니면 빈 목록)
+    fn heard_players(&self) -> Vec<i64> {
+        let all = self.result.as_ref().map(|r| r.players()).unwrap_or_default();
+        all.into_iter().filter(|p| !self.muted.contains(p)).collect()
+    }
+
+    /// 지금 보고 있는 합주자 한 명만 듣는가 (그러면 장 단위로 듣는다)
+    fn hearing_one(&self) -> bool {
+        let heard = self.heard_players();
+        let who = self.result.as_ref().and_then(|r| r.scores.get(self.tab)).map(|s| s.player).unwrap_or(0);
+        !self.is_ensemble() || (heard.len() == 1 && heard[0] == who)
     }
 
     fn preview_scores(&self) -> Result<(Vec<Score>, String, String), String> {
         let count = self.score_texts.len();
         let res = self.result.as_ref().ok_or("먼저 파일을 여세요")?;
         let ensemble = self.is_ensemble();
-        let listen = if !ensemble && self.listen == LISTEN_ALL { LISTEN_PLAYER } else { self.listen };
+        let listen = self.listen;
         let cur = self.tab.min(count.saturating_sub(1));
         let who = res.scores.get(cur).map(|s| s.player).unwrap_or(0);
         let only = if (1..=3).contains(&listen) { Some(listen - 1) } else { None };
         let part_tag = only.map(|k| format!(" {}", PART_NAMES[k])).unwrap_or_default();
         let player_tag = if ensemble { format!("합주자 {} ", who) } else { String::new() };
-        if listen == LISTEN_ALL || (count > 1 && self.other.play_all) {
-            // 합주 전체: 합주자마다 처음부터 겹쳐 놓는다. 이 합주자 전체: 그 사람 악보를 이어 붙인다
+        let together = ensemble && !self.hearing_one();
+        let heard = self.heard_players();
+        if together && heard.is_empty() {
+            return Err("들을 합주자를 하나 이상 고르세요 (악보 보기 위 '듣기')".into());
+        }
+        if together || (count > 1 && self.other.play_all) {
+            // 여러 합주자: 고른 사람마다 처음부터 겹쳐 놓는다. 한 사람 전체: 그 사람 악보를 이어 붙인다
             let mut scores = Vec::new();
             let (mut pos, mut player) = (0.0, i64::MIN);
             for i in 0..count {
                 let s = self.tab_score(i)?;
-                if listen != LISTEN_ALL && s.player != who {
+                if if together { !heard.contains(&s.player) } else { s.player != who } {
                     continue;
                 }
                 if s.player != player {
@@ -827,8 +844,12 @@ impl App {
                 scores.push(Score { start: pos, end: pos + length, only, ..s });
                 pos += length;
             }
-            if listen == LISTEN_ALL {
-                return Ok((scores, "합주 전체".into(), "_합주전체".into()));
+            if together {
+                let all = res.players().len() == heard.len();
+                let names = heard.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("·");
+                let label = if all { format!("합주 전체{}", part_tag) } else { format!("합주자 {} 함께{}", names, part_tag) };
+                let tail = if all { "_합주전체".to_string() } else { format!("_합주자{}", heard.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("_")) };
+                return Ok((scores, label, format!("{}{}", tail, part_tag.replace(' ', "_"))));
             }
             let tail = if ensemble { format!("_합주자{}", who) } else { "_전체".into() };
             return Ok((scores, format!("{}전체 악보{}", player_tag, part_tag), format!("{}{}", tail, part_tag.replace(' ', "_"))));
@@ -894,9 +915,17 @@ impl App {
             }
             return;
         }
-        let all = (self.score_texts.len() > 1 && self.other.play_all) || (self.listen == LISTEN_ALL && self.is_ensemble());
+        let together = !self.hearing_one();
+        let all = (self.score_texts.len() > 1 && self.other.play_all) || together;
         let who = self.result.as_ref().and_then(|r| r.scores.get(self.tab)).map(|s| s.player).unwrap_or(0);
-        let view = format!("{}|{}|{}|{}", self.path, all, if all { who as usize } else { self.tab }, self.listen);
+        let view = format!(
+            "{}|{}|{}|{}|{:?}",
+            self.path,
+            all,
+            if together { 0 } else if all { who as usize } else { self.tab },
+            self.listen,
+            if together { self.heard_players() } else { vec![] }
+        );
         let key = format!("{}|{}", view, self.score_texts.join("\u{1}"));
         if key == self.sheet_key {
             return;
@@ -917,7 +946,7 @@ impl App {
             .unwrap_or(384.0);
         match self.preview_scores() {
             Ok((scores, label, _)) => {
-                let names: Vec<String> = if all && self.listen != LISTEN_ALL {
+                let names: Vec<String> = if all && !together {
                     (0..scores.len()).map(|i| format!("악보 {}", i + 1)).collect()
                 } else {
                     vec![String::new(); scores.len()]
@@ -1061,7 +1090,7 @@ impl App {
         let p = self.pal;
         egui::SidePanel::right("sheet")
             .resizable(true)
-            .default_width(480.0)
+            .default_width(540.0)
             .min_width(280.0)
             .max_width(1000.0)
             .frame(egui::Frame::none().fill(p.bg).inner_margin(egui::Margin { left: 6.0, right: 8.0, top: 6.0, bottom: 6.0 }))
@@ -1084,6 +1113,7 @@ impl App {
                     }
                     ui.label(RichText::new("· 악보를 누르면 그 자리로 이동").size(12.0).color(p.muted));
                 });
+                self.hear_row(ui);
                 if !self.sheet_err.is_empty() {
                     ui.label(RichText::new(format!("고친 MML을 읽지 못해 이전 악보를 보여 줍니다: {}", self.sheet_err)).size(12.0).color(theme::OVER));
                 }
@@ -1116,13 +1146,52 @@ impl App {
     }
 
 
+    /// 합주일 때: 같이 들을 합주자 고르기
+    fn hear_row(&mut self, ui: &mut Ui) {
+        let players = self.result.as_ref().map(|r| r.players()).unwrap_or_default();
+        if players.is_empty() {
+            return;
+        }
+        let p = self.pal;
+        let before = self.muted.clone();
+        let who = self.result.as_ref().and_then(|r| r.scores.get(self.tab)).map(|s| s.player).unwrap_or(0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("듣기").font(theme::bold(13.0)));
+            for &pl in &players {
+                let mut on = !self.muted.contains(&pl);
+                if ui.checkbox(&mut on, format!("합주자 {}", pl)).changed() {
+                    if on {
+                        self.muted.remove(&pl);
+                    } else {
+                        self.muted.insert(pl);
+                    }
+                }
+            }
+            if ui.small_button("전체").on_hover_text("모든 합주자를 함께 듣기").clicked() {
+                self.muted.clear();
+            }
+            if ui.small_button("보는 사람만").on_hover_text("아래에서 고른 합주자 한 명만 듣기 (장 단위)").clicked() {
+                self.muted = players.iter().copied().filter(|&x| x != who).collect();
+            }
+        });
+        if self.heard_players().is_empty() {
+            ui.label(RichText::new("들을 합주자를 하나 이상 고르세요").size(12.0).color(theme::OVER));
+        } else if !self.hearing_one() {
+            ui.label(RichText::new("고른 합주자를 곡 처음부터 함께 들려줍니다 (악보도 겹쳐 보임)").size(12.0).color(p.muted));
+        }
+        if self.muted != before && self.player.is_playing() {
+            self.player.stop();
+            self.toggle_play();
+        }
+    }
+
     fn play_label(&self) -> String {
         if self.player.is_playing() {
             return "■ 정지".into();
         }
         let count = self.score_texts.len();
-        if self.listen == LISTEN_ALL && self.is_ensemble() {
-            "▶ 합주 듣기".into()
+        if !self.hearing_one() {
+            format!("▶ 합주 듣기 ({}명)", self.heard_players().len())
         } else if count > 1 && self.other.play_all {
             "▶ 전체 듣기".into()
         } else if count > 1 {
@@ -2163,6 +2232,7 @@ impl App {
                         }
                     }
                     self.listen = 1;
+                    self.muted = self.result.as_ref().map(|r| r.players()).unwrap_or_default().into_iter().filter(|&x| x != 2).collect();
                     wait_ms = 900;
                 } else {
                     if let Some(sh) = &self.sheet {
@@ -2171,7 +2241,18 @@ impl App {
                     shot = Some("5_합주자2_멜로디만.png");
                 }
             }
-            6 if ensemble_shot => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            6 if ensemble_shot => {
+                self.listen = 0;
+                self.muted.clear();
+                if let Some(r) = &self.result {
+                    if let Some(&last) = r.players().last() {
+                        self.muted.insert(last);
+                    }
+                }
+                wait_ms = 900;
+            }
+            7 if ensemble_shot => shot = Some("6_합주자_골라_듣기.png"),
+            8 if ensemble_shot => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             0 => shot = Some("1_기본화면.png"),
             1 => {
                 if let Some(s) = song {
@@ -2418,7 +2499,7 @@ pub fn run(files: Vec<String>) -> eframe::Result<()> {
     let pal = theme::palette(&saved.color_theme);
     let mut vb = egui::ViewportBuilder::default()
         .with_title(format!("마비노기 MML 변환기 v{}", VERSION))
-        .with_inner_size([1460.0, 900.0])
+        .with_inner_size([1540.0, 900.0])
         .with_min_inner_size([1080.0, 620.0])
         .with_drag_and_drop(true)
         .with_app_id("MabiMML.Converter");
