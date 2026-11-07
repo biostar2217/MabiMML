@@ -2,6 +2,7 @@
 
 pub mod ai;
 pub mod arrange;
+pub mod bundle;
 pub mod cli;
 pub mod config;
 pub mod convert;

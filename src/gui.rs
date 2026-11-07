@@ -19,7 +19,7 @@ use crate::convert::{
 use crate::mml_parser::{parse_part, split_clipboard};
 use crate::mobile_io::{clean_part, fragments_of, has_several_parts, is_mml_text, join_fragments, read_mobile_mml, song_from_parts, split_parts};
 use crate::model::Song;
-use crate::omr::{find_audiveris, set_audiveris_path};
+use crate::omr::set_audiveris_path;
 use crate::player::PianoPlayer;
 use crate::progress::{self, fmt_time, Progress, Snapshot};
 use crate::ranks::{rank_order, UNLIMITED};
@@ -648,7 +648,7 @@ impl App {
     }
 
     fn pick_audiveris(&mut self) {
-        let cur = find_audiveris();
+        let cur = crate::omr::find_audiveris_quick();
         let mut d = rfd::FileDialog::new()
             .set_title("Audiveris 실행 파일 선택 (보통 C:\\Program Files\\Audiveris\\Audiveris.exe)")
             .add_filter("실행 파일", &["exe", "bat", "cmd"])

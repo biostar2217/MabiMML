@@ -50,7 +50,18 @@ cargo test
 - 시험은 파이썬판 `tests/test_roundtrip.py`, `test_progress.py`, `test_ai_relay.py`, `test_updater.py` 를 옮긴 것입니다 (`tests/`, 각 모듈의 단위 시험).
 - 창 캡처: `MABIMML_SHOTS=폴더` 로 실행하면 기본 화면, 곡 불러온 화면, 불러오는 중 창, 포도주 테마를 자기 창에서 찍고 스스로 닫힙니다.
 
-설정 파일은 `%USERPROFILE%\.mabimml-rs.json` (파이썬판 설정과 따로). 배포용 exe 와 GitHub 릴리스는 아직 만들지 않았습니다.
+설정 파일은 `%USERPROFILE%\.mabimml-rs.json` (파이썬판 설정과 따로).
+
+## 배포 exe (PDF 포함판, 한 파일)
+`mabimml.exe` 뒤에 Audiveris(자바 포함) 폴더를 압축해 붙여 한 파일로 만듭니다. 처음 악보 PDF 를 읽을 때
+`%LOCALAPPDATA%\MabiMMLudiveris_<해시>` 에 한 번만 풀어 쓰고, 새 판이 나오면 이전 폴더는 지웁니다.
+
+```bash
+cargo build --release && target/release/mabimml-pack.exe target/release/mabimml.exe <audiveris 폴더> MabiMML_v2.0_PDF.exe
+```
+
+릴리스 자산은 `MabiMML_vX.Y_PDF.exe` 와 같은 파일의 고정 이름 `MabiMML_PDF.exe`, 그리고 `MabiMML_vX.Y_LICENSES.txt` 입니다.
+파이썬판 v1.6 의 자동 업데이트도 이 이름을 찾으므로 v1.6 사용자는 v2.0 을 업데이트로 받습니다.
 
 ## 폴더
 ```

@@ -141,7 +141,7 @@ pub fn load_song(path: &str, o: &LoadOpts) -> Res<Song> {
         }
     }
     if omr::OMR_EXTS.contains(&ext.as_str()) {
-        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf());
+        let abs = omr::abspath(path);
         let folder = abs.parent().map(|p| p.to_path_buf());
         let keep = if o.keep_omr { folder.clone() } else { None };
         let files = if o.keep_omr && !o.re_ocr { omr::existing_results(path) } else { vec![] };

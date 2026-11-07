@@ -100,6 +100,12 @@ fn candidates() -> Vec<PathBuf> {
     if let Some(Value::String(p)) = config::python_config().get("audiveris") {
         c.push(PathBuf::from(p));
     }
+    c
+}
+
+/// 컴퓨터에 설치된 Audiveris 자리
+fn installed() -> Vec<PathBuf> {
+    let mut c = Vec::new();
     for key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)", "LOCALAPPDATA"] {
         if let Some(r) = std::env::var_os(key) {
             let r = PathBuf::from(r);
@@ -112,11 +118,13 @@ fn candidates() -> Vec<PathBuf> {
     c
 }
 
+/// 지정한 위치 → exe 옆 폴더 → exe 에 붙어 있는 Audiveris(PDF 포함판, 처음 한 번 풀기) → 설치된 것 순.
 pub fn find_audiveris() -> Option<String> {
-    candidates().into_iter().find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
+    let found = candidates().into_iter().find(|p| p.is_file()).or_else(crate::bundle::bundled_audiveris);
+    found.or_else(|| installed().into_iter().find(|p| p.is_file())).map(|p| p.to_string_lossy().into_owned())
 }
 
-fn abspath(p: &str) -> PathBuf {
+pub fn abspath(p: &str) -> PathBuf {
     let pb = PathBuf::from(p);
     if pb.is_absolute() {
         pb
@@ -359,4 +367,9 @@ pub fn recognize(
         return Ok(kept);
     }
     Ok(found)
+}
+
+/// 풀기 없이 찾을 수 있는 위치만 (위치 설정 창의 시작 폴더용)
+pub fn find_audiveris_quick() -> Option<String> {
+    candidates().into_iter().chain(installed()).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
 }
