@@ -1261,6 +1261,29 @@ impl App {
         }
     }
 
+    /// 재생 중에 다른 악보(또는 합주자)를 누르면 바로 그 악보를 재생한다.
+    /// '전체'로 이어 듣는 중이면 그 장이 시작하는 곳으로 옮긴다.
+    fn tab_switched(&mut self) {
+        if !self.player.is_playing() || !self.hearing_one() {
+            return; // 멈춰 있거나, 여러 합주자를 함께 듣는 중이면 듣는 내용이 그대로다
+        }
+        self.player.stop();
+        self.was_playing = false;
+        self.refresh_sheet();
+        let count = self.score_texts.len();
+        let mut from = 0.0;
+        if count > 1 && self.other.play_all {
+            if let (Some(res), Some(sh)) = (self.result.as_ref(), self.sheet.as_ref()) {
+                let who = res.scores.get(self.tab).map(|s| s.player).unwrap_or(0);
+                let pos: f64 = (0..self.tab).filter(|&j| res.scores[j].player == who).map(|j| res.scores[j].end - res.scores[j].start).sum();
+                from = sh.unit_to_ms(pos);
+            }
+        }
+        self.seek_ms = from;
+        self.sheet_line = None;
+        self.toggle_play();
+    }
+
     fn play_label(&self) -> String {
         if self.player.is_playing() {
             return "■ 정지".into();
@@ -1945,6 +1968,7 @@ impl App {
 
     fn results(&mut self, ui: &mut Ui, ctx: &egui::Context, warn_lines: f32) {
         let p = self.pal;
+        let tab_before = self.tab;
         // 안내 칸 (아래)
         let warn_h = warn_lines * 17.0 + 8.0;
         let avail = ui.available_height();
@@ -1993,6 +2017,9 @@ impl App {
                         }
                     }
                 });
+            }
+            if self.tab != tab_before {
+                self.tab_switched();
             }
             if self.score_texts.is_empty() {
                 egui::Frame::none().fill(p.panel).stroke(egui::Stroke::new(1.0f32, p.line)).inner_margin(8.0).show(ui, |ui| {
