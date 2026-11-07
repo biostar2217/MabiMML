@@ -116,7 +116,7 @@ fn relay_body_shape() {
     let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
     assert_eq!(keys, ["app", "version", "system", "messages", "max_tokens"]);
     assert_eq!(body["app"], "MabiMML");
-    assert!(body["max_tokens"].as_i64().unwrap() <= 8192);
+    assert!(body["max_tokens"].as_i64().unwrap() <= 32000);
     let system = body["system"].as_str().unwrap();
     assert!(system.contains("JSON 스키마") && system.contains("\"changes\""));
     let content = body["messages"][0]["content"].as_str().unwrap();
@@ -197,7 +197,8 @@ fn relay_errors() {
 #[test]
 fn extract() {
     assert_eq!(ai::extract_json("앞말 {\"a\": 1} 뒷말").unwrap(), json!({"a": 1}));
-    assert!(ai::extract_json("JSON 없음").is_err());
+    assert_eq!(ai::extract_json("JSON 없음").unwrap()["reply"], "JSON 없음"); // 글로만 답하면 그 글을 답으로
+    assert!(ai::extract_json("").is_err());
 }
 
 #[test]
@@ -241,4 +242,100 @@ fn live_relay_once() {
     let (ok, _) = ai::validate(&got, &choices());
     println!("답: {:?}", got);
     assert_eq!(ok.get("speed_percent").and_then(|v| v.as_i64()), Some(110));
+}
+
+#[test]
+fn ai_player_instruments_and_drums() {
+    let mut c = ai::Choices::new();
+    c.insert("players".into(), vec!["자동".into(), "1".into(), "2".into()]);
+    let data = serde_json::json!({"changes": [
+        {"name": "ensemble", "value": "true"},
+        {"name": "players", "value": "1"},
+        {"name": "drums", "value": "true"},
+        {"name": "player_instruments", "value": "전기기타"}
+    ], "reply": "ok"});
+    let d = ai::changes_to_dict(&data, &c);
+    let (ok, rejected) = ai::validate(&d, &c);
+    assert!(rejected.is_empty(), "{:?}", rejected);
+    assert_eq!(ok.get("player_instruments").and_then(|v| v.as_str()), Some("전기기타"));
+    assert_eq!(ok.get("drums").and_then(|v| v.as_bool()), Some(true));
+    let bad = serde_json::json!({"changes": [{"name": "player_instruments", "value": "드럼,피아노"}], "reply": ""});
+    let (_, rej) = ai::validate(&ai::changes_to_dict(&bad, &c), &c);
+    assert_eq!(rej.len(), 1);
+}
+
+#[test]
+fn ai_mml_edits_parse() {
+    let c = ai::Choices::new();
+    let data = serde_json::json!({"changes": [], "reply": "고쳤어요",
+        "mml_edits": [{"sheet": 2, "part": "화음1", "mml": "MML@t120 c4 d4;"}, {"sheet": 1, "part": "없는파트", "mml": "c"}]});
+    let d = ai::changes_to_dict(&data, &c);
+    let (ok, rejected) = ai::validate(&d, &c);
+    assert!(ok.is_empty() && rejected.is_empty());
+    assert_eq!(ai::mml_edits(&d), vec![(1usize, 1usize, "t120c4d4".to_string())]);
+}
+
+/// 실제 중계 서버로 MML 고치기를 한 번 묻는다: MABIMML_LIVE_AI=1 cargo test --test progress_ai live_mml_edit -- --nocapture
+#[test]
+fn live_mml_edit() {
+    if std::env::var("MABIMML_LIVE_AI").is_err() {
+        return;
+    }
+    let c = ai::Choices::new();
+    let state = serde_json::json!({"instrument": "그대로 (류트 등)"});
+    let info = serde_json::json!({"파일": "test.mid", "악보": [{"장": 1, "글자 수": [16, 8, 0], "한도": [1600, 1200, 900]}]});
+    let mml = serde_json::json!({"악보 1": {"멜로디": "t120l4cdefgab>c", "화음1": "l2<c<g", "화음2": ""}});
+    let body = ai::build_request("멜로디의 마지막 음(높은 도)만 한 옥타브 낮춰 줘", &state, &info, Some(&mml), &c);
+    let data = ai::ask_relay(&body, mabimml::VERSION, ai::RELAY_URL).unwrap();
+    let d = ai::changes_to_dict(&data, &c);
+    println!("답: {:?}", d);
+    let edits = ai::mml_edits(&d);
+    assert!(!edits.is_empty(), "{:?}", d);
+    let (notes, _, _) = mabimml::mml_parser::parse_part(&edits[0].2).unwrap();
+    println!("고친 멜로디: {} -> 음 {:?}", edits[0].2, notes.iter().map(|n| n.pitch).collect::<Vec<_>>());
+}
+
+/// 실제 중계로 '드럼을 더 다채롭게' 명령을 보내 답을 읽을 수 있는지 본다:
+/// MABIMML_LIVE_AI=1 cargo test --test progress_ai live_drum_edit -- --nocapture
+#[test]
+fn live_drum_edit() {
+    if std::env::var("MABIMML_LIVE_AI").is_err() {
+        return;
+    }
+    use mabimml::convert::{convert_file, Options};
+    let res = convert_file(
+        "D:/MML/golden-hour-jvke-eobdeiteu-beojeon.mid",
+        &Options { players: 1, ensemble: true, auto_drums: true, instrument: "피아노".into(), ..Default::default() },
+    )
+    .unwrap();
+    let mut c = ai::Choices::new();
+    c.insert("drum_style".into(), vec!["기본".into(), "풍성하게".into(), "단순하게".into()]);
+    let mut sheets = serde_json::Map::new();
+    for (i, sc) in res.scores.iter().enumerate() {
+        sheets.insert(
+            format!("악보 {}", i + 1),
+            serde_json::json!({"합주자": sc.player, "악기": sc.instrument, "멜로디": sc.parts[0], "화음1": sc.parts[1], "화음2": sc.parts[2]}),
+        );
+    }
+    let info = serde_json::json!({"파일": "golden-hour.mid", "악보": res.scores.iter().enumerate().map(|(i, s)| serde_json::json!({"장": i + 1, "합주자": s.player, "악기": s.instrument, "글자 수": s.lengths(), "한도": res.limits})).collect::<Vec<_>>()});
+    let state = serde_json::json!({"ensemble": true, "players": "1", "auto_drums": true});
+    let body = ai::build_request(&std::env::var("MABIMML_AI_CMD").unwrap_or_else(|_| "합주자2 드럼을 좀더 다채롭게 해줬으면 좋겠어 악보새로만들어도돼".into()), &state, &info, Some(&serde_json::Value::Object(sheets)), &c);
+    println!("보내는 글자 수: {}", ai::py_json(&ai::relay_body(&body, "2.4.5"), None).len());
+    match ai::ask_relay(&body, mabimml::VERSION, ai::RELAY_URL) {
+        Ok(d) => {
+            println!("읽음: reply={:?} edits={}", d.get("reply"), d.get("mml_edits").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0));
+            println!("changes: {:?}", d.get("changes"));
+            println!("players: {:?}", ai::mml_edit_players(&ai::changes_to_dict(&d, &c)));
+            for (sheet, part, mml) in ai::mml_edits(&ai::changes_to_dict(&d, &c)) {
+                let ok = if part == 3 { mabimml::mml_parser::split_clipboard(&mml).iter().all(|p| mabimml::mml_parser::parse_part(p).is_ok()) } else { mabimml::mml_parser::parse_part(&mml).is_ok() };
+                println!("고침: 악보 {} 파트 {} 글자 {} 문법 {}", sheet + 1, part, mml.chars().count(), ok);
+            }
+        }
+        Err(e) => {
+            println!("오류: {}", e.0);
+            let raw = std::fs::read_to_string(std::env::temp_dir().join("mabimml_ai_last_answer.txt")).unwrap_or_default();
+            println!("받은 글 앞: {}", raw.chars().take(600).collect::<String>());
+            println!("받은 글 뒤: {}", raw.chars().rev().take(300).collect::<String>().chars().rev().collect::<String>());
+        }
+    }
 }
