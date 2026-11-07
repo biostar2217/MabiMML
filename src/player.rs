@@ -48,13 +48,27 @@ impl PianoPlayer {
 
     /// 악보들을 재생한다. 낼 수 없어 건너뛴 음의 수를 돌려준다.
     pub fn play(&mut self, scores: &[Score], shift: i64, program: i64) -> Result<usize, PlayerError> {
+        self.play_from(scores, shift, program, 0)
+    }
+
+    /// from_ms 밀리초 위치부터 재생한다.
+    pub fn play_from(&mut self, scores: &[Score], shift: i64, program: i64, from_ms: u64) -> Result<usize, PlayerError> {
         self.stop();
         let (bytes, skipped) = preview_midi(scores, shift, program, true).map_err(|e| PlayerError(e.to_string()))?;
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         let path = std::env::temp_dir().join(format!("mabimml_{}_{}.mid", std::process::id(), stamp));
         std::fs::write(&path, bytes).map_err(|e| PlayerError(e.to_string()))?;
         self.path = Some(path.clone());
-        let r = mci(&format!("open \"{}\" type sequencer alias {}", path.display(), ALIAS)).and_then(|_| mci(&format!("play {}", ALIAS)));
+        let r = mci(&format!("open \"{}\" type sequencer alias {}", path.display(), ALIAS))
+            .and_then(|_| mci(&format!("set {} time format milliseconds", ALIAS)))
+            .and_then(|_| {
+                let len = self.length_ms().unwrap_or(0);
+                if from_ms > 0 && from_ms + 100 < len {
+                    mci(&format!("play {} from {}", ALIAS, from_ms))
+                } else {
+                    mci(&format!("play {}", ALIAS))
+                }
+            });
         if let Err(e) = r {
             self.stop();
             return Err(e);
@@ -71,6 +85,30 @@ impl PianoPlayer {
             return false;
         }
         mci(&format!("status {} mode", ALIAS)).map(|m| m == "playing").unwrap_or(false)
+    }
+
+    /// 지금 재생 위치 (밀리초). 열린 곡이 없으면 None.
+    pub fn position_ms(&self) -> Option<u64> {
+        self.path.as_ref()?;
+        mci(&format!("status {} position", ALIAS)).ok()?.trim().parse().ok()
+    }
+
+    pub fn length_ms(&self) -> Option<u64> {
+        self.path.as_ref()?;
+        mci(&format!("status {} length", ALIAS)).ok()?.trim().parse().ok()
+    }
+
+    /// 재생 중인 곡의 위치를 옮긴다 (재생은 계속).
+    pub fn seek(&mut self, ms: u64) -> bool {
+        if !self.is_playing() {
+            return false;
+        }
+        let len = self.length_ms().unwrap_or(0);
+        if ms + 50 >= len {
+            self.stop();
+            return true;
+        }
+        mci(&format!("play {} from {}", ALIAS, ms)).is_ok()
     }
 
     pub fn stop(&mut self) {

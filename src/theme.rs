@@ -136,6 +136,11 @@ pub fn install_fonts(ctx: &egui::Context) {
         fonts.font_data.insert("consolas".into(), egui::FontData::from_owned(data));
         fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "consolas".into());
     }
+    // 악보 보기의 음자리표 글꼴
+    if let Some(data) = read("seguisym.ttf") {
+        fonts.font_data.insert("symbol".into(), egui::FontData::from_owned(data));
+        fonts.families.insert(egui::FontFamily::Name("music".into()), vec!["symbol".to_string()]);
+    }
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style()).clone();
     use egui::{FontFamily, FontId, TextStyle};

@@ -20,8 +20,9 @@ pub mod pyfmt;
 pub mod ranks;
 pub mod updater;
 pub mod gui;
+pub mod sheet;
 pub mod theme;
 pub mod zipread;
 
-pub const VERSION: &str = "2.0";
+pub const VERSION: &str = "2.1";
 pub const AUTHOR: &str = "LT 남븝";
