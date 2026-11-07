@@ -188,6 +188,9 @@ pub struct Other {
     pub transpose: i64,
     pub speed: i64,
     pub fixed_bpm: i64,
+    /// 앞부분 잘라 내기(초), 뒷부분 잘라 내기(초, 0=끝까지)
+    pub cut_start: i64,
+    pub cut_end: i64,
     pub vol_step: i64,
     pub quality: String,
     pub re_ocr: bool,
@@ -208,6 +211,8 @@ impl Default for Other {
             transpose: 0,
             speed: 100,
             fixed_bpm: 0,
+            cut_start: 0,
+            cut_end: 0,
             vol_step: 1,
             quality: QUALITY_PRESETS[0].0.into(),
             re_ocr: false,
@@ -445,6 +450,8 @@ impl App {
             transpose: o.transpose,
             tempo_scale: o.speed.clamp(10, 400) as f64 / 100.0,
             fixed_tempo: o.fixed_bpm.clamp(0, 255),
+            cut_start_sec: o.cut_start.max(0) as f64,
+            cut_end_sec: o.cut_end.max(0) as f64,
             volume_threshold: o.vol_step.clamp(1, 15),
             auto_detail: o.quality == QUALITY_AUTO,
             instrument: s.instrument.clone(),
@@ -682,6 +689,10 @@ impl App {
 
     /// 새 곡을 열 때: 앞 곡에서 켠 합주(합주자·드럼·합주자별 악기)는 이어지지 않게 끈다
     fn new_song_reset(&mut self, path: &str) {
+        if self.path != path {
+            self.other.cut_start = 0;
+            self.other.cut_end = 0;
+        }
         if self.path != path && (self.saved.ensemble || self.saved.auto_drums || !self.saved.player_insts.is_empty()) {
             self.saved.ensemble = false;
             self.saved.auto_drums = false;
@@ -1618,7 +1629,7 @@ impl App {
         let o = &self.other;
         let s = &self.saved;
         let v = json!({
-            "speed_percent": o.speed, "fixed_bpm": o.fixed_bpm, "transpose": o.transpose, "low_limit": s.low_limit,
+            "speed_percent": o.speed, "fixed_bpm": o.fixed_bpm, "cut_start_sec": o.cut_start, "cut_end_sec": o.cut_end, "transpose": o.transpose, "low_limit": s.low_limit,
             "tempo_all_parts": o.tempo_all, "no_song": o.no_song, "split_players": s.split_players,
             "keep_original": s.keep_original, "ensemble_fix": s.ensemble_fix, "instrument": s.instrument,
             "quality": o.quality, "rank": o.rank, "sustain": s.sustain, "gap_mode": s.gap_mode, "triplet": o.triplet,
@@ -1637,6 +1648,8 @@ impl App {
             match k.as_str() {
                 "speed_percent" => if let Some(i) = i { self.other.speed = i },
                 "fixed_bpm" => if let Some(i) = i { self.other.fixed_bpm = i },
+                "cut_start_sec" => if let Some(i) = i { self.other.cut_start = i.max(0) },
+                "cut_end_sec" => if let Some(i) = i { self.other.cut_end = i.max(0) },
                 "transpose" => if let Some(i) = i { self.other.transpose = i },
                 "low_limit" => if let Some(b) = b { self.saved.low_limit = b },
                 "tempo_all_parts" => if let Some(b) = b { self.other.tempo_all = b },
@@ -1768,7 +1781,28 @@ impl App {
         let limits = self.result.as_ref().map(|r| r.limits).unwrap_or([i64::MAX; 3]);
         let mut done = 0;
         let mut problems = Vec::new();
+        // 장 지우기는 뒤에서부터 (번호가 밀리지 않게)
+        let mut dels: Vec<usize> = edits.iter().filter(|e| e.1 == 4).map(|e| e.0).collect();
+        dels.sort();
+        dels.dedup();
+        for &d in dels.iter().rev() {
+            if d < self.score_texts.len() && self.score_texts.len() > 1 {
+                self.score_texts.remove(d);
+                if let Some(res) = self.result.as_mut() {
+                    if d < res.scores.len() {
+                        res.scores.remove(d);
+                    }
+                }
+                done += 1;
+            } else {
+                problems.push(format!("악보 {}은(는) 지울 수 없음", d + 1));
+            }
+        }
+        self.tab = self.tab.min(self.score_texts.len().saturating_sub(1));
         for (sheet, part, mml) in edits {
+            if *part == 4 {
+                continue;
+            }
             if *part == 3 {
                 // 장 전체 (세 파트) 바꾸기 또는 새 장 붙이기
                 let mut parts = split_clipboard(mml.trim());
@@ -2122,6 +2156,16 @@ impl App {
                 ui.label("템포 고정(0=원곡)");
                 ui.add(egui::DragValue::new(&mut self.other.fixed_bpm).range(0..=255));
                 ui.label(self.tempo_label.clone());
+                ui.label("");
+                ui.end_row();
+
+                ui.label("앞 자르기");
+                ui.add(egui::DragValue::new(&mut self.other.cut_start).range(0..=7200).custom_formatter(|v, _| fmt_clock(v * 1000.0)))
+                    .on_hover_text("이 시각 전은 버립니다 (그 시각이 든 마디 처음부터 남김). 0:00 은 자르지 않음");
+                ui.label("뒤 자르기");
+                ui.add(egui::DragValue::new(&mut self.other.cut_end).range(0..=7200).custom_formatter(|v, _| if v <= 0.0 { "끝까지".into() } else { fmt_clock(v * 1000.0) }))
+                    .on_hover_text("이 시각 뒤는 버립니다 (그 시각이 든 마디 끝까지 남김)");
+                ui.label("");
                 ui.label("");
                 ui.end_row();
 

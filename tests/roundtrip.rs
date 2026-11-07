@@ -803,3 +803,16 @@ fn auto_drums_follow_meter() {
     assert!(hits.iter().any(|h| h.0 >= 3 * 384 + 288 && h.0 < 4 * 384 && h.1 == 53));
     assert!(hits.len() > 120, "{}", hits.len());
 }
+
+#[test]
+fn cut_start_and_end() {
+    // 4/4, 120 BPM: 한 마디 = 2초. 9초는 5번째 마디 중간 -> 5번째 마디 처음(1536)부터 남긴다
+    let notes: Vec<Note> = (0..40).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 60 + (i % 12) as i64, 100.0)).collect();
+    let song = Song { tracks: vec![Track::new("m", notes)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let r = convert_song(&song, &Options { cut_start_sec: 9.0, cut_end_sec: 15.0, ..opts() }).unwrap();
+    let p = &r.parts_notes[0];
+    assert_eq!(p.first().map(|x| (x.start, x.pitch)), Some((0.0, 60 + (16 % 12) as i64)));
+    // 15초는 8번째 마디 중간 -> 8번째 마디 끝(3072)까지: 16~31번 음 16개
+    assert_eq!(p.len(), 16, "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("잘라 냈습니다"));
+}

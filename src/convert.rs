@@ -338,6 +338,10 @@ pub struct Options {
     pub auto_drums: bool,
     /// 자동 드럼 모양 (DRUM_STYLES)
     pub drum_style: String,
+    /// 곡 앞부분 잘라 내기: 이 시각(초) 전은 버린다 (마디 처음에서 자름)
+    pub cut_start_sec: f64,
+    /// 곡 뒷부분 잘라 내기: 이 시각(초) 뒤는 버린다 (0 = 끝까지)
+    pub cut_end_sec: f64,
 }
 
 impl Default for Options {
@@ -380,6 +384,8 @@ impl Default for Options {
             player_instruments: Vec::new(),
             auto_drums: false,
             drum_style: "기본".into(),
+            cut_start_sec: 0.0,
+            cut_end_sec: 0.0,
         }
     }
 }
@@ -1146,7 +1152,93 @@ fn split_original(song: &Song, opts: &Options) -> Res<ConvResult> {
     Ok(ConvResult { scores, limits, parts_notes: notes, tempos, warnings, sound_shift: 0 })
 }
 
+/// 곡 시간(초) -> 위치(유닛). 템포 변화를 따라간다.
+fn sec_to_unit(tempos: &[(f64, f64)], sec: f64) -> f64 {
+    let mut t: Vec<(f64, f64)> = tempos.to_vec();
+    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if t.is_empty() || t[0].0 > 0.0 {
+        t.insert(0, (0.0, 120.0));
+    }
+    let mut ms_left = sec * 1000.0;
+    for k in 0..t.len() {
+        let (u0, bpm) = t[k];
+        let ms_per_unit = 60000.0 / bpm.max(1.0) / 96.0;
+        let seg = t.get(k + 1).map(|n| (n.0 - u0) * ms_per_unit).unwrap_or(f64::INFINITY);
+        if ms_left <= seg {
+            return u0 + ms_left / ms_per_unit;
+        }
+        ms_left -= seg;
+    }
+    0.0
+}
+
+/// 곡의 앞(start_sec 전)과 뒤(end_sec 뒤, 0 이면 끝까지)를 마디 단위로 잘라 낸다. (잘린 곡, 안내)
+pub fn trim_song(song: &Song, start_sec: f64, end_sec: f64) -> (Song, String) {
+    let end_all = song.end_unit();
+    let bars: Vec<f64> = match &song.bars {
+        Some(b) if !b.is_empty() => {
+            let mut v = b.clone();
+            v.insert(0, 0.0);
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v
+        }
+        _ => bar_starts(&song.timesigs, end_all.max(1.0)).into_iter().map(|x| x as f64).collect(),
+    };
+    let bar_no = |u: f64| bars.partition_point(|&b| b <= u + 0.5);
+    let mut a = 0.0;
+    if start_sec > 0.0 {
+        let u = sec_to_unit(&song.tempos, start_sec);
+        a = bars.iter().cloned().filter(|&b| b <= u + 0.5).fold(0.0, f64::max);
+    }
+    let mut b = f64::INFINITY;
+    if end_sec > 0.0 && end_sec > start_sec {
+        let u = sec_to_unit(&song.tempos, end_sec);
+        b = bars.iter().cloned().find(|&x| x >= u - 0.5).unwrap_or(end_all);
+    }
+    let mut out = song.clone();
+    for t in out.tracks.iter_mut() {
+        t.notes = t
+            .notes
+            .iter()
+            .filter(|n| n.end > a + 0.5 && n.start < b - 0.5)
+            .map(|n| {
+                let s = n.start.max(a) - a;
+                let e = n.end.min(b) - a;
+                Note { start: s, end: e, hold: if n.hold > 0.0 { (n.hold.min(b) - a).max(e) } else { 0.0 }, key_end: if n.key_end > 0.0 { (n.key_end.min(b) - a).max(s) } else { 0.0 }, ..n.clone() }
+            })
+            .collect();
+    }
+    let bpm_at = |u: f64| song.tempos.iter().filter(|t| t.0 <= u + 0.5).map(|t| t.1).last().unwrap_or(120.0);
+    let mut tempos = vec![(0.0, bpm_at(a))];
+    tempos.extend(song.tempos.iter().filter(|t| t.0 > a + 0.5 && t.0 < b).map(|t| (t.0 - a, t.1)));
+    out.tempos = tempos;
+    let sig_at = song.timesigs.iter().filter(|s| s.0 <= a + 0.5).last().cloned().map(|s| (0.0, s.1, s.2));
+    let mut sigs: Vec<(f64, i64, i64)> = sig_at.into_iter().collect();
+    sigs.extend(song.timesigs.iter().filter(|s| s.0 > a + 0.5 && s.0 < b).map(|s| (s.0 - a, s.1, s.2)));
+    out.timesigs = sigs;
+    if let Some(bs) = &song.bars {
+        out.bars = Some(bs.iter().filter(|&&x| x > a + 0.5 && x < b).map(|x| x - a).collect());
+    }
+    out.raw_parts = None;
+    let mut msg = Vec::new();
+    if a > 0.0 {
+        msg.push(format!("{}마디 앞(약 {:.0}초 전)을 잘라 냈습니다", bar_no(a), start_sec));
+    }
+    if b.is_finite() {
+        msg.push(format!("{}마디부터 끝까지(약 {:.0}초 뒤)를 잘라 냈습니다", bar_no(b), end_sec));
+    }
+    (out, msg.join(", "))
+}
+
 pub fn convert_song(song: &Song, opts: &Options) -> Res<ConvResult> {
+    if opts.cut_start_sec > 0.0 || opts.cut_end_sec > 0.0 {
+        let (s2, msg) = trim_song(song, opts.cut_start_sec, opts.cut_end_sec);
+        let mut res = convert_song(&s2, &Options { cut_start_sec: 0.0, cut_end_sec: 0.0, keep_original: false, ..opts.clone() })?;
+        if !msg.is_empty() {
+            res.warnings.insert(0, msg);
+        }
+        return Ok(res);
+    }
     if opts.keep_original && song.raw_parts.as_ref().map(|r| r.len() <= 3).unwrap_or(false) {
         return split_original(song, opts);
     }
