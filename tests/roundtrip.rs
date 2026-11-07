@@ -793,4 +793,13 @@ fn auto_drums_follow_meter() {
     // 8번째 마디 끝 필인(탐), 9번째 마디 첫 박 크래시
     assert!(hits.iter().any(|h| h.0 >= 7 * 384 + 288 && h.0 < 8 * 384 && h.1 == 53), "{:?}", &hits[hits.len().saturating_sub(30)..]);
     assert!(hits.contains(&(8 * 384, 60)));
+    // 풍성하게: 당김음 킥(2박 뒤 8분), 오픈 하이햇(o3g=55), 뒤 4마디 라이드(o4e=64), 4마디마다 필인
+    let rich = convert_song(&song, &Options { players: 1, ensemble: true, auto_drums: true, drum_style: "풍성하게".into(), ..opts() }).unwrap();
+    let d = rich.scores.iter().find(|s| s.instrument == "드럼 세트").unwrap().clone();
+    let (dn, _) = scores_to_notes(&[d]).unwrap();
+    let hits: Vec<(i64, i64)> = dn.iter().flatten().filter(|x| x.vel > 0.0).map(|x| (x.start as i64, x.pitch)).collect();
+    assert!(hits.contains(&(144, 41)) && hits.contains(&(336, 55)), "{:?}", &hits[..20.min(hits.len())]);
+    assert!(hits.iter().any(|h| h.0 >= 4 * 384 && h.0 < 8 * 384 && h.1 == 64));
+    assert!(hits.iter().any(|h| h.0 >= 3 * 384 + 288 && h.0 < 4 * 384 && h.1 == 53));
+    assert!(hits.len() > 120, "{}", hits.len());
 }

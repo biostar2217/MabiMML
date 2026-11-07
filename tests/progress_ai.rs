@@ -197,7 +197,8 @@ fn relay_errors() {
 #[test]
 fn extract() {
     assert_eq!(ai::extract_json("앞말 {\"a\": 1} 뒷말").unwrap(), json!({"a": 1}));
-    assert!(ai::extract_json("JSON 없음").is_err());
+    assert_eq!(ai::extract_json("JSON 없음").unwrap()["reply"], "JSON 없음"); // 글로만 답하면 그 글을 답으로
+    assert!(ai::extract_json("").is_err());
 }
 
 #[test]
@@ -292,4 +293,41 @@ fn live_mml_edit() {
     assert!(!edits.is_empty(), "{:?}", d);
     let (notes, _, _) = mabimml::mml_parser::parse_part(&edits[0].2).unwrap();
     println!("고친 멜로디: {} -> 음 {:?}", edits[0].2, notes.iter().map(|n| n.pitch).collect::<Vec<_>>());
+}
+
+/// 실제 중계로 '드럼을 더 다채롭게' 명령을 보내 답을 읽을 수 있는지 본다:
+/// MABIMML_LIVE_AI=1 cargo test --test progress_ai live_drum_edit -- --nocapture
+#[test]
+fn live_drum_edit() {
+    if std::env::var("MABIMML_LIVE_AI").is_err() {
+        return;
+    }
+    use mabimml::convert::{convert_file, Options};
+    let res = convert_file(
+        "D:/MML/golden-hour-jvke-eobdeiteu-beojeon.mid",
+        &Options { players: 1, ensemble: true, auto_drums: true, instrument: "피아노".into(), ..Default::default() },
+    )
+    .unwrap();
+    let mut c = ai::Choices::new();
+    c.insert("drum_style".into(), vec!["기본".into(), "풍성하게".into(), "단순하게".into()]);
+    let mut sheets = serde_json::Map::new();
+    for (i, sc) in res.scores.iter().enumerate() {
+        sheets.insert(
+            format!("악보 {}", i + 1),
+            serde_json::json!({"합주자": sc.player, "악기": sc.instrument, "멜로디": sc.parts[0], "화음1": sc.parts[1], "화음2": sc.parts[2]}),
+        );
+    }
+    let info = serde_json::json!({"파일": "golden-hour.mid", "악보": res.scores.iter().enumerate().map(|(i, s)| serde_json::json!({"장": i + 1, "합주자": s.player, "악기": s.instrument, "글자 수": s.lengths(), "한도": res.limits})).collect::<Vec<_>>()});
+    let state = serde_json::json!({"ensemble": true, "players": "1", "auto_drums": true});
+    let body = ai::build_request("합주자2 드럼을 좀더 다채롭게 해줬으면 좋겠어 악보새로만들어도돼", &state, &info, Some(&serde_json::Value::Object(sheets)), &c);
+    println!("보내는 글자 수: {}", ai::py_json(&ai::relay_body(&body, "2.4.5"), None).len());
+    match ai::ask_relay(&body, mabimml::VERSION, ai::RELAY_URL) {
+        Ok(d) => println!("읽음: reply={:?} edits={}", d.get("reply"), d.get("mml_edits").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0)),
+        Err(e) => {
+            println!("오류: {}", e.0);
+            let raw = std::fs::read_to_string(std::env::temp_dir().join("mabimml_ai_last_answer.txt")).unwrap_or_default();
+            println!("받은 글 앞: {}", raw.chars().take(600).collect::<String>());
+            println!("받은 글 뒤: {}", raw.chars().rev().take(300).collect::<String>().chars().rev().collect::<String>());
+        }
+    }
 }

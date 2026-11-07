@@ -93,6 +93,8 @@ pub struct Saved {
     pub player_insts: Vec<String>,
     /// 드럼 트랙이 없으면 드럼 자동 만들기
     pub auto_drums: bool,
+    /// 자동 드럼 모양
+    pub drum_style: String,
 }
 
 impl Default for Saved {
@@ -118,6 +120,7 @@ impl Default for Saved {
             drums: true,
             player_insts: Vec::new(),
             auto_drums: false,
+            drum_style: crate::convert::DRUM_STYLES[0].into(),
         }
     }
 }
@@ -132,7 +135,7 @@ impl Saved {
             "sustain": self.sustain, "split_players": self.split_players,
             "ensemble": self.ensemble, "players": self.players, "ensemble_by": self.ensemble_by,
             "compact": self.compact, "drums": self.drums, "player_insts": self.player_insts,
-            "auto_drums": self.auto_drums
+            "auto_drums": self.auto_drums, "drum_style": self.drum_style
         })
     }
 
@@ -160,6 +163,7 @@ impl Saved {
         if let Some(v) = gb("compact") { s.compact = v; }
         if let Some(v) = gb("drums") { s.drums = v; }
         if let Some(v) = gb("auto_drums") { s.auto_drums = v; }
+        if let Some(v) = gs("drum_style", &|v| crate::convert::DRUM_STYLES.contains(&v)) { s.drum_style = v; }
         if let Some(a) = saved.get("player_insts").and_then(|v| v.as_array()) {
             s.player_insts = a.iter().take(8).map(|x| x.as_str().unwrap_or("").to_string()).collect();
         }
@@ -455,6 +459,7 @@ impl App {
             ensemble: s.ensemble,
             player_instruments: if s.ensemble { s.player_insts.clone() } else { vec![] },
             auto_drums: s.ensemble && s.auto_drums,
+            drum_style: s.drum_style.clone(),
             flats: s.compact,
             n_numbers: s.compact,
             keep_original: s.keep_original,
@@ -1585,6 +1590,7 @@ impl App {
         c.insert("fit".into(), FIT_LABELS.iter().map(|x| x.0.to_string()).collect());
         c.insert("players".into(), PLAYER_CHOICES.iter().map(|x| x.to_string()).collect());
         c.insert("ensemble_by".into(), ENSEMBLE_BY.iter().map(|x| x.to_string()).collect());
+        c.insert("drum_style".into(), crate::convert::DRUM_STYLES.iter().map(|x| x.to_string()).collect());
         c
     }
 
@@ -1598,7 +1604,8 @@ impl App {
             "quality": o.quality, "rank": o.rank, "sustain": s.sustain, "gap_mode": s.gap_mode, "triplet": o.triplet,
             "volume": o.volume, "fit": o.fit, "part_volume": s.part_vol,
             "ensemble": s.ensemble, "players": s.players, "ensemble_by": s.ensemble_by,
-            "drums": s.drums, "player_instruments": s.player_insts.join(","), "auto_drums": s.auto_drums
+            "drums": s.drums, "player_instruments": s.player_insts.join(","), "auto_drums": s.auto_drums,
+            "drum_style": s.drum_style
         });
         v.as_object().cloned().unwrap()
     }
@@ -1629,6 +1636,7 @@ impl App {
                 "ensemble_by" => if let Some(s) = st.filter(|s| ENSEMBLE_BY.contains(&s.as_str())) { self.saved.ensemble_by = s },
                 "drums" => if let Some(b) = b { self.saved.drums = b },
                 "auto_drums" => if let Some(b) = b { self.saved.auto_drums = b },
+                "drum_style" => if let Some(s) = st.filter(|s| crate::convert::DRUM_STYLES.contains(&s.as_str())) { self.saved.drum_style = s },
                 "player_instruments" => {
                     if let Some(s) = st {
                         self.saved.player_insts = s.split(',').take(8).map(|x| x.trim().to_string()).collect();
@@ -2103,6 +2111,9 @@ impl App {
                     ui.checkbox(&mut self.saved.drums, "드럼 트랙은 드럼 세트 합주자로");
                     ui.checkbox(&mut self.saved.auto_drums, "드럼이 없으면 자동으로 만들기")
                         .on_hover_text("곡에 드럼 트랙이 없으면 박자에 맞춘 드럼(킥·스네어·하이햇, 8마디마다 크래시)을 만들어 드럼 세트 합주자로 넣습니다");
+                    if self.saved.auto_drums {
+                        Self::combo(ui, "drum_style", &mut self.saved.drum_style, &crate::convert::DRUM_STYLES, 80.0);
+                    }
                     ui.add_space(8.0);
                     ui.label("합주자 악기");
                     // 지금 결과의 합주자 수(드럼 제외)만큼, 없으면 고른 인원만큼

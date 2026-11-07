@@ -336,6 +336,8 @@ pub struct Options {
     pub player_instruments: Vec<String>,
     /// 합주에서 드럼 트랙이 없으면 박자에 맞춘 드럼을 만들어 드럼 세트 합주자로
     pub auto_drums: bool,
+    /// 자동 드럼 모양 (DRUM_STYLES)
+    pub drum_style: String,
 }
 
 impl Default for Options {
@@ -377,6 +379,7 @@ impl Default for Options {
             ensemble: false,
             player_instruments: Vec::new(),
             auto_drums: false,
+            drum_style: "기본".into(),
         }
     }
 }
@@ -1348,7 +1351,12 @@ pub fn drum_preview_note(kit: i64) -> i64 {
 /// 드럼 트랙이 없는 곡에 곡 박자에 맞춘 드럼(GM 드럼 음)을 만든다.
 /// 음이 나는 마디에만: 4/4 는 킥 1·3박, 스네어 2·4박, 하이햇 8분음표(빠른 곡은 4분음표), 8마디마다 크래시와 그 앞 마디 끝에 필인,
 /// 3/4 는 킥 1박·하이햇, 6/8 등은 점4분음표 묶음으로. 베이스 음이 시작하는 8분음표 자리에 킥을 조금 더한다.
-fn generated_drum_track(song: &Song, grid: &BeatGrid) -> Option<Track> {
+/// 자동 드럼 모양: 기본 / 풍성하게 / 단순하게
+pub const DRUM_STYLES: [&str; 3] = ["기본", "풍성하게", "단순하게"];
+
+fn generated_drum_track(song: &Song, grid: &BeatGrid, style: &str) -> Option<Track> {
+    let rich = style == "풍성하게";
+    let simple = style == "단순하게";
     let notes: Vec<&Note> = song.tracks.iter().filter(|t| !t.is_drum).flat_map(|t| t.notes.iter()).filter(|n| n.vel > 0.0).collect();
     if notes.is_empty() {
         return None;
@@ -1390,11 +1398,14 @@ fn generated_drum_track(song: &Song, grid: &BeatGrid) -> Option<Track> {
         let (num, den) = sig_at(a);
         let beat = 384.0 / den as f64;
         let fast = tempo_at_u(a) >= 170.0;
-        // 크래시: 음이 다시 시작한 첫 마디와 8마디마다
-        if active_run % 8 == 0 {
-            hit(&mut out, a, 49, 110.0);
+        // 크래시: 음이 다시 시작한 첫 마디와 8마디마다 (풍성하게는 4마디마다)
+        let phrase = if rich { 4 } else { 8 };
+        if active_run % phrase == 0 {
+            hit(&mut out, a, if rich && active_run % 8 == 4 { 57 } else { 49 }, 110.0);
         }
-        let fill = active_run % 8 == 7 && den == 4 && num >= 4;
+        let fill = !simple && active_run % phrase == phrase - 1 && den == 4 && num >= 4;
+        // 풍성하게: 8마디 묶음의 뒤쪽 4마디는 하이햇 대신 라이드
+        let cymbal = if rich && active_run % 8 >= 4 { 51 } else { 42 };
         let mut kicks: Vec<f64> = Vec::new();
         if den == 8 && num % 3 == 0 {
             // 6/8, 9/8, 12/8: 점4분음표 묶음
@@ -1417,13 +1428,24 @@ fn generated_drum_track(song: &Song, grid: &BeatGrid) -> Option<Track> {
             for k in 0..6 {
                 hit(&mut out, a + k as f64 * 48.0, 42, if k % 2 == 0 { 80.0 } else { 60.0 });
             }
+        } else if den == 4 && (num == 2 || num == 4) && simple {
+            // 단순하게: 1박 킥, 3박 스네어(하프 타임), 박마다 하이햇
+            hit(&mut out, a, 36, 100.0);
+            kicks.push(a);
+            if num >= 4 {
+                hit(&mut out, a + 2.0 * beat, 38, 100.0);
+            }
+            for k in 0..num {
+                hit(&mut out, a + k as f64 * beat, 42, 70.0);
+            }
         } else if den == 4 && (num == 2 || num == 4) {
             for k in 0..num {
                 let t = a + k as f64 * beat;
                 if fill && k == num - 1 {
-                    // 필인: 마지막 박을 16분음표 탐·스네어로
-                    for (j, p) in [50i64, 47, 45, 38].iter().enumerate() {
-                        hit(&mut out, t + j as f64 * 24.0, *p, 100.0);
+                    // 필인: 마지막 박을 16분음표로. 풍성하게는 번갈아 다른 필인 (탐 내려오기 / 스네어 연타)
+                    let pat: [i64; 4] = if rich && (active_run / phrase) % 2 == 1 { [38, 38, 38, 38] } else { [50, 47, 45, 38] };
+                    for (j, p) in pat.iter().enumerate() {
+                        hit(&mut out, t + j as f64 * 24.0, *p, if *p == 38 { 90.0 + j as f64 * 5.0 } else { 100.0 });
                     }
                     continue;
                 }
@@ -1434,12 +1456,24 @@ fn generated_drum_track(song: &Song, grid: &BeatGrid) -> Option<Track> {
                     hit(&mut out, t, 38, 105.0);
                 }
             }
-            let step = if fast { 96.0 } else { 48.0 };
+            if rich && !fill {
+                // 당김음 킥(2박 뒤 8분음표)과 고스트 스네어(2박 뒤 16분음표, 약하게)
+                if num >= 4 {
+                    hit(&mut out, a + beat + 48.0, 36, 92.0);
+                    kicks.push(a + beat + 48.0);
+                }
+                hit(&mut out, a + beat + 72.0, 38, 40.0);
+            }
+            // 하이햇(또는 라이드): 기본은 8분음표, 풍성하게는 느린 곡이면 16분음표, 빠른 곡은 4분음표
+            let step = if fast { 96.0 } else if rich && tempo_at_u(a) < 110.0 { 24.0 } else { 48.0 };
             let mut t = a;
             let stop = if fill { b - beat } else { b };
             let mut k = 0;
             while t < stop - 1.0 {
-                hit(&mut out, t, 42, if k % 2 == 0 { 85.0 } else { 65.0 });
+                let on_beat = ((t - a) / beat).fract().abs() < 1e-6;
+                // 풍성하게: 마지막 박 뒤 8분음표는 오픈 하이햇
+                let open = rich && cymbal == 42 && !fill && (t - (a + (num as f64 - 0.5) * beat)).abs() < 1.0;
+                hit(&mut out, t, if open { 46 } else { cymbal }, if on_beat { 85.0 } else if k % 2 == 1 { 65.0 } else { 55.0 });
                 t += step;
                 k += 1;
             }
@@ -1489,11 +1523,19 @@ fn drum_parts(
     let has_drum_track = song.tracks.iter().any(|t| t.is_drum && !t.notes.is_empty());
     let made;
     if !has_drum_track && opts.auto_drums {
-        made = generated_drum_track(song, grid);
+        made = generated_drum_track(song, grid, &opts.drum_style);
         if let Some(t) = &made {
             drums.push(t);
             warnings.push(
-                "드럼 트랙이 없어 곡 박자에 맞춘 드럼을 자동으로 만들었습니다 (킥·스네어·하이햇, 8마디마다 크래시와 필인, 베이스에 맞춘 킥)".into(),
+                format!(
+                    "드럼 트랙이 없어 곡 박자에 맞춘 드럼을 자동으로 만들었습니다 ({}: {})",
+                    if opts.drum_style.is_empty() { "기본" } else { opts.drum_style.as_str() },
+                    match opts.drum_style.as_str() {
+                        "풍성하게" => "당김음 킥·고스트 스네어·오픈 하이햇, 4마디마다 크래시와 번갈아 다른 필인, 뒤 4마디는 라이드",
+                        "단순하게" => "1박 킥·3박 스네어·4분음표 하이햇, 필인 없음",
+                        _ => "킥·스네어·하이햇, 8마디마다 크래시와 필인, 베이스에 맞춘 킥",
+                    }
+                ),
             );
         }
     }
