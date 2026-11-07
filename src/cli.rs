@@ -18,6 +18,7 @@ MIDI / MusicXML / 악보 PDF 파일을 PC판 마비노기 MML(MML@멜로디,화�
   --mobile-text, --mml-text 글자   파일 대신 MML 글자를 직접 넣기
   --rearrange                3파트 이하 MML도 편곡 단계를 거침
   --split-players            모바일 MML의 1~3파트, 4~6파트를 두 사람 PC 악보로 나눔
+  --players N|auto           합주: N명(2~8)이 함께 치도록 나눔. auto 는 음을 빼지 않고 한 사람 한 장에 들어가는 인원
   --instrument 악기          연주 악기 (높게 나는 악기는 낮춰 적음)
   --no-low-limit             o2e 아래 음을 올리지 않음
   --fill-gaps auto|on|off    짧은 빈틈 메우기
@@ -64,6 +65,7 @@ struct Args {
     mobile_text: Option<String>,
     rearrange: bool,
     split_players: bool,
+    players: Option<usize>,
     instrument: String,
     no_low_limit: bool,
     fill_gaps: String,
@@ -149,6 +151,18 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             "--mobile-text" | "--mml-text" => a.mobile_text = Some(val(&mut i)?),
             "--rearrange" => a.rearrange = true,
             "--split-players" => a.split_players = true,
+            "--players" => {
+                let v = val(&mut i)?;
+                a.players = Some(if v.trim().eq_ignore_ascii_case("auto") {
+                    0
+                } else {
+                    let n = int(v, "--players")?;
+                    if !(1..=8).contains(&n) {
+                        return Err("--players 는 1~8 또는 auto".into());
+                    }
+                    n as usize
+                });
+            }
             "--instrument" => {
                 let v = val(&mut i)?;
                 let names: Vec<&str> = INSTRUMENTS.iter().map(|x| x.0).collect();
@@ -326,6 +340,7 @@ pub fn main(argv: &[String]) -> i32 {
         keep_original: !a.rearrange,
         sustain: if a.no_pedal { "off".into() } else { a.sustain.clone() },
         split_players: a.split_players,
+        players: a.players.unwrap_or(1),
         jabchiel: !a.no_jabchiel,
         roles: Some(roles),
         include_drums: a.drums,

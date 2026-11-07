@@ -361,7 +361,7 @@ fn mobile_mml() {
     let r = convert_song(&song, &Options { split_players: true, ..opts() }).unwrap();
     let players: std::collections::BTreeSet<i64> = r.scores.iter().map(|s| s.player).collect();
     assert_eq!(players.into_iter().collect::<Vec<_>>(), vec![1, 2]);
-    assert!(r.text().contains("[연주자 2]"));
+    assert!(r.text().contains("[합주자 2]"));
     assert_eq!(convert_song(&read_mobile_mml("c,d,e").unwrap(), &Options { split_players: true, ..opts() }).unwrap().scores[0].player, 0);
     // 이름표, 쉼표, 줄바꿈
     assert_eq!(split_parts("Melody: CDE\nChord1: EFG\nChord 2: GAB"), ["CDE", "EFG", "GAB"]);
@@ -578,4 +578,42 @@ fn musicxml_measure_ending_with_backup_does_not_overlap_next() {
     let starts = |pc: i64| song.tracks[0].notes.iter().filter(|x| x.pitch == 60 + pc).map(|x| x.start).collect::<Vec<_>>();
     assert_eq!(starts(7), vec![384.0]);
     assert_eq!(starts(11), vec![1152.0]);
+}
+
+#[test]
+fn ensemble_players() {
+    // 다섯 음 화음: 혼자서는 음을 빼야 하지만 두 사람이면 다 들어간다
+    let mut notes = vec![];
+    for b in 0..16 {
+        for (j, p) in [48, 55, 64, 67, 72].iter().enumerate() {
+            notes.push(n((b * 96) as f64, (b * 96 + 96) as f64, p + (b % 3) as i64 + j as i64 * 0, 100.0));
+        }
+    }
+    let song = Song { tracks: vec![Track::new("t", notes.clone())], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let solo = convert_song(&song, &Options { rank: "무제한".into(), ..opts() }).unwrap();
+    assert!(solo.warnings.iter().any(|w| w.contains("뺐습니다")));
+    let r = convert_song(&song, &Options { rank: "무제한".into(), players: 2, ..opts() }).unwrap();
+    assert_eq!(r.scores.iter().map(|s| s.player).collect::<Vec<_>>(), vec![1, 2]);
+    assert!(!r.warnings.iter().any(|w| w.contains("뺐습니다")), "{:?}", r.warnings);
+    // 두 사람 악보를 합치면 원래 음이 모두 있다
+    let (parts, _) = scores_to_notes(&r.scores).unwrap();
+    let total: usize = parts.iter().map(|p| p.iter().filter(|n| n.vel > 0.0).count()).sum();
+    assert_eq!(total, notes.len());
+    // 자동: 음을 빼지 않는 가장 적은 인원 (2명)
+    let a = convert_song(&song, &Options { rank: "무제한".into(), players: 0, ..opts() }).unwrap();
+    assert_eq!(a.scores.last().unwrap().player, 2);
+    assert!(a.warnings[0].contains("자동"));
+    // 글자 수: 긴 멜로디는 자동 합주에서 다른 합주자에게 뒷부분이 넘어가 한 사람 한 장에 들어간다
+    let mut rng = Rng(3);
+    let mel: Vec<Note> = (0..1600).map(|i| n((i * 24) as f64, (i * 24 + 24) as f64, 72 + rng.range(0, 11), 90.0)).collect();
+    let long = Song { tracks: vec![Track::new("m", mel)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let one_p = convert_song(&long, &Options { rank: "5".into(), ..opts() }).unwrap();
+    assert!(one_p.scores.len() > 1);
+    let e = convert_song(&long, &Options { rank: "5".into(), players: 0, ..opts() }).unwrap();
+    let players = e.scores.last().unwrap().player as usize;
+    assert_eq!(e.scores.len(), players, "{:?}", e.warnings);
+    assert!(e.scores.iter().all(|sc| sc.lengths().iter().zip(e.limits.iter()).all(|(l, m)| l <= m)));
+    let (parts, _) = scores_to_notes(&e.scores).unwrap();
+    let total: usize = parts.iter().map(|p| p.iter().filter(|n| n.vel > 0.0).count()).sum();
+    assert_eq!(total, 1600);
 }
