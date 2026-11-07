@@ -298,6 +298,8 @@ pub struct App {
     sheet_label: String,
     sheet_open: bool,
     sheet_follow: bool,
+    /// 여러 합주자를 함께 볼 때 합주자마다 큰보표를 따로 그린다
+    sheet_split: bool,
     sheet_line: Option<usize>,
     /// 멈춰 있을 때 다음 재생을 시작할 위치 (밀리초)
     seek_ms: f64,
@@ -374,6 +376,7 @@ impl App {
             sheet_label: String::new(),
             sheet_open: true,
             sheet_follow: true,
+            sheet_split: true,
             sheet_line: None,
             seek_ms: 0.0,
             seek_drag: None,
@@ -949,6 +952,7 @@ impl App {
         let together = !self.hearing_one();
         let all = (self.score_texts.len() > 1 && self.other.play_all) || together;
         let who = self.result.as_ref().and_then(|r| r.scores.get(self.tab)).map(|s| s.player).unwrap_or(0);
+        let split = together && self.sheet_split;
         let view = format!(
             "{}|{}|{}|{}|{:?}",
             self.path,
@@ -957,6 +961,7 @@ impl App {
             self.listen,
             if together { self.heard_players() } else { vec![] }
         );
+        let view = format!("{}|{}", view, split);
         let key = format!("{}|{}", view, self.score_texts.join("\u{1}"));
         if key == self.sheet_key {
             return;
@@ -982,7 +987,20 @@ impl App {
                 } else {
                     vec![String::new(); scores.len()]
                 };
-                match Sheet::build(&scores, names, bar) {
+                let built = if split {
+                    // 합주자마다 큰보표 하나씩
+                    let mut groups: Vec<(String, Vec<Score>)> = Vec::new();
+                    for sc in &scores {
+                        match groups.iter_mut().find(|g| g.1.first().map(|x| x.player) == Some(sc.player)) {
+                            Some(g) => g.1.push(sc.clone()),
+                            None => groups.push((self.player_name(sc.player), vec![sc.clone()])),
+                        }
+                    }
+                    Sheet::build_staves(&groups, bar)
+                } else {
+                    Sheet::build(&scores, names, bar)
+                };
+                match built {
                     Ok(sh) => {
                         self.sheet = Some(sh);
                         self.sheet_err.clear();
@@ -1208,7 +1226,11 @@ impl App {
         if self.heard_players().is_empty() {
             ui.label(RichText::new("들을 합주자를 하나 이상 고르세요").size(12.0).color(theme::OVER));
         } else if !self.hearing_one() {
-            ui.label(RichText::new("고른 합주자를 곡 처음부터 함께 들려줍니다 (악보도 겹쳐 보임)").size(12.0).color(p.muted));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.sheet_split, "합주자마다 악보 따로 보기");
+                let note = if self.sheet_split { "고른 합주자를 곡 처음부터 함께 들려줍니다" } else { "고른 합주자를 곡 처음부터 함께 들려줍니다 (악보는 한 보표에 겹쳐 보임)" };
+                ui.label(RichText::new(note).size(12.0).color(p.muted));
+            });
         }
         if self.muted != before && self.player.is_playing() {
             self.player.stop();
