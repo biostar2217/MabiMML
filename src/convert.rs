@@ -350,6 +350,8 @@ pub struct Options {
     pub drum_merge: bool,
     /// 드럼 장을 합칠 때 다른 합주자가 장을 바꾸는 자리마다 넣을 쉼 (박)
     pub drum_merge_rest: f64,
+    /// 합주에서 곡 화음을 따라 베이스 합주자를 자동으로 만든다 (모양은 drum_style 을 따름)
+    pub auto_bass: bool,
 }
 
 impl Default for Options {
@@ -398,6 +400,7 @@ impl Default for Options {
             drum_compact: false,
             drum_merge: false,
             drum_merge_rest: 1.0,
+            auto_bass: false,
         }
     }
 }
@@ -1615,6 +1618,95 @@ fn generated_drum_track(song: &Song, grid: &BeatGrid, style: &str) -> Option<Tra
     Some(t)
 }
 
+/// 곡 화음의 가장 낮은 음을 따라 베이스 합주자 한 사람(멜로디 파트 한 줄)을 만든다.
+/// 기본: 1·3박 2분음표, 풍성하게: 8분음표로 근음과 옥타브를 오가며, 단순하게: 마디마다 온음표.
+fn bass_part(song: &Song, opts: &Options, grid: &BeatGrid, tempos: &[(i64, i64)], warnings: &mut Vec<String>) -> Option<Vec<Vec<Note>>> {
+    if !opts.auto_bass {
+        return None;
+    }
+    let notes: Vec<&Note> = song.tracks.iter().filter(|t| !t.is_drum).flat_map(|t| t.notes.iter()).filter(|n| n.vel > 0.0).collect();
+    if notes.is_empty() {
+        return None;
+    }
+    let end = notes.iter().map(|n| n.end).fold(0.0, f64::max);
+    let bars = song_bars(song, grid, end);
+    let sig_at = |u: f64| {
+        let mut s = (4i64, 4i64);
+        for &(t, num, den) in &song.timesigs {
+            if t <= u + 1e-6 && num > 0 && den > 0 {
+                s = (num, den);
+            }
+        }
+        s
+    };
+    // 그 구간에서 나는 가장 낮은 음의 음이름 -> 베이스 음역(o1a~o2g#, MIDI 33~44)
+    let root_at = |a: f64, b: f64| -> Option<i64> {
+        let low = notes.iter().filter(|n| n.start < b && n.end > a + 1.0).map(|n| n.pitch).min()?;
+        let pc = low.rem_euclid(12);
+        let mut p = 33 + (pc - 33i64.rem_euclid(12)).rem_euclid(12);
+        if p > 44 {
+            p -= 12;
+        }
+        Some(p)
+    };
+    let style = opts.drum_style.as_str();
+    let mut line: Vec<Note> = Vec::new();
+    for w in bars.windows(2) {
+        let (a, b) = (w[0] as f64, w[1] as f64);
+        if b - a < 24.0 || !notes.iter().any(|n| n.start < b && n.end > a) {
+            continue;
+        }
+        let (num, den) = sig_at(a);
+        let beat = 384.0 / den as f64;
+        // 마디를 나누는 단위: 단순하게는 한 마디, 기본은 반 마디(4/4면 2박), 풍성하게는 8분음표
+        let step = match style {
+            "단순하게" => b - a,
+            "풍성하게" => 48.0f64.min(b - a),
+            _ => {
+                if num % 2 == 0 && num >= 4 { beat * (num / 2) as f64 } else { b - a }
+            }
+        };
+        let mut t = a;
+        let mut k = 0;
+        while t < b - 1.0 {
+            let e = (t + step).min(b);
+            // 화음은 반 마디마다 다시 본다 (8분음표로 칠 때도 근음은 반 마디 단위)
+            let chord_a = if style == "풍성하게" { a + (((t - a) / (beat * 2.0)).floor() * beat * 2.0) } else { t };
+            // 음 길이는 64분음표(6유닛) 눈금에 맞춘다 (MML로 적을 수 없는 짧은 길이를 피함)
+            let (ts, es) = ((t / 6.0).round() * 6.0, (e / 6.0).round() * 6.0);
+            if es - ts < 6.0 {
+                t = e;
+                k += 1;
+                continue;
+            }
+            if let Some(mut p) = root_at(chord_a, (chord_a + beat * 2.0).min(b)) {
+                if style == "풍성하게" && k % 4 == 3 {
+                    p += 12; // 박 뒤에 옥타브 위
+                }
+                line.push(Note::new(ts, es, p, 100.0)); // 볼륨은 한 가지로 (글자 아끼기)
+            }
+            t = e;
+            k += 1;
+        }
+    }
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = vec![line, vec![], vec![]];
+    if !opts.tempo_all_parts {
+        parts = silence_after_tempo(&parts, tempos);
+    }
+    warnings.push(format!(
+        "곡 화음의 가장 낮은 음을 따라 베이스 합주자를 자동으로 만들었습니다 ({})",
+        match style {
+            "풍성하게" => "8분음표로 근음과 옥타브",
+            "단순하게" => "마디마다 온음표",
+            _ => "1·3박 2분음표",
+        }
+    ));
+    Some(parts)
+}
+
 /// MIDI 드럼 트랙을 마비노기 드럼 세트 세 파트로 옮긴다 (조옮김 없음). 드럼 트랙이 없으면 None.
 /// opts.auto_drums 면 드럼 트랙이 없는 곡에 박자에 맞춘 드럼을 만들어 쓴다.
 fn drum_parts(
@@ -1762,6 +1854,10 @@ fn convert_by_pitch(song: &Song, opts: &Options) -> Res<ConvResult> {
     let ((mut parts, tempos, limits, grid), mut warnings, moved) = pick_players(song, &o, &candidates, auto)?;
     let n = parts.len() / 3;
     let mut insts = vec![String::new(); n];
+    if let Some(b) = bass_part(song, opts, &grid, &tempos, &mut warnings) {
+        insts.push("베이스".into());
+        parts.extend(b);
+    }
     if let Some(d) = drum_parts(song, opts, &grid, &tempos, &limits, &mut warnings) {
         for _ in 0..d.len() / 3 {
             insts.push(DRUM_KIT.into());
@@ -1776,9 +1872,8 @@ fn convert_by_pitch(song: &Song, opts: &Options) -> Res<ConvResult> {
     if moved > 0 {
         head += &format!(" (긴 파트 {}개는 뒷부분을 다른 합주자에게 넘겼습니다)", moved);
     }
-    if insts.len() > n {
-        let who: Vec<String> = (n + 1..=insts.len()).map(|p| p.to_string()).collect();
-        head += &format!(" + 드럼 세트 합주자 {}", who.join("·"));
+    for (k, inst) in insts.iter().enumerate().skip(n) {
+        head += &format!(" + {} 합주자 {}", if inst == DRUM_KIT { "드럼 세트" } else { inst.as_str() }, k + 1);
     }
     apply_player_instruments(&mut parts, &mut insts, opts, &mut warnings);
     finish_ensemble(song, opts, parts, &tempos, limits, &grid, warnings, &insts, head)
@@ -1978,6 +2073,14 @@ fn convert_by_instrument(song: &Song, opts: &Options) -> Res<ConvResult> {
         insts.extend(std::iter::repeat(inst.to_string()).take(n));
         tempos = t;
         limits = l;
+    }
+    // 원곡에 베이스 트랙이 없을 때만 자동 베이스
+    if !groups.iter().any(|g| g.0 == "베이스") {
+        if let Some(b) = bass_part(song, opts, &grid, &tempos, &mut warnings) {
+            insts.push("베이스".into());
+            parts.extend(b);
+            lines.push(format!("합주자 {}: 베이스 (자동)", insts.len()));
+        }
     }
     if let Some(d) = drum_parts(song, opts, &grid, &tempos, &limits, &mut warnings) {
         let first = insts.len() + 1;

@@ -102,6 +102,8 @@ pub struct Saved {
     pub drum_merge: bool,
     /// 드럼 장 합칠 때 장 바꿈마다 넣을 쉼 (박)
     pub drum_merge_rest: f64,
+    /// 베이스 자동 만들기 (곡마다)
+    pub auto_bass: bool,
 }
 
 impl Default for Saved {
@@ -132,6 +134,7 @@ impl Default for Saved {
             drum_compact: true,
             drum_merge: false,
             drum_merge_rest: 1.0,
+            auto_bass: false,
         }
     }
 }
@@ -490,6 +493,7 @@ impl App {
             ensemble: s.ensemble,
             player_instruments: if s.ensemble { s.player_insts.clone() } else { vec![] },
             auto_drums: s.ensemble && s.auto_drums,
+            auto_bass: s.ensemble && s.auto_bass,
             drum_style: s.drum_style.clone(),
             drum_compact: s.drum_compact,
             drum_merge: s.drum_merge,
@@ -718,9 +722,10 @@ impl App {
             self.other.cut_end = 0;
             self.other.drop_players.clear();
         }
-        if self.path != path && (self.saved.ensemble || self.saved.auto_drums || !self.saved.player_insts.is_empty()) {
+        if self.path != path && (self.saved.ensemble || self.saved.auto_drums || self.saved.auto_bass || !self.saved.player_insts.is_empty()) {
             self.saved.ensemble = false;
             self.saved.auto_drums = false;
+            self.saved.auto_bass = false;
             self.saved.player_insts.clear();
             self.save_settings();
             self.load_note = "새 곡이라 합주는 꺼 두었습니다. 필요하면 '연주 맞춤'에서 합주를 켜세요".into();
@@ -1689,7 +1694,7 @@ impl App {
             "volume": o.volume, "fit": o.fit, "part_volume": s.part_vol,
             "ensemble": s.ensemble, "players": s.players, "ensemble_by": s.ensemble_by,
             "drums": s.drums, "player_instruments": s.player_insts.join(","), "auto_drums": s.auto_drums,
-            "drum_compact": s.drum_compact, "drum_merge": s.drum_merge,
+            "drum_compact": s.drum_compact, "drum_merge": s.drum_merge, "auto_bass": s.auto_bass,
             "drum_style": s.drum_style,
             "track_roles": self.roles.iter().enumerate().map(|(i, r)| format!("{}:{}", i + 1, r)).collect::<Vec<_>>().join(",")
         });
@@ -1732,6 +1737,7 @@ impl App {
                 "drums" => if let Some(b) = b { self.saved.drums = b },
                 "auto_drums" => if let Some(b) = b { self.saved.auto_drums = b },
                 "drum_compact" => if let Some(b) = b { self.saved.drum_compact = b },
+                "auto_bass" => if let Some(b) = b { self.saved.auto_bass = b },
                 "drum_merge" => if let Some(b) = b { self.saved.drum_merge = b },
                 "drum_style" => if let Some(s) = st.filter(|s| crate::convert::DRUM_STYLES.contains(&s.as_str())) { self.saved.drum_style = s },
                 "track_roles" => {
@@ -2335,9 +2341,11 @@ impl App {
             if self.saved.ensemble {
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.saved.drums, "드럼 트랙은 드럼 세트 합주자로");
+                    ui.checkbox(&mut self.saved.auto_bass, "베이스 자동으로 만들기")
+                        .on_hover_text("곡 화음의 가장 낮은 음을 따라 베이스 합주자를 만듭니다 (모양은 옆의 기본/풍성하게/단순하게)");
                     ui.checkbox(&mut self.saved.auto_drums, "드럼이 없으면 자동으로 만들기")
                         .on_hover_text("곡에 드럼 트랙이 없으면 박자에 맞춘 드럼(킥·스네어·하이햇, 8마디마다 크래시)을 만들어 드럼 세트 합주자로 넣습니다");
-                    if self.saved.auto_drums {
+                    if self.saved.auto_drums || self.saved.auto_bass {
                         Self::combo(ui, "drum_style", &mut self.saved.drum_style, &crate::convert::DRUM_STYLES, 80.0);
                     }
                     ui.checkbox(&mut self.saved.drum_compact, "드럼 글자 아끼기")
