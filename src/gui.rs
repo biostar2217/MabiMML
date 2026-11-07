@@ -1003,11 +1003,22 @@ impl App {
             .unwrap_or(384.0);
         match self.preview_scores() {
             Ok((scores, label, _)) => {
-                let names: Vec<String> = if all && !together {
-                    (0..scores.len()).map(|i| format!("악보 {}", i + 1)).collect()
-                } else {
-                    vec![String::new(); scores.len()]
-                };
+                // 여러 장을 이어 볼 때 장 경계에 '악보 k'를 적는다 (합주는 모두 같은 마디에서 잘리므로 첫 합주자 기준)
+                let first_player = scores.first().map(|s| s.player).unwrap_or(0);
+                let mut k = 0;
+                let names: Vec<String> = scores
+                    .iter()
+                    .map(|s| {
+                        if all && s.player == first_player {
+                            k += 1;
+                            format!("악보 {}", k)
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .collect();
+                let starts: Vec<(f64, String)> =
+                    scores.iter().zip(names.iter()).filter(|(_, n)| !n.is_empty()).map(|(s, n)| (s.start, n.clone())).collect();
                 let built = if split {
                     // 합주자마다 큰보표 하나씩
                     let mut groups: Vec<(String, Vec<Score>)> = Vec::new();
@@ -1017,7 +1028,10 @@ impl App {
                             None => groups.push((self.player_name(sc.player), vec![sc.clone()])),
                         }
                     }
-                    Sheet::build_staves(&groups, bar)
+                    Sheet::build_staves(&groups, bar).map(|mut sh| {
+                        sh.starts = starts.clone();
+                        sh
+                    })
                 } else {
                     Sheet::build(&scores, names, bar)
                 };
@@ -1157,6 +1171,11 @@ impl App {
         if !self.sheet_open {
             return;
         }
+        // 고른 악보(장)를 악보 보기에서 진하게
+        let pick = self.result.as_ref().and_then(|r| r.scores.get(self.tab).map(|_| r.sheet_number(self.tab).0 - 1));
+        if let Some(sh) = self.sheet.as_mut() {
+            sh.highlight = if sh.starts.len() >= 2 { pick } else { None };
+        }
         let p = self.pal;
         egui::SidePanel::right("sheet")
             .resizable(true)
@@ -1282,22 +1301,38 @@ impl App {
     /// 재생 중에 다른 악보(또는 합주자)를 누르면 바로 그 악보를 재생한다.
     /// '전체'로 이어 듣는 중이면 그 장이 시작하는 곳으로 옮긴다.
     fn tab_switched(&mut self) {
-        if !self.player.is_playing() || !self.hearing_one() {
-            return; // 멈춰 있거나, 여러 합주자를 함께 듣는 중이면 듣는 내용이 그대로다
+        if !self.hearing_one() {
+            // 여러 합주자를 함께 듣는 중: 같은 악보를 그대로 들으며 고른 장이 시작하는 곳으로 옮긴다
+            let target = self.sheet.as_ref().and_then(|sh| {
+                let k = self.result.as_ref().map(|r| r.sheet_number(self.tab).0)?;
+                sh.starts.get(k - 1).map(|s| sh.unit_to_ms(s.0))
+            });
+            if let Some(ms) = target {
+                self.sheet_line = None;
+                self.commit_seek(ms);
+            }
+            return;
+        }
+        let count = self.score_texts.len();
+        if count > 1 && self.other.play_all {
+            // 한 사람의 장을 이어 듣는 중: 고른 장이 시작하는 곳으로 옮긴다 (재생 중이면 그 자리부터 이어서)
+            self.refresh_sheet();
+            let target = self.sheet.as_ref().and_then(|sh| {
+                let k = self.result.as_ref().map(|r| r.sheet_number(self.tab).0)?;
+                sh.starts.get(k - 1).map(|s| sh.unit_to_ms(s.0))
+            });
+            if let Some(ms) = target {
+                self.commit_seek(ms);
+            }
+            return;
+        }
+        if !self.player.is_playing() {
+            return; // 멈춰 있으면 고른 악보가 새로 그려지고 처음부터 듣는다
         }
         self.player.stop();
         self.was_playing = false;
         self.refresh_sheet();
-        let count = self.score_texts.len();
-        let mut from = 0.0;
-        if count > 1 && self.other.play_all {
-            if let (Some(res), Some(sh)) = (self.result.as_ref(), self.sheet.as_ref()) {
-                let who = res.scores.get(self.tab).map(|s| s.player).unwrap_or(0);
-                let pos: f64 = (0..self.tab).filter(|&j| res.scores[j].player == who).map(|j| res.scores[j].end - res.scores[j].start).sum();
-                from = sh.unit_to_ms(pos);
-            }
-        }
-        self.seek_ms = from;
+        self.seek_ms = 0.0;
         self.sheet_line = None;
         self.toggle_play();
     }
@@ -2555,11 +2590,17 @@ impl App {
             }
             3 => {
                 // 재생 위치 표시가 보이도록 곡의 1/5 쯤으로 옮겨 둔다
-                if let Some(sh) = &self.sheet {
-                    self.seek_ms = sh.total_ms() * 0.2;
-                    self.sheet_line = None;
+                let frac = std::env::var("MABIMML_SHOT_SEEK").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.2);
+                if self.seek_ms <= 0.0 {
+                    if let Some(sh) = &self.sheet {
+                        self.seek_ms = sh.total_ms() * frac;
+                        self.sheet_line = None;
+                    }
+                    again = true; // 악보 보기가 그 자리로 스크롤할 시간을 준다
+                    wait_ms = 700;
+                } else {
+                    shot = Some("2_곡_불러온_화면.png");
                 }
-                shot = Some("2_곡_불러온_화면.png");
             }
             4 => {
                 if let Some(b) = big {

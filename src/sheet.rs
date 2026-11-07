@@ -25,6 +25,8 @@ pub struct Sheet {
     pub end: f64,
     /// 여러 장을 이어 그릴 때 각 악보의 시작 위치와 이름
     pub starts: Vec<(f64, String)>,
+    /// 지금 고른 악보 (starts 의 번호): 바탕을 조금 진하게
+    pub highlight: Option<usize>,
     /// (유닛, 그 위치의 밀리초, bpm) — midi_io::unit_to_ms 와 같은 계산
     marks: Vec<(f64, f64, f64)>,
 }
@@ -49,7 +51,7 @@ impl Sheet {
         }
         let starts = scores.iter().zip(names).filter(|(_, n)| !n.is_empty()).map(|(s, n)| (s.start, n)).collect();
         let staves = vec![(String::new(), parts.clone())];
-        Ok(Sheet { parts, staves, bar: if bar > 0.0 { bar } else { 384.0 }, end, starts, marks })
+        Ok(Sheet { parts, staves, bar: if bar > 0.0 { bar } else { 384.0 }, end, starts, highlight: None, marks })
     }
 
     /// 합주자마다 큰보표 하나씩: groups = [(이름, 그 사람의 악보들)]. 박과 템포는 모두 같은 줄에 맞춘다.
@@ -280,6 +282,29 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
         if top > clip.bottom() || top + sys_h < clip.top() {
             continue;
         }
+        // 악보(장)마다 바탕을 번갈아 칠해 구분한다. 고른 장은 조금 진하게
+        if sheet.starts.len() >= 2 {
+            let (la, lb) = (line as f64 * lu, (line + 1) as f64 * lu);
+            let y0 = top + 10.0;
+            let y1 = lay.bass_bottom(line, nst - 1) + 8.0;
+            for (k, (s0, _)) in sheet.starts.iter().enumerate() {
+                let s1 = sheet.starts.get(k + 1).map(|x| x.0).unwrap_or(sheet.end);
+                let (a, b) = (s0.max(la), s1.min(lb));
+                if b <= a {
+                    continue;
+                }
+                let fill = if sheet.highlight == Some(k) {
+                    Color32::from_rgba_unmultiplied(pal.wine.r(), pal.wine.g(), pal.wine.b(), 38)
+                } else if k % 2 == 1 {
+                    Color32::from_rgba_unmultiplied(110, 110, 110, 24)
+                } else {
+                    continue;
+                };
+                let xa = lay.x_of(sheet, line, a).max(rect.left() + LEFT - 4.0);
+                let xb = lay.x_of(sheet, line, b);
+                painter.rect_filled(Rect::from_min_max(pos2(xa, y0), pos2(xb, y1)), 2.0, fill);
+            }
+        }
         let x0 = rect.left() + LEFT;
         let first_bar = line * per_line;
         let bars_here = per_line.min(total_bars - first_bar.min(total_bars));
@@ -323,14 +348,25 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
             }
         }
         let bb = lay.bass_bottom(line, nst - 1);
-        // 악보 경계
-        for (t, name) in &sheet.starts {
-            if *t < line as f64 * lu - 0.5 || *t >= (line + 1) as f64 * lu - 0.5 || sheet.starts.len() < 2 {
-                continue;
+        // 악보 경계: 줄 첫머리가 장의 시작이 아니어도 그 줄이 무슨 장인지 왼쪽 위에 적는다
+        if sheet.starts.len() >= 2 {
+            let la = line as f64 * lu;
+            let cur = sheet.starts.iter().rposition(|(t, _)| *t <= la + 0.5);
+            for (k, (t, name)) in sheet.starts.iter().enumerate() {
+                let starts_here = *t >= la - 0.5 && *t < (line + 1) as f64 * lu - 0.5;
+                if !starts_here {
+                    continue;
+                }
+                let x = lay.x_of(sheet, line, *t);
+                let w = if sheet.highlight == Some(k) { 2.5f32 } else { 1.5f32 };
+                painter.line_segment([pos2(x, top + 10.0), pos2(x, bb + 6.0)], Stroke::new(w, pal.wine));
+                painter.text(pos2(x + 3.0, top + 2.0), Align2::LEFT_TOP, name, theme::bold(12.0), pal.wine);
             }
-            let x = lay.x_of(sheet, line, *t);
-            painter.line_segment([pos2(x, top + 10.0), pos2(x, bb + 6.0)], Stroke::new(1.5f32, pal.wine_soft));
-            painter.text(pos2(x + 3.0, top + 4.0), Align2::LEFT_TOP, name, theme::bold(11.0), pal.wine);
+            if let Some(k) = cur {
+                if sheet.starts[k].0 < la - 0.5 {
+                    painter.text(pos2(rect.right() - 4.0, top + 2.0), Align2::RIGHT_TOP, format!("{} 이어서", sheet.starts[k].1), FontId::proportional(10.0), pal.muted);
+                }
+            }
         }
     }
 
