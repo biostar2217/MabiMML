@@ -816,3 +816,18 @@ fn cut_start_and_end() {
     assert_eq!(p.len(), 16, "{:?}", r.warnings);
     assert!(r.warnings[0].contains("잘라 냈습니다"));
 }
+
+#[test]
+fn drop_players_keeps_original_numbers() {
+    let mut notes = vec![];
+    for b in 0..16 {
+        for p in [48, 55, 64, 67, 72] {
+            notes.push(n((b * 96) as f64, (b * 96 + 96) as f64, p, 100.0));
+        }
+    }
+    let song = Song { tracks: vec![Track::new("t", notes)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let r = convert_song(&song, &Options { players: 3, drop_players: vec![2], ..opts() }).unwrap();
+    let who: Vec<(i64, i64)> = r.scores.iter().map(|s| (s.player, s.orig_player)).collect();
+    assert_eq!(who, vec![(1, 1), (2, 3)], "{:?}", r.warnings);
+    assert!(r.warnings.iter().any(|w| w.contains("뺐습니다")));
+}

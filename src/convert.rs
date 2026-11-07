@@ -342,6 +342,8 @@ pub struct Options {
     pub cut_start_sec: f64,
     /// 곡 뒷부분 잘라 내기: 이 시각(초) 뒤는 버린다 (0 = 끝까지)
     pub cut_end_sec: f64,
+    /// 합주에서 뺄 합주자 (빼기 전 원래 번호, 1부터)
+    pub drop_players: Vec<usize>,
 }
 
 impl Default for Options {
@@ -386,6 +388,7 @@ impl Default for Options {
             drum_style: "기본".into(),
             cut_start_sec: 0.0,
             cut_end_sec: 0.0,
+            drop_players: Vec::new(),
         }
     }
 }
@@ -401,11 +404,13 @@ pub struct Score {
     pub only: Option<usize>,
     /// 이 악보를 칠 연주 악기 (악기별 합주). 비어 있으면 설정의 연주 악기
     pub instrument: String,
+    /// 합주자를 빼기 전의 원래 번호 (빼기 설정에 쓴다)
+    pub orig_player: i64,
 }
 
 impl Score {
     pub fn new(parts: Vec<String>, start: f64, end: f64) -> Score {
-        Score { parts, start, end, player: 0, only: None, instrument: String::new() }
+        Score { parts, start, end, player: 0, only: None, instrument: String::new(), orig_player: 0 }
     }
     pub fn clipboard(&self) -> String {
         format!("MML@{};", self.parts.join(","))
@@ -441,6 +446,7 @@ impl ConvResult {
     /// 합주자 번호들 (합주가 아니면 빈 목록)
     pub fn players(&self) -> Vec<i64> {
         let mut v: Vec<i64> = self.scores.iter().map(|s| s.player).filter(|&p| p != 0).collect();
+        v.sort();
         v.dedup();
         v
     }
@@ -2055,6 +2061,26 @@ fn finish_ensemble(
 ) -> Res<ConvResult> {
     let tempos = tempos.to_vec();
     let shift = -instrument_shift(&opts.instrument);
+    // 사용자가 뺀 합주자를 지운다 (남은 합주자의 원래 번호를 기억)
+    let total = parts.len() / 3;
+    let kept: Vec<usize> = (1..=total).filter(|p| !opts.drop_players.contains(p)).collect();
+    let (parts, insts_v): (Vec<Vec<Note>>, Vec<String>) = if kept.len() < total && !kept.is_empty() {
+        let mut ps = Vec::new();
+        let mut is = Vec::new();
+        for &p in &kept {
+            ps.extend(parts[(p - 1) * 3..p * 3].iter().cloned());
+            is.push(insts.get(p - 1).cloned().unwrap_or_default());
+        }
+        warnings.push(format!(
+            "합주자 {}을(를) 뺐습니다 (남은 합주자는 번호를 앞으로 당겼습니다)",
+            opts.drop_players.iter().filter(|&&p| p <= total).map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+        ));
+        (ps, is)
+    } else {
+        (parts, insts.to_vec())
+    };
+    let kept: Vec<usize> = if kept.len() < total && !kept.is_empty() { kept } else { (1..=total).collect() };
+    let insts = &insts_v[..];
     // 한 사람이라도 악기가 따로 있으면(드럼 등) 나머지는 설정의 연주 악기로 적어 둔다 (미리듣기 소리)
     let insts: Vec<String> = if insts.iter().any(|i| !i.is_empty()) {
         insts.iter().map(|i| if i.is_empty() { opts.instrument.clone() } else { i.clone() }).collect()
@@ -2105,6 +2131,7 @@ fn finish_ensemble(
         let v = if v.is_empty() { vec![Score::new(vec![String::new(); 3], 0.0, 0.0)] } else { v };
         for mut sc in v {
             sc.player = p as i64 + 1;
+            sc.orig_player = kept.get(p).copied().unwrap_or(p + 1) as i64;
             sc.instrument = insts.get(p).cloned().unwrap_or_default();
             scores.push(sc);
         }

@@ -195,6 +195,8 @@ pub struct Other {
     /// 앞부분 잘라 내기(초), 뒷부분 잘라 내기(초, 0=끝까지)
     pub cut_start: i64,
     pub cut_end: i64,
+    /// 뺀 합주자 (원래 번호)
+    pub drop_players: Vec<usize>,
     pub vol_step: i64,
     pub quality: String,
     pub re_ocr: bool,
@@ -217,6 +219,7 @@ impl Default for Other {
             fixed_bpm: 0,
             cut_start: 0,
             cut_end: 0,
+            drop_players: Vec::new(),
             vol_step: 1,
             quality: QUALITY_PRESETS[0].0.into(),
             re_ocr: false,
@@ -456,6 +459,7 @@ impl App {
             tempo_scale: o.speed.clamp(10, 400) as f64 / 100.0,
             fixed_tempo: o.fixed_bpm.clamp(0, 255),
             cut_start_sec: o.cut_start.max(0) as f64,
+            drop_players: if s.ensemble { o.drop_players.clone() } else { vec![] },
             cut_end_sec: o.cut_end.max(0) as f64,
             volume_threshold: o.vol_step.clamp(1, 15),
             auto_detail: o.quality == QUALITY_AUTO,
@@ -697,6 +701,7 @@ impl App {
         if self.path != path {
             self.other.cut_start = 0;
             self.other.cut_end = 0;
+            self.other.drop_players.clear();
         }
         if self.path != path && (self.saved.ensemble || self.saved.auto_drums || !self.saved.player_insts.is_empty()) {
             self.saved.ensemble = false;
@@ -879,7 +884,7 @@ impl App {
             let e = parse_part(p).map_err(|e| format!("악보 {}의 MML을 읽지 못했습니다: {}", i + 1, e))?.2;
             end = end.max(e);
         }
-        Ok(Score { parts, start: original.start, end: original.start + end.trunc(), player: original.player, only: None, instrument: original.instrument.clone() })
+        Ok(Score { parts, start: original.start, end: original.start + end.trunc(), player: original.player, only: None, instrument: original.instrument.clone(), orig_player: original.orig_player })
     }
 
     /// 합주 결과인지 (합주자 번호가 붙은 악보)
@@ -1437,6 +1442,24 @@ impl App {
         }
     }
 
+    /// 화면 번호로 합주자를 뺀다 (설정에 원래 번호로 기억해 다시 변환해도 빠진 채로)
+    fn remove_players(&mut self, shown: &[i64]) {
+        let Some(res) = self.result.as_ref() else { return };
+        let mut n = 0;
+        for &pl in shown {
+            if let Some(orig) = res.scores.iter().find(|s| s.player == pl).map(|s| if s.orig_player > 0 { s.orig_player } else { pl }) {
+                if !self.other.drop_players.contains(&(orig as usize)) {
+                    self.other.drop_players.push(orig as usize);
+                    n += 1;
+                }
+            }
+        }
+        if n > 0 {
+            self.tab = 0;
+            self.status = format!("합주자 {}을(를) 뺐습니다. 다시 넣으려면 '뺀 합주자 되살리기'", shown.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "));
+        }
+    }
+
     /// 재생 중에 다른 악보(또는 합주자)를 누르면 바로 그 악보를 재생한다.
     /// '전체'로 이어 듣는 중이면 그 장이 시작하는 곳으로 옮긴다.
     fn tab_switched(&mut self) {
@@ -1664,6 +1687,13 @@ impl App {
                 "speed_percent" => if let Some(i) = i { self.other.speed = i },
                 "fixed_bpm" => if let Some(i) = i { self.other.fixed_bpm = i },
                 "cut_start_sec" => if let Some(i) = i { self.other.cut_start = i.max(0) },
+                "remove_players" => {
+                    if let Some(s) = st.clone() {
+                        let ps: Vec<i64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                        self.remove_players(&ps);
+                    }
+                }
+                "restore_players" => if b == Some(true) { self.other.drop_players.clear() },
                 "cut_end_sec" => if let Some(i) = i { self.other.cut_end = i.max(0) },
                 "transpose" => if let Some(i) = i { self.other.transpose = i },
                 "low_limit" => if let Some(b) = b { self.saved.low_limit = b },
@@ -1791,7 +1821,7 @@ impl App {
     }
 
     /// AI 가 고친 MML 을 결과 글에 넣는다. (고친 곳 수, 못 넣은 이유들)
-    fn apply_mml_edits(&mut self, edits: &[(usize, usize, String)]) -> (usize, Vec<String>) {
+    fn apply_mml_edits(&mut self, edits: &[(usize, usize, String)], edit_players: &[Option<i64>]) -> (usize, Vec<String>) {
         let before = self.score_texts.clone();
         let limits = self.result.as_ref().map(|r| r.limits).unwrap_or([i64::MAX; 3]);
         let mut done = 0;
@@ -1814,7 +1844,7 @@ impl App {
             }
         }
         self.tab = self.tab.min(self.score_texts.len().saturating_sub(1));
-        for (sheet, part, mml) in edits {
+        for (ei, (sheet, part, mml)) in edits.iter().enumerate() {
             if *part == 4 {
                 continue;
             }
@@ -1842,13 +1872,24 @@ impl App {
                 if *sheet < self.score_texts.len() {
                     self.score_texts[*sheet] = text;
                     done += 1;
-                } else if *sheet == self.score_texts.len() {
-                    // 새 장: 마지막 장 다음에 붙인다 (같은 합주자)
+                } else if *sheet >= self.score_texts.len() {
+                    // 새 장: 뒤에 붙인다. player 가 있으면 그 합주자(없는 번호면 새 합주자)의 다음 장으로
+                    let want = edit_players.get(ei).copied().flatten();
                     if let Some(res) = self.result.as_mut() {
                         if let Some(last) = res.scores.last().cloned() {
-                            let mut sc = Score::new(parts.clone(), last.end, last.end);
-                            sc.player = last.player;
-                            sc.instrument = last.instrument.clone();
+                            let (player, start, inst) = match want {
+                                Some(p) if p >= 1 => {
+                                    let mine: Vec<&Score> = res.scores.iter().filter(|s| s.player == p).collect();
+                                    match mine.last() {
+                                        Some(m) => (p, m.end, m.instrument.clone()),
+                                        None => (p, 0.0, String::new()), // 새 합주자: 곡 처음부터
+                                    }
+                                }
+                                _ => (last.player, last.end, last.instrument.clone()),
+                            };
+                            let mut sc = Score::new(parts.clone(), start, start);
+                            sc.player = player;
+                            sc.instrument = inst;
                             res.scores.push(sc);
                             self.score_texts.push(text);
                             done += 1;
@@ -1942,7 +1983,7 @@ impl App {
                         note += "  (설정을 바꿨고, 새 MML이 만들어지면 이어서 MML도 고칩니다…)";
                     }
                 } else if !edits.is_empty() {
-                    let (done, problems) = self.apply_mml_edits(&edits);
+                    let (done, problems) = self.apply_mml_edits(&edits, &ai::mml_edit_players(&data));
                     if done > 0 {
                         note += &format!("  (MML {}곳을 고쳤습니다. 마음에 안 들면 '되돌리기')", done);
                     }
@@ -2439,6 +2480,14 @@ impl App {
                             let mine: Vec<usize> = (0..count).filter(|&j| res.scores[j].player == pl).collect();
                             self.tab = mine.get(k - 1).or(mine.first()).copied().unwrap_or(0);
                         }
+                    }
+                    ui.add_space(6.0);
+                    if players.len() > 1 && ui.small_button(format!("✕ 합주자 {} 빼기", who)).on_hover_text("이 합주자를 합주에서 뺍니다 (뒤 합주자 번호는 앞으로 당겨짐)").clicked() {
+                        self.remove_players(&[who]);
+                    }
+                    if !self.other.drop_players.is_empty() && ui.small_button("뺀 합주자 되살리기").clicked() {
+                        self.other.drop_players.clear();
+                        self.status = "뺀 합주자를 되살렸습니다".into();
                     }
                 });
                 let mine: Vec<usize> = (0..count).filter(|&j| res.scores[j].player == who).collect();

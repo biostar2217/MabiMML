@@ -324,6 +324,8 @@ fn live_drum_edit() {
     match ai::ask_relay(&body, mabimml::VERSION, ai::RELAY_URL) {
         Ok(d) => {
             println!("읽음: reply={:?} edits={}", d.get("reply"), d.get("mml_edits").and_then(|e| e.as_array()).map(|a| a.len()).unwrap_or(0));
+            println!("changes: {:?}", d.get("changes"));
+            println!("players: {:?}", ai::mml_edit_players(&ai::changes_to_dict(&d, &c)));
             for (sheet, part, mml) in ai::mml_edits(&ai::changes_to_dict(&d, &c)) {
                 let ok = if part == 3 { mabimml::mml_parser::split_clipboard(&mml).iter().all(|p| mabimml::mml_parser::parse_part(p).is_ok()) } else { mabimml::mml_parser::parse_part(&mml).is_ok() };
                 println!("고침: 악보 {} 파트 {} 글자 {} 문법 {}", sheet + 1, part, mml.chars().count(), ok);
