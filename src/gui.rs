@@ -41,6 +41,8 @@ pub const SETTINGS_VERSION: i64 = 2;
 pub const GAP_LABELS: [(&str, &str); 3] = [("MIDI만", "auto"), ("항상", "on"), ("끄기", "off")];
 /// 합주 인원 고르기: 자동 = 음을 빼지 않고 한 사람 한 장에 들어가는 가장 적은 인원
 pub const PLAYER_CHOICES: [&str; 8] = ["자동", "2", "3", "4", "5", "6", "7", "8"];
+/// 합주를 나누는 방식
+pub const ENSEMBLE_BY: [&str; 2] = ["음 높이로 나누기", "원곡 악기별로"];
 /// 듣기 범위
 const LISTEN_PLAYER: usize = 0;
 pub const SUSTAIN_LABELS: [(&str, &str); 3] = [("모든 음 늘리기", "all"), ("베이스만 늘리기", "bass"), ("끄기", "off")];
@@ -80,6 +82,7 @@ pub struct Saved {
     /// 합주 켜기와 인원 (PLAYER_CHOICES 중 하나)
     pub ensemble: bool,
     pub players: String,
+    pub ensemble_by: String,
 }
 
 impl Default for Saved {
@@ -100,6 +103,7 @@ impl Default for Saved {
             split_players: false,
             ensemble: false,
             players: PLAYER_CHOICES[0].into(),
+            ensemble_by: ENSEMBLE_BY[0].into(),
         }
     }
 }
@@ -112,7 +116,7 @@ impl Saved {
             "gap_mode": self.gap_mode, "align": self.align, "part_vol0": self.part_vol[0], "part_vol1": self.part_vol[1],
             "part_vol2": self.part_vol[2], "ensemble_fix": self.ensemble_fix, "v0_tempo": self.v0_tempo,
             "sustain": self.sustain, "split_players": self.split_players,
-            "ensemble": self.ensemble, "players": self.players
+            "ensemble": self.ensemble, "players": self.players, "ensemble_by": self.ensemble_by
         })
     }
 
@@ -136,6 +140,7 @@ impl Saved {
         if let Some(v) = gb("split_players") { s.split_players = v; }
         if let Some(v) = gb("ensemble") { s.ensemble = v; }
         if let Some(v) = gs("players", &|v| PLAYER_CHOICES.contains(&v)) { s.players = v; }
+        if let Some(v) = gs("ensemble_by", &|v| ENSEMBLE_BY.contains(&v)) { s.ensemble_by = v; }
         if !old {
             if let Some(v) = gb("ensemble_fix") { s.ensemble_fix = v; }
             if let Some(v) = gb("v0_tempo") { s.v0_tempo = v; }
@@ -405,6 +410,7 @@ impl App {
             sustain: lookup(&SUSTAIN_LABELS, &s.sustain).into(),
             split_players: s.split_players,
             players: if s.ensemble { s.players.parse().unwrap_or(0) } else { 1 },
+            by_instrument: s.ensemble && s.ensemble_by == ENSEMBLE_BY[1],
             keep_original: s.keep_original,
             jabchiel: s.jabchiel,
             roles: Some(roles),
@@ -785,7 +791,7 @@ impl App {
             let e = parse_part(p).map_err(|e| format!("악보 {}의 MML을 읽지 못했습니다: {}", i + 1, e))?.2;
             end = end.max(e);
         }
-        Ok(Score { parts, start: original.start, end: original.start + end.trunc(), player: original.player, only: None })
+        Ok(Score { parts, start: original.start, end: original.start + end.trunc(), player: original.player, only: None, instrument: original.instrument.clone() })
     }
 
     /// 합주 결과인지 (합주자 번호가 붙은 악보)
@@ -865,7 +871,25 @@ impl App {
     }
 
     fn preview_prog(&self) -> i64 {
-        if self.saved.preview_sound == PREVIEW_SOUNDS[0] { preview_program(&self.saved.instrument) } else { 0 }
+        let per_player = self.result.as_ref().map(|r| r.scores.iter().any(|s| !s.instrument.is_empty())).unwrap_or(false);
+        if self.saved.preview_sound != PREVIEW_SOUNDS[0] {
+            0
+        } else if per_player {
+            -1 // 합주자마다 그 연주 악기 소리로
+        } else {
+            preview_program(&self.saved.instrument)
+        }
+    }
+
+    /// 합주자 이름 (악기별 합주면 악기도)
+    fn player_name(&self, pl: i64) -> String {
+        let inst = self
+            .result
+            .as_ref()
+            .and_then(|r| r.scores.iter().find(|s| s.player == pl))
+            .map(|s| s.instrument.clone())
+            .unwrap_or_default();
+        if inst.is_empty() { format!("합주자 {}", pl) } else { format!("합주자 {} · {}", pl, inst) }
     }
 
     fn toggle_play(&mut self) {
@@ -1159,7 +1183,7 @@ impl App {
             ui.label(RichText::new("듣기").font(theme::bold(13.0)));
             for &pl in &players {
                 let mut on = !self.muted.contains(&pl);
-                if ui.checkbox(&mut on, format!("합주자 {}", pl)).changed() {
+                if ui.checkbox(&mut on, self.player_name(pl)).changed() {
                     if on {
                         self.muted.remove(&pl);
                     } else {
@@ -1316,6 +1340,7 @@ impl App {
         c.insert("volume".into(), VOLUME_LABELS.iter().map(|x| x.0.to_string()).collect());
         c.insert("fit".into(), FIT_LABELS.iter().map(|x| x.0.to_string()).collect());
         c.insert("players".into(), PLAYER_CHOICES.iter().map(|x| x.to_string()).collect());
+        c.insert("ensemble_by".into(), ENSEMBLE_BY.iter().map(|x| x.to_string()).collect());
         c
     }
 
@@ -1328,7 +1353,7 @@ impl App {
             "keep_original": s.keep_original, "ensemble_fix": s.ensemble_fix, "instrument": s.instrument,
             "quality": o.quality, "rank": o.rank, "sustain": s.sustain, "gap_mode": s.gap_mode, "triplet": o.triplet,
             "volume": o.volume, "fit": o.fit, "part_volume": s.part_vol,
-            "ensemble": s.ensemble, "players": s.players
+            "ensemble": s.ensemble, "players": s.players, "ensemble_by": s.ensemble_by
         });
         v.as_object().cloned().unwrap()
     }
@@ -1356,6 +1381,7 @@ impl App {
                 "fit" => if let Some(s) = st { self.other.fit = s },
                 "ensemble" => if let Some(b) = b { self.saved.ensemble = b },
                 "players" => if let Some(s) = st.filter(|s| PLAYER_CHOICES.contains(&s.as_str())) { self.saved.players = s },
+                "ensemble_by" => if let Some(s) = st.filter(|s| ENSEMBLE_BY.contains(&s.as_str())) { self.saved.ensemble_by = s },
                 "part_volume" => {
                     if let Some(a) = v.as_array() {
                         for (j, x) in a.iter().take(3).enumerate() {
@@ -1728,9 +1754,19 @@ impl App {
                 ui.checkbox(&mut self.saved.ensemble, "합주")
                     .on_hover_text("곡을 여러 사람이 함께 치도록 나눕니다. 합주자마다 멜로디·화음1·화음2 악보가 따로 생깁니다");
                 ui.add_enabled_ui(self.saved.ensemble, |ui| {
-                    ui.label("합주자 수");
-                    Self::combo(ui, "players", &mut self.saved.players, &PLAYER_CHOICES, 60.0);
-                    ui.label(RichText::new("자동: 음을 빼지 않고 한 사람이 악보 한 장에 들어가는 가장 적은 인원 (2~8명)").color(p.muted).size(12.0));
+                    ui.label("나누기");
+                    Self::combo(ui, "ensemble_by", &mut self.saved.ensemble_by, &ENSEMBLE_BY, 120.0);
+                    let by_inst = self.saved.ensemble_by == ENSEMBLE_BY[1];
+                    ui.add_enabled_ui(!by_inst, |ui| {
+                        ui.label("합주자 수");
+                        Self::combo(ui, "players", &mut self.saved.players, &PLAYER_CHOICES, 60.0);
+                    });
+                    let hint = if by_inst {
+                        "원곡 트랙의 악기마다 합주자를 따로 두고 어울리는 마비노기 악기를 정합니다 (인원은 자동)"
+                    } else {
+                        "자동: 음을 빼지 않고 한 사람이 악보 한 장에 들어가는 가장 적은 인원 (2~8명)"
+                    };
+                    ui.label(RichText::new(hint).color(p.muted).size(12.0));
                 });
             });
             ui.checkbox(&mut self.saved.keep_original, "붙여넣은 3파트 MML은 원본 그대로 나누기 (편곡 없음. 랭크, 한도, 글자 수 초과 시, 조옮김만 적용)");
@@ -1844,7 +1880,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("합주자").font(theme::bold(13.0)));
                     for &pl in &players {
-                        if tab_button(ui, format!("합주자 {}", pl), pl == who) {
+                        if tab_button(ui, self.player_name(pl), pl == who) {
                             let mine: Vec<usize> = (0..count).filter(|&j| res.scores[j].player == pl).collect();
                             self.tab = mine.get(k - 1).or(mine.first()).copied().unwrap_or(0);
                         }

@@ -635,3 +635,51 @@ fn ensemble_players() {
     }
     assert!(m.scores.iter().all(|sc| sc.lengths().iter().zip(m.limits.iter()).all(|(l, x)| l <= x)));
 }
+
+#[test]
+fn ensemble_by_instrument_and_narrow_instruments() {
+    let mut tracks = vec![];
+    let mk = |name: &str, prog: i64, base: i64| {
+        let notes: Vec<Note> = (0..32).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, base + (i % 5) as i64, 100.0)).collect();
+        let mut t = Track::new(name, notes);
+        t.program = prog;
+        t.channel = 0;
+        t
+    };
+    tracks.push(mk("Track 1", 40, 79)); // 바이올린 (프로그램 번호로)
+    tracks.push(mk("Piano", 0, 60));
+    tracks.push(mk("Electric Bass", 33, 36));
+    let song = Song { tracks, tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], source: "midi".into(), ..Default::default() };
+    let r = convert_song(&song, &Options { players: 0, by_instrument: true, ..opts() }).unwrap();
+    let insts: Vec<(i64, String)> = r.scores.iter().map(|s| (s.player, s.instrument.clone())).collect();
+    assert_eq!(insts.len(), 3, "{:?} {:?}", insts, r.warnings);
+    let names: Vec<&str> = insts.iter().map(|x| x.1.as_str()).collect();
+    assert!(names.contains(&"바이올린") && names.contains(&"피아노") && names.contains(&"베이스"), "{:?}", names);
+    assert!(r.warnings[0].contains("악기별"));
+    // 피아노는 한 옥타브 낮춰 적고, 베이스는 o1c~o4b 안에 적는다
+    for sc in &r.scores {
+        let (notes, _) = scores_to_notes(&[sc.clone()]).unwrap();
+        let ps: Vec<i64> = notes.iter().flatten().filter(|x| x.vel > 0.0).map(|x| x.pitch).collect();
+        match sc.instrument.as_str() {
+            "피아노" => assert_eq!(*ps.iter().min().unwrap(), 48),
+            "베이스" => assert!(ps.iter().all(|&p| (24..=71).contains(&p))),
+            _ => {}
+        }
+    }
+    assert!(r.text().contains("[합주자 1 · "));
+    // 미리듣기: 합주자마다 그 악기 소리 (바이올린 40, 피아노 0, 베이스 33)
+    let (bytes, _) = mabimml::convert::preview_midi(&r.scores, 0, -1, true).unwrap();
+    let progs: Vec<u8> = bytes.windows(2).filter(|w| w[0] & 0xF0 == 0xC0 && w[0] & 0x0F < 8).map(|w| w[1]).collect();
+    for p in [40u8, 0, 33] {
+        assert!(progs.contains(&p), "{:?}", progs);
+    }
+    // 가야금 혼자: 높은 멜로디도 o1~o4 안으로
+    let high: Vec<Note> = (0..16).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 84 + (i % 7) as i64, 100.0)).collect();
+    let g = convert_song(
+        &Song { tracks: vec![Track::new("m", high)], tempos: vec![(0.0, 120.0)], ..Default::default() },
+        &Options { instrument: "가야금".into(), ..opts() },
+    )
+    .unwrap();
+    assert!(g.parts_notes[0].iter().all(|x| (24..=71).contains(&x.pitch)));
+    assert!(g.warnings.iter().any(|w| w.contains("가야금")));
+}
