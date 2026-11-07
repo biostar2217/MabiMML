@@ -346,8 +346,8 @@ pub fn main(argv: &[String]) -> i32 {
         include_drums: a.drums,
         ..Default::default()
     };
-    if crate::ranks::limits_for(&opts.rank, opts.no_song, None).is_err() {
-        eprintln!("알 수 없는 랭크: {} (사용 가능: {}, 무제한)", opts.rank, rank_order().join(", "));
+    if opts.rank == "무제한" || crate::ranks::limits_for(&opts.rank, opts.no_song, None).is_err() {
+        eprintln!("알 수 없는 랭크: {} (사용 가능: {})", opts.rank, rank_order().join(", "));
         return 2;
     }
     let res = match convert_song(&song, &opts) {

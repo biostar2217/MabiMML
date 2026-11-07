@@ -1308,8 +1308,7 @@ impl App {
         let mut q: Vec<String> = QUALITY_PRESETS.iter().map(|q| q.0.to_string()).collect();
         q.push(QUALITY_AUTO.into());
         c.insert("quality".into(), q);
-        let mut r: Vec<String> = rank_order().iter().map(|s| s.to_string()).collect();
-        r.push("무제한".into());
+        let r: Vec<String> = rank_order().iter().map(|s| s.to_string()).collect();
         c.insert("rank".into(), r);
         c.insert("sustain".into(), SUSTAIN_LABELS.iter().map(|x| x.0.to_string()).collect());
         c.insert("gap_mode".into(), GAP_LABELS.iter().map(|x| x.0.to_string()).collect());
@@ -1619,8 +1618,7 @@ impl App {
         let p = self.pal;
         group(ui, &p, "설정", |ui| {
             egui::Grid::new("settings").num_columns(6).spacing([10.0, 5.0]).show(ui, |ui| {
-                let mut ranks: Vec<&str> = rank_order();
-                ranks.push("무제한");
+                let ranks: Vec<&str> = rank_order();
                 ui.label("작곡 랭크");
                 Self::combo(ui, "rank", &mut self.other.rank, &ranks, 70.0);
                 ui.label("양자화 격자");
