@@ -52,10 +52,12 @@ fn byte(d: &[u8], at: usize) -> Result<u8, String> {
 }
 
 pub fn decode_name(md: &[u8]) -> String {
-    match std::str::from_utf8(md) {
+    let s = match std::str::from_utf8(md) {
         Ok(s) => s.to_string(),
         Err(_) => encoding_rs::EUC_KR.decode(md).0.into_owned(),
-    }
+    };
+    // 이름 끝의 NUL 같은 제어 문자는 뺀다 (텍스트 저장 파일이 깨지지 않게)
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 pub fn read_midi_bytes(data0: &[u8], pedal: bool, expression: bool) -> Result<Song, String> {

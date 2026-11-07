@@ -301,6 +301,8 @@ pub struct App {
     /// 여러 합주자를 함께 볼 때 합주자마다 큰보표를 따로 그린다
     sheet_split: bool,
     sheet_line: Option<usize>,
+    /// 악보 보기에서 보고 있는 쪽
+    sheet_page: usize,
     /// 멈춰 있을 때 다음 재생을 시작할 위치 (밀리초)
     seek_ms: f64,
     /// 재생 위치 바를 끄는 중인 위치
@@ -378,6 +380,7 @@ impl App {
             sheet_follow: true,
             sheet_split: true,
             sheet_line: None,
+            sheet_page: 0,
             seek_ms: 0.0,
             seek_drag: None,
             was_playing: false,
@@ -1184,8 +1187,28 @@ impl App {
                     let head = show_head.then(|| sh.ms_to_unit(cur));
                     let follow = self.sheet_follow && show_head;
                     let line = &mut self.sheet_line;
+                    let page = &mut self.sheet_page;
+                    // 긴 곡은 쪽으로 나눠 그린다
+                    let w = ui.available_width() - 16.0;
+                    if follow {
+                        sheet::follow_page(sh, w, head, *line, page);
+                    }
+                    let (npages, bars_per_page) = sheet::pages(sh, w);
+                    if npages > 1 {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(*page > 0, egui::Button::new("◀ 앞쪽")).clicked() {
+                                *page -= 1;
+                            }
+                            let a = *page * bars_per_page + 1;
+                            let b = ((*page + 1) * bars_per_page).min(sh.bars());
+                            ui.label(RichText::new(format!("마디 {}~{} / 전체 {}마디 ({}/{}쪽)", a, b, sh.bars(), *page + 1, npages)).size(12.0).color(p.muted));
+                            if ui.add_enabled(*page + 1 < npages, egui::Button::new("뒤쪽 ▶")).clicked() {
+                                *page += 1;
+                            }
+                        });
+                    }
                     egui::ScrollArea::vertical().id_salt("sheet_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                        clicked = sheet::show(ui, sh, &p, head, if follow { Some(line) } else { None }).map(|t| sh.unit_to_ms(t));
+                        clicked = sheet::show(ui, sh, &p, head, if follow { Some(line) } else { None }, page).map(|t| sh.unit_to_ms(t));
                     });
                 });
                 if let Some(ms) = clicked {
@@ -1941,7 +1964,7 @@ impl App {
                 let cur = self.tab.min(count.saturating_sub(1));
                 let who = res.scores[cur].player;
                 let (k, _) = res.sheet_number(cur);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("합주자").font(theme::bold(13.0)));
                     for &pl in &players {
                         if tab_button(ui, self.player_name(pl), pl == who) {
@@ -1952,7 +1975,7 @@ impl App {
                 });
                 let mine: Vec<usize> = (0..count).filter(|&j| res.scores[j].player == who).collect();
                 if mine.len() > 1 {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(format!("합주자 {}의 악보", who));
                         for (n, &j) in mine.iter().enumerate() {
                             if tab_button(ui, format!("악보 {}", n + 1), j == cur) {
@@ -1962,7 +1985,8 @@ impl App {
                     });
                 }
             } else {
-                ui.horizontal(|ui| {
+                // 장이 많으면 여러 줄로 (긴 곡에서 뒤쪽 장 단추가 잘려 안 보이던 문제)
+                ui.horizontal_wrapped(|ui| {
                     for i in 0..count {
                         if tab_button(ui, format!("악보 {}", i + 1), self.tab == i) {
                             self.tab = i;
@@ -2363,7 +2387,16 @@ impl App {
                 wait_ms = 400;
             }
             2 => {
-                if busy { again = true; wait_ms = 300; } else { wait_ms = 900; }
+                if busy {
+                    again = true;
+                    wait_ms = 300;
+                } else {
+                    // 시험용: 여러 장을 이어서 보기
+                    if std::env::var_os("MABIMML_SHOT_ALL").is_some() {
+                        self.other.play_all = true;
+                    }
+                    wait_ms = 900;
+                }
             }
             3 => {
                 // 재생 위치 표시가 보이도록 곡의 1/5 쯤으로 옮겨 둔다

@@ -159,11 +159,46 @@ struct Layout {
     bar_w: f32,
     lines: usize,
     sys_h: f32,
+    /// 이 쪽의 첫 줄 (긴 곡은 쪽으로 나눠 그린다)
+    first: usize,
+}
+
+/// 한 쪽에 그릴 줄 수: 화면에 아주 긴 그림을 만들지 않도록 (긴 MIDI에서 악보가 잘리던 문제)
+fn lines_per_page(sys_h: f32) -> usize {
+    ((6000.0 / sys_h).floor() as usize).clamp(4, 40)
+}
+
+fn sys_height(nst: usize) -> f32 {
+    TOP + nst as f32 * STAFF_H + (nst.max(1) - 1) as f32 * STAFF_GAP + BOTTOM + if nst > 1 { 12.0 } else { 0.0 }
+}
+
+fn per_line_for(width: f32) -> usize {
+    (((width.max(200.0) - LEFT - RIGHT) / 190.0).floor() as usize).max(1)
+}
+
+/// 재생 위치가 다른 줄로 넘어갔으면 그 줄이 있는 쪽으로 넘긴다 (쪽 버튼으로 넘긴 쪽은 그대로 둔다)
+pub fn follow_page(sheet: &Sheet, width: f32, playhead: Option<f64>, last_line: Option<usize>, page: &mut usize) {
+    let Some(t) = playhead else { return };
+    let per_line = per_line_for(width);
+    let lines = sheet.bars().div_ceil(per_line).max(1);
+    let lpp = lines_per_page(sys_height(sheet.staves.len().max(1)));
+    let line = ((t / (sheet.bar * per_line as f64)).floor().max(0.0) as usize).min(lines - 1);
+    if last_line != Some(line) {
+        *page = line / lpp;
+    }
+}
+
+/// (쪽 수, 한 쪽의 마디 수)
+pub fn pages(sheet: &Sheet, width: f32) -> (usize, usize) {
+    let per_line = per_line_for(width);
+    let lines = sheet.bars().div_ceil(per_line).max(1);
+    let lpp = lines_per_page(sys_height(sheet.staves.len().max(1)));
+    (lines.div_ceil(lpp), lpp * per_line)
 }
 
 impl Layout {
     fn sys_top(&self, line: usize) -> f32 {
-        self.rect.top() + line as f32 * self.sys_h
+        self.rect.top() + (line as f32 - self.first as f32) * self.sys_h
     }
     fn treble_bottom(&self, line: usize, st: usize) -> f32 {
         self.sys_top(line) + TOP + st as f32 * (STAFF_H + STAFF_GAP) + 4.0 * SP
@@ -199,15 +234,28 @@ impl Layout {
 
 /// 악보를 그린다. 누른 곳의 위치(유닛)를 돌려준다.
 /// follow_line: 재생 위치가 있는 줄이 바뀌면 그 줄로 스크롤한다 (마지막으로 따라간 줄 번호).
-pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, follow_line: Option<&mut Option<usize>>) -> Option<f64> {
+/// page: 보고 있는 쪽 (재생 위치를 따라가면 바뀐다)
+pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, follow_line: Option<&mut Option<usize>>, page: &mut usize) -> Option<f64> {
     let width = ui.available_width().max(200.0);
-    let per_line = (((width - LEFT - RIGHT) / 190.0).floor() as usize).max(1);
+    let per_line = per_line_for(width);
     let bar_w = (width - LEFT - RIGHT) / per_line as f32;
     let lines = sheet.bars().div_ceil(per_line).max(1);
     let nst = sheet.staves.len().max(1);
-    let sys_h = TOP + nst as f32 * STAFF_H + (nst - 1) as f32 * STAFF_GAP + BOTTOM + if nst > 1 { 12.0 } else { 0.0 };
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, lines as f32 * sys_h), Sense::click());
-    let lay = Layout { rect, per_line, bar_w, lines, sys_h };
+    let sys_h = sys_height(nst);
+    let lpp = lines_per_page(sys_h);
+    // 재생 위치가 다른 줄로 넘어갔을 때만 그 줄이 있는 쪽으로 (쪽 버튼으로 넘긴 쪽은 그대로 둔다)
+    if let (Some(t), Some(last)) = (playhead, follow_line.as_ref()) {
+        let line = ((t / (sheet.bar * per_line as f64)).floor().max(0.0) as usize).min(lines - 1);
+        if **last != Some(line) && *page != line / lpp {
+            *page = line / lpp;
+            ui.ctx().request_repaint(); // 위쪽 '마디 a~b' 글자도 바로 바뀌게
+        }
+    }
+    *page = (*page).min((lines - 1) / lpp);
+    let first = *page * lpp;
+    let count = lpp.min(lines - first);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, count as f32 * sys_h), Sense::click());
+    let lay = Layout { rect, per_line, bar_w, lines, sys_h, first };
     let painter = ui.painter_at(rect);
     let clip = ui.clip_rect();
 
@@ -227,7 +275,7 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
     let total_bars = sheet.bars();
     let lu = lay.line_units(sheet);
 
-    for line in 0..lines {
+    for line in first..first + count {
         let top = lay.sys_top(line);
         if top > clip.bottom() || top + sys_h < clip.top() {
             continue;
@@ -424,7 +472,7 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
     // 누른 곳으로 옮기기
     if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
-            let line = (((p.y - rect.top()) / sys_h).floor().max(0.0) as usize).min(lines - 1);
+            let line = (first + ((p.y - rect.top()) / sys_h).floor().max(0.0) as usize).min(lines - 1);
             let rel = ((p.x - rect.left() - LEFT) / bar_w).max(0.0) as f64;
             let t = line as f64 * lu + rel * sheet.bar;
             return Some(t.clamp(0.0, sheet.end));
