@@ -237,22 +237,24 @@ impl Layout {
 /// 악보를 그린다. 누른 곳의 위치(유닛)를 돌려준다.
 /// follow_line: 재생 위치가 있는 줄이 바뀌면 그 줄로 스크롤한다 (마지막으로 따라간 줄 번호).
 /// page: 보고 있는 쪽 (재생 위치를 따라가면 바뀐다)
-pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, follow_line: Option<&mut Option<usize>>, page: &mut usize) -> Option<f64> {
-    let width = ui.available_width().max(200.0);
+/// width: 악보를 그릴 폭. 쪽 계산(pages, follow_page)과 같은 값을 넘겨야 쪽이 어긋나지 않는다.
+/// 쪽을 재생 위치에 맞추는 일은 follow_page 가 먼저 한다.
+pub fn show(
+    ui: &mut Ui,
+    sheet: &Sheet,
+    pal: &Palette,
+    playhead: Option<f64>,
+    follow_line: Option<&mut Option<usize>>,
+    page: &mut usize,
+    width: f32,
+) -> Option<f64> {
+    let width = width.max(200.0);
     let per_line = per_line_for(width);
     let bar_w = (width - LEFT - RIGHT) / per_line as f32;
     let lines = sheet.bars().div_ceil(per_line).max(1);
     let nst = sheet.staves.len().max(1);
     let sys_h = sys_height(nst);
     let lpp = lines_per_page(sys_h);
-    // 재생 위치가 다른 줄로 넘어갔을 때만 그 줄이 있는 쪽으로 (쪽 버튼으로 넘긴 쪽은 그대로 둔다)
-    if let (Some(t), Some(last)) = (playhead, follow_line.as_ref()) {
-        let line = ((t / (sheet.bar * per_line as f64)).floor().max(0.0) as usize).min(lines - 1);
-        if **last != Some(line) && *page != line / lpp {
-            *page = line / lpp;
-            ui.ctx().request_repaint(); // 위쪽 '마디 a~b' 글자도 바로 바뀌게
-        }
-    }
     *page = (*page).min((lines - 1) / lpp);
     let first = *page * lpp;
     let count = lpp.min(lines - first);
@@ -263,10 +265,13 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
 
     if let (Some(t), Some(last)) = (playhead, follow_line) {
         let line = lay.line_of(sheet, t);
-        if *last != Some(line) {
+        if *last != Some(line) && line >= first && line < first + count {
             *last = Some(line);
             let r = Rect::from_min_size(pos2(rect.left(), lay.sys_top(line)), vec2(width, sys_h));
-            ui.scroll_to_rect(r, Some(egui::Align::Center));
+            // 보표가 화면보다 크면(합주자가 많을 때) 가운데가 아니라 위쪽을 맞춘다
+            let view_h = ui.clip_rect().height();
+            let align = if sys_h > view_h * 0.6 { egui::Align::Min } else { egui::Align::Center };
+            ui.scroll_to_rect(r, Some(align));
         }
     }
 
@@ -360,7 +365,9 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
                 let x = lay.x_of(sheet, line, *t);
                 let w = if sheet.highlight == Some(k) { 2.5f32 } else { 1.5f32 };
                 painter.line_segment([pos2(x, top + 10.0), pos2(x, bb + 6.0)], Stroke::new(w, pal.wine));
-                painter.text(pos2(x + 3.0, top + 2.0), Align2::LEFT_TOP, name, theme::bold(12.0), pal.wine);
+                // 줄 첫머리면 합주자 이름과 겹치지 않게 조금 오른쪽에
+                let lx = if nst > 1 && x < rect.left() + LEFT + 80.0 { rect.left() + LEFT + 80.0 } else { x + 3.0 };
+                painter.text(pos2(lx, top + 2.0), Align2::LEFT_TOP, name, theme::bold(12.0), pal.wine);
             }
             if let Some(k) = cur {
                 if sheet.starts[k].0 < la - 0.5 {

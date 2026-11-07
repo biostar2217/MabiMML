@@ -317,6 +317,10 @@ pub struct App {
     sheet_label: String,
     sheet_open: bool,
     sheet_follow: bool,
+    /// 악보 보기를 프로그램 오른쪽에 따로 띄운 창으로
+    sheet_window: bool,
+    /// 따로 띄운 창의 처음 위치 (띄울 때 한 번 정한다)
+    sheet_win_pos: Option<egui::Pos2>,
     /// 여러 합주자를 함께 볼 때 합주자마다 큰보표를 따로 그린다
     sheet_split: bool,
     sheet_line: Option<usize>,
@@ -398,6 +402,8 @@ impl App {
             sheet_label: String::new(),
             sheet_open: true,
             sheet_follow: true,
+            sheet_window: false,
+            sheet_win_pos: None,
             sheet_split: true,
             sheet_line: None,
             sheet_page: 0,
@@ -408,6 +414,10 @@ impl App {
             pos_base: (-1.0, Instant::now()),
         };
         app.last_fingerprint = app.fingerprint();
+        // 시험용: 악보 보기를 따로 띄운 창으로 시작
+        if std::env::var_os("MABIMML_SHOT_SHEETWIN").is_some() {
+            app.sheet_window = true;
+        }
         app
     }
 
@@ -997,6 +1007,7 @@ impl App {
         if view != self.sheet_view {
             self.sheet_view = view;
             self.sheet_line = None;
+            self.sheet_page = 0; // 다른 악보를 보면 첫 쪽부터
             if !self.player.is_playing() {
                 self.seek_ms = 0.0;
             }
@@ -1088,7 +1099,12 @@ impl App {
                     self.pos_base = (ms, Instant::now());
                 }
                 let total = self.player.length_ms().map(|l| l as f64).unwrap_or(f64::MAX);
-                self.last_pos = (self.pos_base.0 + self.pos_base.1.elapsed().as_secs_f64() * 1000.0).min(total);
+                let est = (self.pos_base.0 + self.pos_base.1.elapsed().as_secs_f64() * 1000.0).min(total);
+                // 재생기는 음이 날 때만 위치를 알려 주고, 그 값을 알아챈 때가 조금 늦어 새 값이 살짝 뒤로 갈 수 있다.
+                // 재생선이 뒤로 튀며 줄·쪽이 왔다 갔다 하지 않도록 조금 뒤로 가는 값은 무시한다 (자리 옮기기는 commit_seek 가 직접 바꾼다)
+                if est >= self.last_pos || self.last_pos - est > 1500.0 {
+                    self.last_pos = est;
+                }
             }
         } else if self.was_playing {
             let total = self.sheet.as_ref().map(|s| s.total_ms()).unwrap_or(0.0);
@@ -1183,20 +1199,86 @@ impl App {
             sh.highlight = if sh.starts.len() >= 2 { pick } else { None };
         }
         let p = self.pal;
+        if self.sheet_window {
+            self.sheet_viewport(ctx);
+            return;
+        }
         egui::SidePanel::right("sheet")
             .resizable(true)
             .default_width(540.0)
             .min_width(280.0)
             .max_width(1000.0)
             .frame(egui::Frame::none().fill(p.bg).inner_margin(egui::Margin { left: 6.0, right: 8.0, top: 6.0, bottom: 6.0 }))
-            .show(ctx, |ui| {
+            .show(ctx, |ui| self.sheet_body(ui));
+    }
+
+    /// 악보 보기를 프로그램 오른쪽에 따로 띄운 창으로 보여 준다 (크기를 마음대로 키울 수 있다)
+    fn sheet_viewport(&mut self, ctx: &egui::Context) {
+        let p = self.pal;
+        const SHEET_W: f32 = 760.0;
+        if self.sheet_win_pos.is_none() {
+            // 프로그램 바로 오른쪽에 띄운다. 화면 밖으로 나가면 프로그램을 왼쪽으로 옮기고 폭을 줄여 나란히 놓는다
+            let (outer, inner, monitor) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect, i.viewport().monitor_size));
+            let pos = match (outer, monitor) {
+                (Some(r), Some(m)) if r.right() + 4.0 + SHEET_W > m.x => {
+                    let main_w = (m.x - SHEET_W - 12.0).max(1080.0);
+                    let inner_h = inner.map(|i| i.height()).unwrap_or(r.height());
+                    let top = r.top().max(0.0);
+                    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::OuterPosition(egui::pos2(0.0, top)));
+                    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::InnerSize(egui::vec2(main_w, inner_h)));
+                    let outer_w = main_w + (r.width() - inner.map(|i| i.width()).unwrap_or(r.width()));
+                    egui::pos2((outer_w + 4.0).min((m.x - SHEET_W).max(0.0)), top)
+                }
+                (Some(r), _) => egui::pos2(r.right() + 4.0, r.top()),
+                _ => egui::pos2(100.0, 100.0),
+            };
+            self.sheet_win_pos = Some(pos);
+        }
+        let mut b = egui::ViewportBuilder::default()
+            .with_title(format!("악보 보기 - 마비노기 MML 변환기 v{}", VERSION))
+            .with_inner_size([SHEET_W, 900.0])
+            .with_min_inner_size([360.0, 360.0]);
+        if let Some(pos) = self.sheet_win_pos {
+            b = b.with_position(pos);
+        }
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("mabimml_sheet_window"), b, |ctx, class| {
+            let frame = egui::Frame::none().fill(p.bg).inner_margin(8.0);
+            if class == egui::ViewportClass::Embedded {
+                // 창을 따로 띄울 수 없는 환경이면 프로그램 안의 떠 있는 창으로
+                let mut open = true;
+                egui::Window::new("악보 보기").open(&mut open).default_size([700.0, 800.0]).show(ctx, |ui| self.sheet_body(ui));
+                if !open {
+                    self.sheet_window = false;
+                }
+            } else {
+                egui::CentralPanel::default().frame(frame).show(ctx, |ui| self.sheet_body(ui));
+            }
+            if ctx.input(|i| i.viewport().close_requested()) {
+                self.sheet_window = false;
+            }
+        });
+    }
+
+    fn sheet_body(&mut self, ui: &mut Ui) {
+        let p = self.pal;
+        {
+            {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("악보 보기").font(theme::bold(13.0)).color(p.wine));
                     if self.sheet.is_some() {
                         ui.label(RichText::new(&self.sheet_label).color(p.muted));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.checkbox(&mut self.sheet_follow, "재생 위치 따라가기");
+                        let label = if self.sheet_window { "창 합치기" } else { "창 따로 띄우기" };
+                        let tip = if self.sheet_window { "악보 보기를 프로그램 안 오른쪽으로 되돌립니다" } else { "악보 보기를 프로그램 오른쪽에 따로 띄워 크게 봅니다" };
+                        if ui.button(label).on_hover_text(tip).clicked() {
+                            self.sheet_window = !self.sheet_window;
+                            self.sheet_win_pos = None;
+                            self.sheet_line = None;
+                        }
+                        if ui.checkbox(&mut self.sheet_follow, "재생 위치 따라가기").changed() {
+                            self.sheet_line = None; // 켜자마자 지금 위치로
+                        }
                     });
                 });
                 ui.horizontal(|ui| {
@@ -1231,8 +1313,8 @@ impl App {
                     let follow = self.sheet_follow && show_head;
                     let line = &mut self.sheet_line;
                     let page = &mut self.sheet_page;
-                    // 긴 곡은 쪽으로 나눠 그린다
-                    let w = ui.available_width() - 16.0;
+                    // 긴 곡은 쪽으로 나눠 그린다. 쪽 계산과 그리기에 같은 폭을 쓴다 (세로 막대 자리를 뺀 폭)
+                    let w = (ui.available_width() - 16.0).max(200.0);
                     if follow {
                         sheet::follow_page(sh, w, head, *line, page);
                     }
@@ -1251,15 +1333,15 @@ impl App {
                         });
                     }
                     egui::ScrollArea::vertical().id_salt("sheet_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                        clicked = sheet::show(ui, sh, &p, head, if follow { Some(line) } else { None }, page).map(|t| sh.unit_to_ms(t));
+                        clicked = sheet::show(ui, sh, &p, head, if follow { Some(line) } else { None }, page, w).map(|t| sh.unit_to_ms(t));
                     });
                 });
                 if let Some(ms) = clicked {
                     self.commit_seek(ms);
                 }
-            });
+            }
+        }
     }
-
 
     /// 합주일 때: 같이 들을 합주자 고르기
     fn hear_row(&mut self, ui: &mut Ui) {
