@@ -864,7 +864,7 @@ fn musicxml_overfull_measure_does_not_shift_later_bars() {
         attrs, n("C", 192), n("A", 96), n("F", 102), n("G", 192)
     );
     let xml = format!(
-        "<score-partwise><part-list><score-part id=\"P1\"><part-name>a</part-name></score-part><score-part id=\"P2\"><part-name>b</part-name></score-part></part-list>{}{}</score-partwise>",
+        "<score-partwise><identification><encoding><software>Audiveris 5.11</software></encoding></identification><part-list><score-part id=\"P1\"><part-name>a</part-name></score-part><score-part id=\"P2\"><part-name>b</part-name></score-part></part-list>{}{}</score-partwise>",
         rh, lh
     );
     let song = mabimml::musicxml_io::read_musicxml_text(&xml).unwrap();
@@ -893,4 +893,26 @@ fn omr_chunk_plan_uses_cores() {
     // 메모리가 모자라면 덜 동시에
     let (c, p) = plan_chunks(40, 32, Some(3.0));
     assert!(c.iter().map(|x| x.1 - x.0 + 1).max().unwrap() * p <= 4);
+}
+
+#[test]
+fn musicxml_clamp_only_for_omr_and_composite_meter() {
+    let n = |step: &str, dur: i64| format!("<note><pitch><step>{}</step><octave>4</octave></pitch><duration>{}</duration></note>", step, dur);
+    // 사람이 만든 악보: 반복 앞에서 쪼갠 3박 마디는 그대로 (쉼을 끼우지 않음)
+    let attrs = "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>";
+    let xml = format!(
+        "<score-partwise><part-list><score-part id=\"P1\"><part-name>a</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\">{}{}</measure><measure number=\"2\">{}</measure><measure number=\"3\">{}</measure></part></score-partwise>",
+        attrs, n("C", 4), n("D", 3), n("E", 4)
+    );
+    let song = mabimml::musicxml_io::read_musicxml_text(&xml).unwrap();
+    assert_eq!(song.tracks[0].notes.iter().find(|x| x.pitch == 64).unwrap().start, 672.0);
+    // 3+2/8 은 5/8 (240) 으로 읽는다
+    let attrs = "<attributes><divisions>2</divisions><time><beats>3+2</beats><beat-type>8</beat-type></time></attributes>";
+    let xml = format!(
+        "<score-partwise><identification><encoding><software>Audiveris</software></encoding></identification><part-list><score-part id=\"P1\"><part-name>a</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\">{}{}{}</measure><measure number=\"2\">{}</measure></part></score-partwise>",
+        attrs, n("C", 3), n("D", 2), n("E", 5)
+    );
+    let song = mabimml::musicxml_io::read_musicxml_text(&xml).unwrap();
+    assert_eq!(song.bars.as_ref().unwrap(), &vec![0.0, 240.0]);
+    assert_eq!(song.tracks[0].notes.iter().find(|x| x.pitch == 62).unwrap().start, 144.0);
 }

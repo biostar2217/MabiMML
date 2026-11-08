@@ -40,12 +40,14 @@ fn mci(_cmd: &str) -> Result<String, PlayerError> {
 #[cfg(windows)]
 static NOTE_OUT: std::sync::Mutex<(usize, u64)> = std::sync::Mutex::new((0, 0));
 
-/// 건반을 누를 때 음 하나를 짧게 들려준다 (Windows 기본 MIDI 장치, 실패하면 소리 없이 넘어감).
+/// 건반을 누를 때 음 하나를 짧게 들려준다 (Windows 기본 MIDI 장치, 실패하면 소리 없이 넘어감). program 128 이상은 드럼.
 /// 잠시 뒤 아무 음도 더 안 누르면 장치를 닫는다 (미리듣기 재생이 장치를 쓸 수 있게)
 #[cfg(windows)]
 pub fn preview_note(pitch: i64, program: i64) {
     use windows_sys::Win32::Media::Audio::{midiOutOpen, midiOutShortMsg, HMIDIOUT};
     let p = pitch.clamp(0, 127) as u32;
+    // 128 이상이면 드럼 (10번 채널)
+    let drum = program >= 128;
     let prog = program.clamp(0, 127) as u32;
     let gen = {
         let mut g = NOTE_OUT.lock().unwrap();
@@ -59,8 +61,12 @@ pub fn preview_note(pitch: i64, program: i64) {
         }
         let h = g.0 as HMIDIOUT;
         unsafe {
-            midiOutShortMsg(h, 0xC0 | (prog << 8));
-            midiOutShortMsg(h, 0x90 | (p << 8) | (100 << 16));
+            if drum {
+                midiOutShortMsg(h, 0x99 | (p << 8) | (100 << 16));
+            } else {
+                midiOutShortMsg(h, 0xC0 | (prog << 8));
+                midiOutShortMsg(h, 0x90 | (p << 8) | (100 << 16));
+            }
         }
         g.1 += 1;
         g.1
@@ -69,7 +75,7 @@ pub fn preview_note(pitch: i64, program: i64) {
         std::thread::sleep(std::time::Duration::from_millis(700));
         let mut g = NOTE_OUT.lock().unwrap();
         if g.0 != 0 {
-            unsafe { midiOutShortMsg(g.0 as HMIDIOUT, 0x80 | (p << 8)) };
+            unsafe { midiOutShortMsg(g.0 as HMIDIOUT, if drum { 0x89 } else { 0x80 } | (p << 8)) };
             if g.1 == gen {
                 close_note_out(&mut g);
             }

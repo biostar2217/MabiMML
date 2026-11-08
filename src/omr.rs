@@ -296,6 +296,7 @@ pub fn recognize(
     let (chunks, procs) = plan_chunks(pages, cores, free_memory_gb());
     let started = Instant::now();
     let mut found: Option<Vec<String>> = None;
+    let mut mismatch = false;
     if !chunks.is_empty() {
         if let Some(l) = log {
             l(&format!("CPU 코어 {}개: {}쪽을 {}덩어리로 나눠 동시에 인식합니다", cores, pages, chunks.len()));
@@ -344,14 +345,23 @@ pub fn recognize(
                 }
             }
             Some(e) => return Err(e),
+            None if chunks.len() > 1 && !same_parts(&all) => {
+                // 덩어리마다 파트(보표) 구성이 다르면 파트끼리 잘못 이어지므로 한 번에 다시 인식한다
+                mismatch = true;
+                if let Some(l) = log {
+                    l("나눠 인식한 페이지들의 파트 구성이 달라 한 번에 다시 인식합니다");
+                }
+            }
             None => found = Some(all),
         }
     }
     let found = match found {
         Some(f) => f,
         None => {
-            let meter = Arc::new(Mutex::new(AudiverisProgress::new(pages)));
-            run_audiveris(&exe, path, timeout, progress, meter, false, None)?
+            // 파트 구성이 달라 다시 하는 거면 한 번에 동시 인식, 동시 인식이 실패해서면 한 장씩
+            let par = mismatch && (2..=PARALLEL_MAX_PAGES).contains(&pages);
+            let meter = Arc::new(Mutex::new(AudiverisProgress { parallel: par, ..AudiverisProgress::new(pages) }));
+            run_audiveris(&exe, path, timeout, progress, meter, par, None)?
         }
     };
     if let Some(p) = progress {
@@ -385,6 +395,15 @@ pub fn recognize(
         return Ok(kept);
     }
     Ok(found)
+}
+
+/// 인식 결과 파일들의 파트 이름이 모두 같은지 (나눠 인식한 덩어리를 이어 붙여도 되는지)
+fn same_parts(files: &[String]) -> bool {
+    let names: Vec<Option<Vec<String>>> = files
+        .iter()
+        .map(|f| crate::musicxml_io::read_musicxml(f).ok().map(|s| s.tracks.iter().map(|t| t.name.clone()).collect()))
+        .collect();
+    names.windows(2).all(|w| w[0].is_some() && w[0] == w[1])
 }
 
 /// Audiveris 를 한 번 돌려 결과 MusicXML 목록(악장 순서)을 돌려준다. sheets: 이 페이지 범위만 인식

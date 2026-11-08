@@ -169,9 +169,15 @@ fn omr_err(e: OmrError) -> ConvError {
 }
 
 fn read_xml_files(files: &[String]) -> Res<Song> {
-    let mut songs = Vec::new();
+    let mut songs: Vec<Song> = Vec::new();
+    // 나눠 인식한 뒤쪽 파일은 박자표가 없으므로 앞 파일의 마지막 박자를 이어 쓴다
+    let mut sig: Option<(i64, i64)> = None;
     for f in files {
-        songs.push(read_musicxml(f)?);
+        let s = crate::musicxml_io::read_musicxml_with(f, sig)?;
+        if let Some(&(_, b, bt)) = s.timesigs.last() {
+            sig = Some((b, bt));
+        }
+        songs.push(s);
     }
     Ok(merge_songs(songs))
 }
@@ -267,11 +273,15 @@ pub fn merge_songs(mut songs: Vec<Song>) -> Song {
     let mut tempos = Vec::new();
     let mut sigs = Vec::new();
     let mut marks = Vec::new();
+    let mut last_sig: Option<(i64, i64)> = None;
     for s in &songs {
         let end = s.end_unit();
+        if let Some(&(_, b, bt)) = s.timesigs.last() {
+            last_sig = Some((b, bt));
+        }
         let mut bar = UNITS_PER_WHOLE as f64;
-        if let Some(last) = s.timesigs.last() {
-            bar = last.1 as f64 * UNITS_PER_WHOLE as f64 / last.2 as f64;
+        if let Some((b, bt)) = last_sig {
+            bar = b as f64 * UNITS_PER_WHOLE as f64 / bt as f64;
         }
         let mut end = -floordiv(-end, bar) * bar;
         // 마디 위치를 알면 마지막 마디 끝에서 다음 악장(덩어리)을 잇는다 (못갖춘마디·끝의 쉬는 마디도 맞게)
@@ -1276,7 +1286,8 @@ pub fn convert_song(song: &Song, opts: &Options) -> Res<ConvResult> {
         res.warnings.insert(0, "합주로 나누기를 켜서 붙여넣은 MML을 원본 그대로 나누지 않고 합주자로 나눴습니다".into());
         return Ok(res);
     }
-    if opts.split_players && song.source == "mml" && song.tracks.iter().skip(3).any(|t| !t.notes.is_empty()) {
+    // 합주로 나누기를 켰으면 6파트도 합주 쪽에서 나눈다 (두 사람 악보로 나누기와 겹치지 않게)
+    if opts.split_players && !opts.ensemble && song.source == "mml" && song.tracks.iter().skip(3).any(|t| !t.notes.is_empty()) {
         return split_players(song, opts);
     }
     if opts.align_start && song.source == "midi" {

@@ -432,6 +432,12 @@ pub struct App {
     mml_scroll: bool,
     /// 악보 보기를 고른 자리가 있는 줄로 넘길지
     sheet_jump: bool,
+    /// 악보 밑 재생 줄·편집 도구가 차지한 높이 (지난 화면에서 잼)
+    tools_h: f32,
+    /// 첫 화면에서 창이 모니터보다 크면 줄였는지
+    size_checked: bool,
+    /// AI 가 MML 을 고치기 전의 결과 악보들 (장을 지우거나 붙였을 때 함께 되돌림)
+    ai_undo_scores: Option<Vec<Score>>,
     /// 설정을 바꾼 뒤 새 MML 로 AI 에게 한 번 더 물을 명령 (설정과 MML 고침을 함께 할 때)
     ai_followup: Option<String>,
     /// 마지막으로 AI 에게 보낸 명령
@@ -538,6 +544,9 @@ impl App {
             mml_mark: None,
             mml_scroll: false,
             sheet_jump: false,
+            tools_h: 0.0,
+            size_checked: false,
+            ai_undo_scores: None,
             ai_followup: None,
             ai_last_cmd: String::new(),
             ai_rx: None,
@@ -629,8 +638,10 @@ impl App {
         }
     }
 
+    /// 변환에 쓰는 설정만 (소리·테마·악보 창 같은 화면 설정은 바꿔도 다시 변환하지 않아 고친 MML 이 남는다)
     fn fingerprint(&self) -> String {
-        format!("{:?}|{:?}|{:?}", self.other, self.saved, self.roles).replace(&format!("re_ocr: {}", self.other.re_ocr), "")
+        let s = Saved { preview_sound: String::new(), color_theme: String::new(), sheet_window: false, ..self.saved.clone() };
+        format!("{:?}|{:?}|{:?}", self.other, s, self.roles).replace(&format!("re_ocr: {}", self.other.re_ocr), "")
             .replace(&format!("play_all: {}", self.other.play_all), "")
     }
 
@@ -839,6 +850,7 @@ impl App {
     /// 새 곡을 열 때: 앞 곡에서 켠 합주(합주자·드럼·합주자별 악기)는 이어지지 않게 끈다
     fn new_song_reset(&mut self, path: &str) {
         if self.path != path {
+            self.muted.clear();
             self.other.cut_start = 0;
             self.other.cut_end = 0;
             self.other.drop_players.clear();
@@ -901,6 +913,7 @@ impl App {
         match read_mobile_mml(text) {
             Ok(song) => {
                 self.other.transpose = 0;
+                self.path.clear(); // 같은 이름이라도 새로 붙여넣은 곡: 자르기·뺀 합주자·합주를 비운다
                 self.new_song_reset("붙여넣은MML.txt");
                 self.loaded_now("붙여넣은MML.txt", song);
             }
@@ -991,6 +1004,8 @@ impl App {
         self.edit_undo.clear();
         self.mml_cursor = None;
         self.mml_mark = None;
+        self.ai_undo_texts = None;
+        self.ai_undo_scores = None;
         let bpms: Vec<i64> = res.tempos.iter().map(|t| t.1).collect();
         if let (Some(lo), Some(hi)) = (bpms.iter().min(), bpms.iter().max()) {
             self.tempo_label = if lo != hi { format!("결과 템포: {}~{} BPM", lo, hi) } else { format!("결과 템포: {} BPM", lo) };
@@ -1329,10 +1344,18 @@ impl App {
 
     /// 스페이스 바: 재생 / 일시정지 (글을 입력하는 중이 아닐 때)
     fn space_key(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
+        if ctx.wants_keyboard_input() || !self.dialogs.is_empty() {
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+        // 누르고 있을 때 반복되는 입력은 무시 (재생/멈춤이 계속 바뀌지 않게)
+        let fresh = ctx.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Space, pressed: true, repeat: false, modifiers, .. } if modifiers.is_none()))
+        });
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) && fresh {
+            if self.result.is_none() {
+                self.status = "먼저 파일을 여세요".into();
+                return;
+            }
             self.toggle_play();
         }
     }
@@ -1344,7 +1367,14 @@ impl App {
             {
                 ui.horizontal(|ui| {
                     let playing = self.player.is_playing();
-                    if self.accent(ui, if playing { "■ 일시정지 (스페이스)" } else { "▶ 재생 (스페이스)" }).on_hover_text(if playing { "멈춘 자리에서 다시 들을 수 있어요" } else { "여기서부터 듣기" }).clicked() {
+                    let narrow = ui.available_width() < 600.0;
+                    let label = match (playing, narrow) {
+                        (true, false) => "■ 일시정지 (스페이스)",
+                        (false, false) => "▶ 재생 (스페이스)",
+                        (true, true) => "■",
+                        (false, true) => "▶",
+                    };
+                    if self.accent(ui, label).on_hover_text(if playing { "일시정지 (스페이스): 멈춘 자리에서 다시 들을 수 있어요" } else { "여기서부터 듣기 (스페이스)" }).clicked() {
                         self.toggle_play();
                     }
                     let (total, bars) = match &self.sheet {
@@ -1354,7 +1384,7 @@ impl App {
                     let cur = self.current_ms().clamp(0.0, total.max(0.0));
                     let bar_no = self.sheet.as_ref().map(|sh| ((sh.ms_to_unit(cur) / sh.bar).floor() as usize + 1).min(bars)).unwrap_or(0);
                     ui.label(RichText::new(format!("{} / {}", fmt_clock(cur), fmt_clock(total))).font(egui::FontId::monospace(13.0)));
-                    let right_w = 200.0;
+                    let right_w = if narrow { 150.0 } else { 200.0 };
                     let w = (ui.available_width() - right_w).max(80.0);
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::click_and_drag());
                     let painter = ui.painter_at(rect.expand(8.0));
@@ -1426,7 +1456,7 @@ impl App {
             self.sheet_viewport(ctx);
             return;
         }
-        egui::SidePanel::right("sheet")
+        egui::SidePanel::right("sheet_v2") // 예전 판이 넓혀 저장한 폭(최대 1000)을 버리려고 이름을 바꿈
             .resizable(true)
             .default_width(540.0)
             .min_width(280.0)
@@ -1443,7 +1473,14 @@ impl App {
         let monitor_w = ctx.input(|i| i.viewport().monitor_size.map(|m| m.x)).unwrap_or(f32::MAX);
         let sheet_w: f32 = main_size.x.min((monitor_w / 2.0).max(700.0)).max(700.0);
         if self.sheet_win_pos.is_none() {
-            self.sheet_win_size = egui::vec2(sheet_w, main_size.y.max(600.0));
+            // 화면이 좁아 프로그램(최소 1080)과 악보 창을 나란히 둘 수 없으면 프로그램 안에 합쳐 보여 준다 (설정은 그대로)
+            if monitor_w < 1080.0 + 700.0 + 12.0 {
+                self.sheet_window = false;
+                self.status = "화면이 좁아 악보 보기를 프로그램 안 오른쪽에 합쳐 보여 줍니다".into();
+                return;
+            }
+            let monitor_h = ctx.input(|i| i.viewport().monitor_size.map(|m| m.y)).unwrap_or(f32::MAX);
+            self.sheet_win_size = egui::vec2(sheet_w, main_size.y.max(600.0).min((monitor_h - 80.0).max(420.0)));
             // 프로그램 바로 오른쪽에 띄운다. 화면 밖으로 나가면 프로그램을 왼쪽으로 옮기고 폭을 줄여 나란히 놓는다
             let (outer, inner, monitor) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect, i.viewport().monitor_size));
             let pos = match (outer, monitor) {
@@ -1464,7 +1501,7 @@ impl App {
         let mut b = egui::ViewportBuilder::default()
             .with_title(format!("악보 보기 - 마비노기 MML 변환기 v{}", VERSION))
             .with_inner_size(self.sheet_win_size)
-            .with_min_inner_size([360.0, 360.0]);
+            .with_min_inner_size([480.0, 420.0]);
         if let Some(pos) = self.sheet_win_pos {
             b = b.with_position(pos);
         }
@@ -1690,10 +1727,16 @@ impl App {
 
     /// 같은 파트의 앞/뒤 음으로
     fn edit_move(&mut self, dir: i64) {
-        if self.edit_sel.is_none() {
+        let temp = self.edit_sel.is_none();
+        if temp {
             self.edit_sel = self.sel_at_playhead();
         }
-        let Some(s) = self.sel_ok() else { return };
+        let Some(s) = self.sel_ok() else {
+            if temp {
+                self.edit_sel = None;
+            }
+            return;
+        };
         let part = self.part_text(s.score, s.part);
         let Ok(p) = mml_edit::analyze(&part) else { return };
         let next = if dir > 0 {
@@ -1711,6 +1754,9 @@ impl App {
                 }
             }
             self.note_sound(s.score, p.notes[i].pitch);
+        } else if temp {
+            // 그 방향에 음이 없으면 재생 위치에서 만든 임시 자리는 남기지 않는다
+            self.edit_sel = None;
         }
     }
 
@@ -1735,16 +1781,25 @@ impl App {
     /// 건반·음 높이를 바꿀 때 그 음을 짧게 들려준다
     fn note_sound(&self, score: usize, pitch: i64) {
         let Some(r) = self.result.as_ref() else { return };
-        let mut prog = self.preview_prog();
-        if prog < 0 {
-            let inst = r.scores.get(score).map(|s| s.instrument.clone()).unwrap_or_default();
-            prog = crate::convert::preview_program(if inst.is_empty() { &self.saved.instrument } else { &inst });
+        let Some(sc) = r.scores.get(score) else { return };
+        // 미리듣기(preview_midi)와 같은 악기·옥타브로
+        let inst = r.scores.iter().filter(|s| s.player == sc.player).map(|s| s.instrument.clone()).find(|i| !i.is_empty()).unwrap_or_default();
+        if inst == crate::convert::DRUM_KIT {
+            crate::player::preview_note(crate::convert::drum_preview_note(pitch), 128);
+            return;
         }
-        crate::player::preview_note(pitch + r.sound_shift, prog.max(0));
+        let prog = self.preview_prog();
+        let per_player = prog < 0 || r.scores.iter().any(|s| !s.instrument.is_empty());
+        let shift = if per_player && !inst.is_empty() { -crate::convert::instrument_shift(&inst) } else { r.sound_shift };
+        let program = if prog < 0 { if inst.is_empty() { 0 } else { crate::convert::preview_program(&inst) } } else { prog };
+        crate::player::preview_note(pitch + shift, program);
     }
 
     /// 악보를 누른 곳으로 고르기
     fn sheet_clicked(&mut self, c: sheet::Click) {
+        if !self.edit_tools {
+            return; // 악보 고치기를 끄면 누른 곳으로 옮기기만
+        }
         if !self.sheet_err.is_empty() {
             self.edit_msg = "MML에 읽을 수 없는 글자가 있어 악보에서 고를 수 없습니다".into();
             return;
@@ -1771,7 +1826,8 @@ impl App {
         let Some(&(start, _, src)) = pick else { return };
         // 16분음표 칸에 맞춘다
         let t = ((c.t - start) / 24.0).floor().max(0.0) * 24.0;
-        let k = self.edit_part;
+        // 한 파트만 보는 중이면 그 파트에 넣는다 (안 보이는 파트를 고치지 않게)
+        let k = if (1..=3).contains(&self.listen) { self.listen - 1 } else { self.edit_part };
         let part = self.part_text(src, k);
         let found = mml_edit::analyze(&part).ok().and_then(|p| mml_edit::note_at_time(&p, t).map(|n| (n, p.notes[n].start)));
         let (note, t) = match found {
@@ -1824,7 +1880,8 @@ impl App {
 
     /// 악보 보기 단축키 (글 칸에 입력 중이 아닐 때)
     fn edit_keys(&mut self, ui: &Ui) {
-        if self.sheet.is_none() || ui.ctx().wants_keyboard_input() {
+        // 악보 고치기를 끈 때, 글 입력 중, 고르기 목록이 열려 있을 때는 단축키를 쓰지 않는다
+        if self.sheet.is_none() || !self.edit_tools || ui.ctx().wants_keyboard_input() || ui.ctx().memory(|m| m.any_popup_open()) {
             return;
         }
         use egui::{Key, Modifiers};
@@ -1947,7 +2004,9 @@ impl App {
             if ui.add_enabled(self.piano_oct > 1, egui::Button::new("◀")).on_hover_text("낮은 옥타브").clicked() {
                 self.piano_oct -= 1;
             }
-            let w = (ui.available_width() - 30.0).max(160.0);
+            // ▶ 단추와 간격 자리를 남긴다 (모자라면 악보 칸이 매번 넓어진다)
+            let arrow = ui.spacing().interact_size.x.max(24.0) + 2.0 * ui.spacing().button_padding.x;
+            let w = (ui.available_width() - arrow - 2.0 * ui.spacing().item_spacing.x - 6.0).max(120.0);
             let octs = ((w / (7.0 * 15.0)).floor() as i64).clamp(2, 8);
             self.piano_oct = self.piano_oct.clamp(1, (9 - octs).max(1));
             pressed = piano(ui, w, 62.0, self.piano_oct, octs, sel_pitch);
@@ -1962,6 +2021,8 @@ impl App {
 
     fn sheet_body(&mut self, ui: &mut Ui) {
         let p = self.pal;
+        // 안의 줄이 넓어도 악보 칸(옆 패널)이 저절로 넓어지지 않게
+        ui.set_max_width(ui.available_width());
         {
             {
                 ui.horizontal(|ui| {
@@ -2001,7 +2062,9 @@ impl App {
                 let (marks, mark_t) = self.sheet_marks();
                 let jump = std::mem::take(&mut self.sheet_jump);
                 self.space_key(ui.ctx());
-                let tools_h = 40.0 + if self.sheet.is_none() { 0.0 } else if self.edit_tools { 150.0 } else { 30.0 };
+                // 아래 재생 줄·편집 도구의 높이: 지난 화면에서 잰 값 (처음엔 어림값)
+                let guess = 40.0 + if self.sheet.is_none() { 0.0 } else if self.edit_tools { 170.0 } else { 30.0 };
+                let tools_h = if self.tools_h > 0.0 && self.sheet.is_some() { self.tools_h } else { guess };
                 let sheet_h = (ui.available_height() - tools_h).max(160.0);
                 ui.allocate_ui(egui::vec2(ui.available_width(), sheet_h), |ui| {
                 egui::Frame::none().fill(Color32::WHITE).stroke(egui::Stroke::new(1.0f32, p.line)).inner_margin(6.0).show(ui, |ui| {
@@ -2055,10 +2118,16 @@ impl App {
                     self.commit_seek(ms);
                     self.sheet_clicked(c);
                 }
+                let tools_top = ui.cursor().top();
                 self.seek_row(ui);
                 if self.sheet.is_some() {
                     self.edit_bar(ui);
                     self.edit_keys(ui);
+                }
+                let h = ui.cursor().top() - tools_top + 4.0;
+                if (h - self.tools_h).abs() > 1.0 {
+                    self.tools_h = h;
+                    ui.ctx().request_repaint();
                 }
             }
         }
@@ -2109,6 +2178,7 @@ impl App {
 
     /// 화면 번호로 합주자를 뺀다 (설정에 원래 번호로 기억해 다시 변환해도 빠진 채로)
     fn remove_players(&mut self, shown: &[i64]) {
+        self.muted.clear(); // 빼면 뒤 번호가 당겨지므로 듣기 선택은 처음부터
         let Some(res) = self.result.as_ref() else { return };
         let mut n = 0;
         for &pl in shown {
@@ -2292,6 +2362,8 @@ impl App {
         self.save_settings();
         match song_from_parts(parts, Some(joined)) {
             Ok(song) => {
+                self.path.clear();
+                self.new_song_reset("직접입력MML.txt");
                 self.loaded_now("직접입력MML.txt", song);
                 if let Some(r) = &self.result {
                     self.direct_status = format!("악보 {}장으로 나눴습니다. 메인 창의 탭에서 듣거나 저장하세요", r.scores.len());
@@ -2492,6 +2564,7 @@ impl App {
     /// AI 가 고친 MML 을 결과 글에 넣는다. (고친 곳 수, 못 넣은 이유들)
     fn apply_mml_edits(&mut self, edits: &[(usize, usize, String)], edit_players: &[Option<i64>]) -> (usize, Vec<String>) {
         let before = self.score_texts.clone();
+        let before_scores = self.result.as_ref().map(|r| r.scores.clone());
         let limits = self.result.as_ref().map(|r| r.limits).unwrap_or([i64::MAX; 3]);
         let mut done = 0;
         let mut problems = Vec::new();
@@ -2556,7 +2629,9 @@ impl App {
                                 }
                                 _ => (last.player, last.end, last.instrument.clone()),
                             };
-                            let mut sc = Score::new(parts.clone(), start, start);
+                            // 장 길이는 파트 중 가장 긴 것 (0 이면 그 장에 음을 넣을 수 없음)
+                            let len = parts.iter().filter_map(|p| parse_part(p).ok().map(|r| r.2)).fold(0.0f64, f64::max);
+                            let mut sc = Score::new(parts.clone(), start, start + len.trunc());
                             sc.player = player;
                             sc.instrument = inst;
                             res.scores.push(sc);
@@ -2611,6 +2686,11 @@ impl App {
         }
         if done > 0 {
             self.ai_undo_texts = Some(before);
+            self.ai_undo_scores = before_scores;
+            // 장 수가 바뀌었을 수 있어 악보에서 고른 자리·되돌리기는 비운다
+            self.edit_sel = None;
+            self.edit_undo.clear();
+            self.mml_mark = None;
             if self.player.is_playing() {
                 self.player.stop();
             }
@@ -3081,7 +3161,9 @@ impl App {
     }
 
     fn action_bar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
+        // 좁으면 줄을 바꿔 가운데 칸보다 넓어지지 않게 (넓어지면 아래 줄들이 잘림)
+        let narrow = ui.available_width() < 800.0;
+        ui.horizontal_wrapped(|ui| {
             if self.accent(ui, "변환").clicked() {
                 self.convert(false);
             }
@@ -3105,9 +3187,16 @@ impl App {
                 self.player.stop();
                 self.toggle_play();
             }
+            if narrow {
+                ui.end_row();
+            }
             ui.label("소리");
             if Self::combo(ui, "sound", &mut self.saved.preview_sound, &PREVIEW_SOUNDS, 110.0) {
                 self.save_settings();
+                if self.player.is_playing() {
+                    self.player.stop();
+                    self.toggle_play();
+                }
             }
             ui.separator();
             ui.menu_button("저장 ▼", |ui| {
@@ -3148,13 +3237,15 @@ impl App {
             ui.add_enabled_ui(self.ai_undo.is_some() || self.ai_undo_texts.is_some(), |ui| {
                 if ui.button("되돌리기").clicked() {
                     if let Some(t) = self.ai_undo_texts.take() {
-                        if let Some(res) = self.result.as_mut() {
-                            res.scores.truncate(t.len().max(1));
+                        // 장을 지우거나 붙였어도 그대로 되돌린다
+                        if let (Some(res), Some(sc)) = (self.result.as_mut(), self.ai_undo_scores.take()) {
+                            res.scores = sc;
                         }
-                        if t.len() <= self.score_texts.len() {
-                            self.score_texts = t;
-                            self.tab = self.tab.min(self.score_texts.len().saturating_sub(1));
-                        }
+                        self.score_texts = t;
+                        self.tab = self.tab.min(self.score_texts.len().saturating_sub(1));
+                        self.edit_sel = None;
+                        self.edit_undo.clear();
+                        self.mml_mark = None;
                         self.ai_label = "AI가 고친 MML을 되돌렸습니다".into();
                     } else if let Some(u) = self.ai_undo.take() {
                         self.ai_set(&u);
@@ -3266,11 +3357,22 @@ impl App {
             }
             let i = self.tab.min(self.score_texts.len() - 1);
             let res = self.result.clone().unwrap();
+            // 좁으면 글자 수 줄과 복사 단추 줄을 나눠 겹치지 않게
+            let narrow = ui.available_width() < 960.0;
+            let lens: Vec<i64> = split_clipboard(self.score_texts[i].trim()).iter().map(|p| p.chars().count() as i64).collect();
+            if narrow {
+                ui.horizontal_wrapped(|ui| {
+                    for k in 0..3 {
+                        length_meter(ui, &p, PART_NAMES[k], lens.get(k).copied().unwrap_or(0), res.limits[k]);
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 // 고친 글(직접 또는 AI)의 글자 수
-                let lens: Vec<i64> = split_clipboard(self.score_texts[i].trim()).iter().map(|p| p.chars().count() as i64).collect();
-                for k in 0..3 {
-                    length_meter(ui, &p, PART_NAMES[k], lens.get(k).copied().unwrap_or(0), res.limits[k]);
+                if !narrow {
+                    for k in 0..3 {
+                        length_meter(ui, &p, PART_NAMES[k], lens.get(k).copied().unwrap_or(0), res.limits[k]);
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.accent(ui, "클립보드에 복사").on_hover_text("세 파트를 MML@멜로디,화음1,화음2; 로 한꺼번에").clicked() {
@@ -3942,6 +4044,16 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
+        if !self.size_checked {
+            let (m, r) = ctx.input(|i| (i.viewport().monitor_size, i.viewport().outer_rect));
+            if let (Some(m), Some(r)) = (m, r) {
+                self.size_checked = true;
+                // 작은 화면(노트북·배율 큼)에서 창이 화면보다 크게 열리면 화면에 맞춘다
+                if m.x > 0.0 && (r.width() > m.x + 1.0 || r.height() > m.y - 30.0) && std::env::var_os("MABIMML_SHOTS").is_none() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                }
+            }
+        }
         self.space_key(ctx);
         self.banner(ctx);
         self.seek_bar(ctx);
