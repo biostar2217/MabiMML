@@ -1466,7 +1466,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "mabimml"
-version = "2.4.11"
+version = "2.4.12"
 dependencies = [
  "arboard",
  "eframe",

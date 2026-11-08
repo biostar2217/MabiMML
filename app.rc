@@ -10,9 +10,9 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "LT 남븝"
       VALUE "FileDescription", "마비노기 MML 변환기"
-      VALUE "FileVersion", "2.4.11"
+      VALUE "FileVersion", "2.4.12"
       VALUE "ProductName", "MabiMML"
-      VALUE "ProductVersion", "2.4.11"
+      VALUE "ProductVersion", "2.4.12"
       VALUE "LegalCopyright", "LT 남븝"
     END
   END

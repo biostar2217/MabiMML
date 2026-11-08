@@ -25,5 +25,5 @@ pub mod sheet;
 pub mod theme;
 pub mod zipread;
 
-pub const VERSION: &str = "2.4.11";
+pub const VERSION: &str = "2.4.12";
 pub const AUTHOR: &str = "LT 남븝";

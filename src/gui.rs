@@ -419,7 +419,7 @@ pub struct App {
     edit_len: i64,
     edit_dot: bool,
     /// 고치기 전의 결과 글들 (되돌리기)
-    edit_undo: Vec<Vec<String>>,
+    edit_undo: Vec<(usize, usize, String, String)>,
     edit_msg: String,
     /// 편집 도구·건반 보이기
     edit_tools: bool,
@@ -1512,42 +1512,68 @@ impl App {
     fn select(&mut self, sel: EditSel) {
         self.edit_part = sel.part;
         self.edit_sel = Some(sel);
-        // 다른 장의 음이면 그 장의 MML 을 보여 준다 (합주 전체·이어 보기)
+        // 다른 장의 음이면 그 장의 MML 을 보여 준다 (합주 전체·이어 보기).
+        // 단, 장을 바꾸면 악보 보기 모양이 바뀌는 경우(한 사람만 듣는 중)는 그대로 둔다
         if self.tab != sel.score && sel.score < self.score_texts.len() {
+            let (old, before) = (self.tab, self.hearing_one());
             self.tab = sel.score;
+            if self.hearing_one() != before {
+                self.tab = old;
+            }
         }
         self.sync_edit_marks();
     }
 
-    /// 파트 글을 바꾼다 (되돌리기에 남김)
+    /// 고친 자리가 지금 악보 보기에 있고 악보를 읽을 수 있을 때만 고친다
+    fn sel_ok(&mut self) -> Option<EditSel> {
+        let s = self.edit_sel?;
+        if !self.sheet_err.is_empty() {
+            self.edit_msg = "MML에 읽을 수 없는 글자가 있어 악보에서 고칠 수 없습니다. MML 칸을 먼저 고쳐 주세요".into();
+            return None;
+        }
+        if s.score >= self.score_texts.len() || self.staff_of(s.score, s.staff).is_none() {
+            self.edit_sel = None;
+            self.edit_msg = "고른 음이 지금 악보 보기에 없습니다. 악보에서 다시 눌러 주세요".into();
+            return None;
+        }
+        Some(s)
+    }
+
+    /// 파트 글을 바꾼다 (되돌리기에 남김: 그 파트의 고치기 전/후 글)
     fn commit_part(&mut self, i: usize, k: usize, new: &str) {
-        self.edit_undo.push(self.score_texts.clone());
+        let old = self.part_text(i, k);
+        self.score_texts[i] = mml_edit::replace_part(&self.score_texts[i], k, new);
+        let now = self.part_text(i, k);
+        self.edit_undo.push((i, k, old, now));
         if self.edit_undo.len() > 200 {
             self.edit_undo.remove(0);
         }
-        self.score_texts[i] = mml_edit::replace_part(&self.score_texts[i], k, new);
-        self.mml_cursor = None;
     }
 
     fn edit_undo_step(&mut self) {
-        match self.edit_undo.pop() {
-            Some(t) if t.len() == self.score_texts.len() => {
-                self.score_texts = t;
-                self.edit_msg = "되돌렸습니다".into();
-                if let Some(s) = self.edit_sel {
-                    // 음 번호가 바뀌었을 수 있으니 시간으로 다시 찾는다
-                    let part = self.part_text(s.score, s.part);
-                    let note = mml_edit::analyze(&part).ok().and_then(|p| mml_edit::note_at_time(&p, s.t));
-                    self.edit_sel = Some(EditSel { note, ..s });
-                }
-                self.sync_edit_marks();
-            }
-            _ => self.edit_msg = "되돌릴 것이 없습니다".into(),
+        let Some((i, k, old, new)) = self.edit_undo.pop() else {
+            self.edit_msg = "되돌릴 것이 없습니다".into();
+            return;
+        };
+        // 그 뒤에 MML 을 직접(또는 AI 가) 고쳤으면 덮어쓰지 않는다
+        if i >= self.score_texts.len() || self.part_text(i, k) != new {
+            self.edit_undo.clear();
+            self.edit_msg = "그 뒤에 MML이 바뀌어서 악보 고치기를 되돌릴 수 없습니다".into();
+            return;
         }
+        self.score_texts[i] = mml_edit::replace_part(&self.score_texts[i], k, &old);
+        self.edit_msg = "되돌렸습니다".into();
+        if let Some(s) = self.edit_sel {
+            // 음 번호가 바뀌었을 수 있으니 시간으로 다시 찾는다
+            let part = self.part_text(s.score, s.part);
+            let note = mml_edit::analyze(&part).ok().and_then(|p| mml_edit::note_at_time(&p, s.t));
+            self.edit_sel = Some(EditSel { note, ..s });
+        }
+        self.sync_edit_marks();
     }
 
     fn edit_delete(&mut self) {
-        let Some(s) = self.edit_sel else { return };
+        let Some(s) = self.sel_ok() else { return };
         let Some(n) = s.note else {
             self.edit_msg = "지울 음을 먼저 누르세요".into();
             return;
@@ -1566,7 +1592,7 @@ impl App {
 
     /// 고른 음의 높이를 pitch 로
     fn edit_set_pitch(&mut self, pitch: i64) {
-        let Some(s) = self.edit_sel else { return };
+        let Some(s) = self.sel_ok() else { return };
         let Some(n) = s.note else { return };
         let part = self.part_text(s.score, s.part);
         match mml_edit::set_pitch(&part, n, pitch) {
@@ -1581,7 +1607,7 @@ impl App {
     }
 
     fn edit_shift(&mut self, d: i64) {
-        let Some(s) = self.edit_sel else { return };
+        let Some(s) = self.sel_ok() else { return };
         let Some(n) = s.note else {
             self.edit_msg = "높이를 바꿀 음을 먼저 누르세요".into();
             return;
@@ -1594,7 +1620,7 @@ impl App {
 
     /// 고른 음의 길이를 지금 고른 길이로
     fn edit_set_length(&mut self) {
-        let Some(s) = self.edit_sel else { return };
+        let Some(s) = self.sel_ok() else { return };
         let Some(n) = s.note else {
             self.edit_msg = "길이를 바꿀 음을 먼저 누르세요".into();
             return;
@@ -1640,7 +1666,7 @@ impl App {
 
     /// 같은 파트의 앞/뒤 음으로
     fn edit_move(&mut self, dir: i64) {
-        let Some(s) = self.edit_sel else { return };
+        let Some(s) = self.sel_ok() else { return };
         let part = self.part_text(s.score, s.part);
         let Ok(p) = mml_edit::analyze(&part) else { return };
         let next = if dir > 0 {
@@ -1655,6 +1681,12 @@ impl App {
 
     /// 악보를 누른 곳으로 고르기
     fn sheet_clicked(&mut self, c: sheet::Click) {
+        if !self.sheet_err.is_empty() {
+            self.edit_msg = "MML에 읽을 수 없는 글자가 있어 악보에서 고를 수 없습니다".into();
+            return;
+        }
+        let cur_player = self.result.as_ref().and_then(|r| r.scores.get(self.tab)).map(|s| s.player);
+        let player_of = |i: usize| self.result.as_ref().and_then(|r| r.scores.get(i)).map(|s| s.player);
         let Some(sh) = self.sheet.as_ref() else { return };
         if let Some((k, idx)) = c.note {
             let Some(&(src, j)) = sh.refs.get(c.staff).and_then(|r| r.get(k)).and_then(|r| r.get(idx)) else { return };
@@ -1663,7 +1695,16 @@ impl App {
             self.select(EditSel { score: src, part: k, note: Some(j), t, staff: c.staff });
             return;
         }
-        let Some(&(start, _, src)) = sh.ranges.get(c.staff).and_then(|g| g.iter().rev().find(|r| r.0 <= c.t + 1e-6)) else { return };
+        // 그 시간을 덮는 장. 여러 합주자를 한 보표에 겹쳐 보면 지금 고른 합주자의 장을 먼저
+        let Some(g) = sh.ranges.get(c.staff) else { return };
+        let covering: Vec<&(f64, f64, usize)> = g.iter().filter(|r| r.0 <= c.t + 1e-6 && c.t < r.1 - 1e-6).collect();
+        let pick = covering
+            .iter()
+            .find(|r| player_of(r.2) == cur_player)
+            .or(covering.first())
+            .copied()
+            .or_else(|| g.iter().rev().find(|r| r.0 <= c.t + 1e-6));
+        let Some(&(start, _, src)) = pick else { return };
         // 16분음표 칸에 맞춘다
         let t = ((c.t - start) / 24.0).floor().max(0.0) * 24.0;
         let k = self.edit_part;
@@ -3147,6 +3188,9 @@ impl App {
                 });
             }
             if self.tab != tab_before {
+                // 다른 장을 보면 악보에서 고른 자리는 지난 장 것이므로 비운다
+                self.edit_sel = None;
+                self.mml_mark = None;
                 self.tab_switched();
             }
             if self.score_texts.is_empty() {

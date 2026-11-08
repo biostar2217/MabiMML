@@ -121,6 +121,11 @@ pub fn analyze(mml: &str) -> Result<Part, String> {
         }
         toks.push(Tok { tok: t, t0, t1: pos, oct_before, oct_after: octave, vol: v });
     }
+    // n 으로 시작한 음은 앞의 '&' 가 나중에 붙으므로 글 순서로 맞춘다
+    for n in notes.iter_mut() {
+        n.toks.sort_unstable();
+        n.toks.dedup();
+    }
     Ok(Part { toks, notes, end: pos })
 }
 
@@ -201,14 +206,16 @@ pub fn note_at_time(p: &Part, t: f64) -> Option<usize> {
 const NAMES: [&str; 12] = ["c", "c+", "d", "d+", "e", "f", "f+", "g", "g+", "a", "a+", "b"];
 
 fn oct_text(cur: i64, target: i64) -> String {
-    match target - cur {
-        0 => String::new(),
-        1 => ">".into(),
-        -1 => "<".into(),
-        2 => ">>".into(),
-        -2 => "<<".into(),
-        _ => format!("o{}", target),
+    let d = target - cur;
+    if d == 0 {
+        return String::new();
     }
+    // 가까우면 < > 로, 멀면 o 숫자로 (o 는 음수를 못 적으므로 그때는 < > 를 여러 번)
+    if d.abs() <= 2 || target < 0 {
+        let c = if d > 0 { '>' } else { '<' };
+        return std::iter::repeat(c).take(d.unsigned_abs() as usize).collect();
+    }
+    format!("o{}", target)
 }
 
 /// 길이 조각들 (숫자를 늘 적는다: 기본 길이 l 에 기대지 않음)
@@ -236,21 +243,88 @@ fn note_text(pitch: i64, d: f64, cur: i64, back: i64) -> Result<String, String> 
     Ok(format!("{}{}{}", oct_text(cur, oct), body.join("&"), oct_text(oct, back)))
 }
 
-fn splice(mml: &str, a: usize, b: usize, new: &str) -> String {
+/// 여러 곳을 한꺼번에 바꾼다 (글자 위치는 원래 글 기준)
+fn apply(mml: &str, mut edits: Vec<(usize, usize, String)>) -> String {
     let chars: Vec<char> = mml.chars().collect();
-    let mut s: String = chars[..a].iter().collect();
-    s += new;
-    s.extend(chars[b..].iter());
-    s
+    edits.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::new();
+    let mut at = 0;
+    for (a, b, new) in edits {
+        let a = a.max(at);
+        out.extend(chars[at..a].iter());
+        out += &new;
+        at = b.max(a);
+    }
+    out.extend(chars[at.min(chars.len())..].iter());
+    out
+}
+
+/// 길이 없는 토큰 중 건너뛰어도 되는 것 (공백, 옥타브, t v l)
+fn passable(t: &Tok) -> bool {
+    match &t.tok.kind {
+        TokKind::Space | TokKind::Sym('<') | TokKind::Sym('>') => true,
+        TokKind::Cmd { cmd, .. } => "otvl".contains(cmd.to_ascii_lowercase()),
+        _ => false,
+    }
+}
+
+/// 고칠 범위 [first, last] 바로 앞/뒤에 있는, 아무 음도 잇지 않던 '&' (고친 뒤 엉뚱한 음끼리 이어지지 않게 지운다)
+fn stray_ties(p: &Part, first: usize, last: usize) -> Vec<(usize, usize, String)> {
+    let owned = |ti: usize| p.notes.iter().any(|n| n.toks.contains(&ti));
+    let mut out = Vec::new();
+    let mut k = first;
+    while k > 0 {
+        k -= 1;
+        if matches!(p.toks[k].tok.kind, TokKind::Sym('&')) {
+            if !owned(k) {
+                out.push((p.toks[k].tok.start, p.toks[k].tok.end, String::new()));
+            }
+            break;
+        }
+        if !passable(&p.toks[k]) {
+            break;
+        }
+    }
+    for k in last + 1..p.toks.len() {
+        if matches!(p.toks[k].tok.kind, TokKind::Sym('&')) {
+            if !owned(k) {
+                out.push((p.toks[k].tok.start, p.toks[k].tok.end, String::new()));
+            }
+            break;
+        }
+        if !passable(&p.toks[k]) {
+            break;
+        }
+    }
+    out
+}
+
+/// 고친 뒤 확인: 바꾼 시간 [w0, w1) 밖의 음, 끝 시간, 템포가 그대로인지
+fn verify(old: &str, new: &str, w0: f64, w1: f64) -> Result<(), String> {
+    let (on, ot, oe) = crate::mml_parser::parse_part(old).map_err(|e| e.0)?;
+    let (nn, nt, ne) = crate::mml_parser::parse_part(new).map_err(|e| format!("고친 MML을 읽지 못했습니다: {}", e.0))?;
+    let bad = || Err("이 자리는 고치면 다른 음까지 바뀌어서 고치지 않았습니다".to_string());
+    if (oe - ne).abs() > 1e-6 || ot != nt {
+        return bad();
+    }
+    let outside = |v: &Vec<crate::model::Note>| -> Vec<(i64, i64, i64, i64)> {
+        v.iter()
+            .filter(|n| n.end <= w0 + 1e-6 || n.start >= w1 - 1e-6)
+            .map(|n| ((n.start * 8.0).round() as i64, (n.end * 8.0).round() as i64, n.pitch, n.vel.round() as i64))
+            .collect()
+    };
+    if outside(&on) != outside(&nn) {
+        return bad();
+    }
+    Ok(())
 }
 
 /// 음을 지운다: 그 자리를 같은 길이의 쉼표로 바꿔 뒤쪽 박자는 그대로
 pub fn delete_note(mml: &str, i: usize) -> Result<String, String> {
     let p = analyze(mml)?;
     let n = p.notes.get(i).ok_or("고른 음을 찾지 못했습니다")?;
-    let mut out = mml.to_string();
-    // 뒤에서부터 바꿔야 앞의 글자 위치가 안 밀린다
-    for &ti in n.toks.iter().rev() {
+    let mut edits = Vec::new();
+    for &ti in &n.toks {
         let t = &p.toks[ti].tok;
         let new = match &t.kind {
             TokKind::Note { num, dot, .. } => format!("r{}{}", num, if *dot { "." } else { "" }),
@@ -258,12 +332,15 @@ pub fn delete_note(mml: &str, i: usize) -> Result<String, String> {
             TokKind::Sym('&') => String::new(),
             _ => continue,
         };
-        out = splice(&out, t.start, t.end, &new);
+        edits.push((t.start, t.end, new));
     }
+    let out = apply(mml, edits);
+    verify(mml, &out, n.start, n.end)?;
     Ok(out)
 }
 
-/// 음 높이를 바꾼다 (길이 글자는 그대로, 옥타브는 앞뒤로 맞춰 뒤쪽 음 높이가 안 바뀌게)
+/// 음 높이를 바꾼다. 붙임줄로 이은 조각마다 글자만 바꾸고 길이·사이의 명령(템포·볼륨 등)은 그대로 둔다.
+/// 옥타브는 바꾼 음 앞뒤로 맞춰 뒤쪽 음 높이가 안 바뀌게.
 pub fn set_pitch(mml: &str, i: usize, pitch: i64) -> Result<String, String> {
     let pitch = pitch.clamp(MIN_PITCH, MAX_PITCH);
     let p = analyze(mml)?;
@@ -271,39 +348,60 @@ pub fn set_pitch(mml: &str, i: usize, pitch: i64) -> Result<String, String> {
     let (first, last) = (*n.toks.first().unwrap(), *n.toks.last().unwrap());
     let oct = pitch.div_euclid(12) - 1;
     let name = NAMES[pitch.rem_euclid(12) as usize];
-    // 붙임줄 사이에 음·& 말고 다른 것이 있으면 길이를 새로 적는다
-    let simple = (first..=last).all(|ti| n.toks.contains(&ti) || matches!(p.toks[ti].tok.kind, TokKind::Space));
-    let cur = p.toks[first].oct_before;
-    let back = p.toks[last].oct_after;
-    let new = if simple {
-        let mut body = String::new();
-        for &ti in &n.toks {
-            match &p.toks[ti].tok.kind {
-                TokKind::Note { num, dot, .. } => {
-                    body += name;
-                    body += num;
-                    if *dot {
-                        body.push('.');
-                    }
+    let mut new = String::new();
+    let mut virt = p.toks[first].oct_before; // 지금까지 적은 글의 옥타브
+    let mut pieces_done = false; // 조각 사이에는 '&' 를 조각 바로 앞에 다시 적는다
+    for ti in first..=last {
+        let t = &p.toks[ti];
+        let mine = n.toks.contains(&ti);
+        match &t.tok.kind {
+            TokKind::Sym('&') if mine => {}
+            TokKind::Note { num, dot, .. } if mine => {
+                if pieces_done {
+                    new.push('&');
                 }
-                TokKind::Cmd { .. } => return splice_n(mml, &p.toks[ti].tok, pitch),
-                TokKind::Sym('&') => body.push('&'),
-                _ => {}
+                pieces_done = true;
+                new += &oct_text(virt, oct);
+                virt = oct;
+                new += name;
+                new += num;
+                if *dot {
+                    new.push('.');
+                }
             }
+            TokKind::Cmd { cmd, .. } if mine && cmd.to_ascii_lowercase() == 'n' => {
+                // n 명령은 기본 길이를 쓰므로 그 길이를 숫자로 적는다
+                if pieces_done {
+                    new.push('&');
+                }
+                pieces_done = true;
+                new += &oct_text(virt, oct);
+                virt = oct;
+                let body: Vec<String> = pieces(t.t1 - t.t0)?.into_iter().map(|x| format!("{}{}", name, x)).collect();
+                new += &body.join("&");
+            }
+            TokKind::Sym('<') | TokKind::Sym('>') => {
+                // 옥타브를 바꾸는 글은 원래 옥타브로 돌려놓은 뒤 그대로
+                new += &oct_text(virt, t.oct_before);
+                new += &t.tok.text;
+                virt = t.oct_after;
+            }
+            TokKind::Cmd { cmd, .. } if cmd.to_ascii_lowercase() == 'o' => {
+                new += &t.tok.text;
+                virt = t.oct_after;
+            }
+            _ => new += &t.tok.text,
         }
-        format!("{}{}{}", oct_text(cur, oct), body, oct_text(oct, back))
-    } else {
-        note_text(pitch, n.end - n.start, cur, back)?
-    };
-    let (a, b) = (p.toks[first].tok.start, p.toks[last].tok.end);
-    Ok(splice(mml, a, b, &new))
+    }
+    new += &oct_text(virt, p.toks[last].oct_after);
+    let mut edits = stray_ties(&p, first, last);
+    edits.push((p.toks[first].tok.start, p.toks[last].tok.end, new));
+    let out = apply(mml, edits);
+    verify(mml, &out, n.start, n.end)?;
+    Ok(out)
 }
 
-fn splice_n(mml: &str, t: &Token, pitch: i64) -> Result<String, String> {
-    Ok(splice(mml, t.start, t.end, &format!("n{}", pitch - 12)))
-}
-
-/// 토큰 ti 부터 시간 t_end 까지 쉼표만 이어지는(옥타브·공백·& 는 건너뜀) 마지막 토큰 번호와 그 끝 시간
+/// 토큰 from 부터 시간 t_end 까지 쉼표만 이어지는(공백·옥타브는 건너뜀) 마지막 토큰 번호와 그 끝 시간
 fn rest_run(p: &Part, from: usize, t_end: f64) -> (usize, f64) {
     let mut last = from;
     let mut reach = p.toks[from].t1;
@@ -316,7 +414,7 @@ fn rest_run(p: &Part, from: usize, t_end: f64) -> (usize, f64) {
                 last = ti;
                 reach = p.toks[ti].t1;
             }
-            TokKind::Space | TokKind::Sym(_) => {}
+            TokKind::Space | TokKind::Sym('<') | TokKind::Sym('>') => {}
             TokKind::Cmd { cmd, .. } if cmd.to_ascii_lowercase() == 'o' => {}
             _ => break,
         }
@@ -330,10 +428,20 @@ pub fn set_length(mml: &str, i: usize, len: f64) -> Result<(String, f64), String
     let p = analyze(mml)?;
     let n = p.notes.get(i).ok_or("고른 음을 찾지 못했습니다")?;
     let (first, mut last) = (*n.toks.first().unwrap(), *n.toks.last().unwrap());
+    // 붙임줄 사이에 템포·볼륨·기본 길이 명령이 있으면 새로 적을 때 사라지므로 고치지 않는다
+    let inner = (first..=last).any(|ti| {
+        !n.toks.contains(&ti) && matches!(&p.toks[ti].tok.kind, TokKind::Cmd { cmd, .. } if "tvln".contains(cmd.to_ascii_lowercase()))
+    });
+    if inner {
+        return Err("이 음은 중간에 템포·볼륨 명령이 있어 길이를 바꿀 수 없습니다 (지우고 다시 넣어 주세요)".into());
+    }
     let old = n.end - n.start;
     let mut room = old;
-    if len > old + 1e-6 && last + 1 < p.toks.len() {
-        let next = (last + 1..p.toks.len()).find(|&ti| !matches!(p.toks[ti].tok.kind, TokKind::Space | TokKind::Sym('<') | TokKind::Sym('>')) && !matches!(&p.toks[ti].tok.kind, TokKind::Cmd { cmd, .. } if cmd.to_ascii_lowercase() == 'o'));
+    if len > old + 1e-6 {
+        let next = (last + 1..p.toks.len()).find(|&ti| {
+            !matches!(p.toks[ti].tok.kind, TokKind::Space | TokKind::Sym('<') | TokKind::Sym('>'))
+                && !matches!(&p.toks[ti].tok.kind, TokKind::Cmd { cmd, .. } if cmd.to_ascii_lowercase() == 'o')
+        });
         if let Some(nx) = next {
             if matches!(p.toks[nx].tok.kind, TokKind::Rest { .. }) {
                 let (l2, reach) = rest_run(&p, nx, n.start + len);
@@ -350,8 +458,11 @@ pub fn set_length(mml: &str, i: usize, len: f64) -> Result<(String, f64), String
     let back = p.toks[last].oct_after;
     let mut new = note_text(n.pitch, len, cur, back)?;
     new += &rest_text(room - len)?;
-    let (a, b) = (p.toks[first].tok.start, p.toks[last].tok.end);
-    Ok((splice(mml, a, b, &new), len))
+    let mut edits = stray_ties(&p, first, last);
+    edits.push((p.toks[first].tok.start, p.toks[last].tok.end, new));
+    let out = apply(mml, edits);
+    verify(mml, &out, n.start, n.start + room)?;
+    Ok((out, len))
 }
 
 /// 시간 t 의 쉼표 자리에 음을 넣는다 (쉼표를 쪼갬). 파트가 t 전에 끝나면 쉼표를 붙여 늘린다.
@@ -370,9 +481,9 @@ pub fn insert_note(mml: &str, t: f64, pitch: i64, len: f64, limit: f64) -> Resul
         // 파트 끝 뒤: 쉼표 + 음을 덧붙인다
         let len = len.min(limit - t);
         let oct = p.toks.last().map(|x| x.oct_after).unwrap_or(4);
-        let vol = p.toks.iter().rev().find_map(|x| match &x.tok.kind {
-            TokKind::Cmd { cmd, val, .. } if cmd.to_ascii_lowercase() == 'v' => Some(*val),
-            _ => None,
+        let vol = p.toks.last().map(|x| match &x.tok.kind {
+            TokKind::Cmd { cmd, val, .. } if cmd.to_ascii_lowercase() == 'v' => (*val).min(15),
+            _ => x.vol,
         });
         let mut add = rest_text(t - p.end)?;
         if vol == Some(0) {
@@ -382,8 +493,16 @@ pub fn insert_note(mml: &str, t: f64, pitch: i64, len: f64, limit: f64) -> Resul
         if vol == Some(0) {
             add += "v0";
         }
-        let mut out = mml.trim_end().to_string();
-        out += &add;
+        // 끝에 남은 '&' 는 새 음을 앞 음에 잇게 되므로 지운다
+        let mut edits = if p.toks.is_empty() { vec![] } else { stray_ties(&p, p.toks.len(), p.toks.len()) };
+        let end = mml.chars().count();
+        let trimmed = mml.trim_end().chars().count();
+        edits.push((trimmed, end, add));
+        let out = apply(mml, edits);
+        let (nn, _, _) = crate::mml_parser::parse_part(&out).map_err(|e| e.0)?;
+        if nn.len() != p.notes.len() + 1 {
+            return Err("그 자리에 넣을 수 없습니다".into());
+        }
         return Ok((out, new_idx, len));
     }
     // t 를 덮는 쉼표 토큰
@@ -417,8 +536,15 @@ pub fn insert_note(mml: &str, t: f64, pitch: i64, len: f64, limit: f64) -> Resul
         new += "v0";
     }
     new += &rest_text(reach - t - len)?;
-    let (a, b) = (p.toks[first].tok.start, p.toks[last].tok.end);
-    Ok((splice(mml, a, b, &new), new_idx, len))
+    let mut edits = stray_ties(&p, first, last);
+    edits.push((p.toks[first].tok.start, p.toks[last].tok.end, new));
+    let out = apply(mml, edits);
+    verify(mml, &out, ta, reach)?;
+    let (nn, _, _) = crate::mml_parser::parse_part(&out).map_err(|e| e.0)?;
+    if nn.len() != p.notes.len() + 1 {
+        return Err("그 자리에 넣을 수 없습니다".into());
+    }
+    Ok((out, new_idx, len))
 }
 
 #[cfg(test)]
@@ -512,6 +638,117 @@ mod tests {
         let (n, _, _) = parse_part(&out).unwrap();
         assert_eq!(n.len(), 1);
         same("v0c4r4c4", &out);
+    }
+
+    #[test]
+    fn review_cases() {
+        // 붙임줄 사이 템포는 그대로
+        let out = set_pitch("t120c2t90&c2d4", 0, 62).unwrap();
+        same("t120c2t90&c2d4", &out);
+        assert_eq!(parse_part(&out).unwrap().1, parse_part("t120c2t90&c2d4").unwrap().1);
+        assert_eq!(parse_part(&out).unwrap().0[0].pitch, 62);
+        assert!(set_length("t120c2t90&c2d4", 0, 96.0).is_err());
+        let out = set_pitch("c&l8c c", 0, 62).unwrap();
+        same("c&l8c c", &out);
+        let out = set_pitch("c4&v15c4 d4", 0, 62).unwrap();
+        assert_eq!(parse_part(&out).unwrap().0[1].vel, parse_part("c4&v15c4 d4").unwrap().0[1].vel);
+        // 아무것도 잇지 않던 & 때문에 붙어 버리지 않게
+        let out = set_pitch("d&e", 1, 62).unwrap();
+        assert_eq!(parse_part(&out).unwrap().0.len(), 2);
+        let out = set_pitch("d&e", 0, 64).unwrap();
+        assert_eq!(parse_part(&out).unwrap().0.len(), 2);
+        let (out, _) = set_length("c4r4&c4", 0, 192.0).unwrap();
+        assert_eq!(parse_part(&out).unwrap().0.len(), 2);
+        let (out, i, _) = insert_note("c4&r4", 96.0, 60, 96.0, 384.0).unwrap();
+        assert_eq!((parse_part(&out).unwrap().0.len(), i), (2, 1));
+        let (out, i, _) = insert_note("r4&c4", 0.0, 60, 96.0, 384.0).unwrap();
+        assert_eq!((parse_part(&out).unwrap().0.len(), i), (2, 0));
+        let (out, _, _) = insert_note("c4&", 96.0, 60, 96.0, 384.0).unwrap();
+        assert_eq!(parse_part(&out).unwrap().0.len(), 2);
+        // n 뒤로 이어진 음
+        let out = delete_note("c&n48c", 1).unwrap();
+        assert_eq!(parse_part(&out).unwrap().0.len(), 1);
+        let out = set_pitch("c&n48c", 1, 62).unwrap();
+        let n = parse_part(&out).unwrap().0;
+        assert_eq!((n.len(), n[1].pitch, n[1].end), (2, 62, 288.0));
+        // 음수 옥타브
+        assert!(parse_part(&set_pitch("o0<c", 0, 60).unwrap_or_default()).is_ok());
+    }
+
+    /// 무작위 MML 로 모든 편집을 해 보고, 되는 경우 결과가 맞는지 (안 되면 오류만, 멈추지 않음)
+    #[test]
+    fn fuzz_edits() {
+        let mut seed: u64 = 0x2545F4914F6CDD1D;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        const LENS: [&str; 8] = ["", "1", "2", "4", "8", "16", "3", "6"];
+        for _ in 0..4000 {
+            let mut m = String::new();
+            let mut oct = 4i64;
+            for _ in 0..rnd(14) + 1 {
+                match rnd(16) {
+                    0..=6 => {
+                        m.push(['c', 'd', 'e', 'f', 'g', 'a', 'b', 'C'][rnd(8) as usize]);
+                        m += ["", "+", "#", "-"][rnd(4) as usize];
+                        m += LENS[rnd(8) as usize];
+                        if rnd(5) == 0 {
+                            m.push('.');
+                        }
+                    }
+                    7 | 8 => {
+                        m.push('r');
+                        m += LENS[rnd(8) as usize];
+                    }
+                    9 => m.push('&'),
+                    10 => {
+                        if oct < 7 {
+                            m.push('>');
+                            oct += 1;
+                        }
+                    }
+                    11 => {
+                        if oct > 2 {
+                            m.push('<');
+                            oct -= 1;
+                        }
+                    }
+                    12 => m += &format!("l{}{}", ["4", "8", "16", "2"][rnd(4) as usize], if rnd(4) == 0 { "." } else { "" }),
+                    13 => m += &format!("v{}", rnd(16)),
+                    14 => m += &format!("t{}", 60 + rnd(100)),
+                    _ => m += &format!("n{}", 40 + rnd(30)),
+                }
+            }
+            let Ok((notes, _, end)) = parse_part(&m) else { continue };
+            for i in 0..notes.len() {
+                if let Ok(out) = delete_note(&m, i) {
+                    let n2 = parse_part(&out).unwrap().0;
+                    assert_eq!(n2.len() + 1, notes.len(), "delete {} {}", m, i);
+                }
+                let want = 36 + rnd(60) as i64;
+                if let Ok(out) = set_pitch(&m, i, want) {
+                    let n2 = parse_part(&out).unwrap().0;
+                    assert_eq!(n2.len(), notes.len(), "pitch {} {} -> {}", m, i, out);
+                    assert_eq!((n2[i].pitch, n2[i].start, n2[i].end), (want, notes[i].start, notes[i].end), "pitch {} {} -> {}", m, i, out);
+                }
+                let len = [24.0, 48.0, 96.0, 144.0, 192.0][rnd(5) as usize];
+                if let Ok((out, got)) = set_length(&m, i, len) {
+                    let n2 = parse_part(&out).unwrap().0;
+                    assert_eq!(n2.len(), notes.len(), "len {} {} -> {}", m, i, out);
+                    assert!((n2[i].end - n2[i].start - got).abs() < 1e-6 && got <= len + 1e-6, "len {} {} -> {}", m, i, out);
+                }
+            }
+            let t = (rnd(16) * 24) as f64;
+            if let Ok((out, idx, got)) = insert_note(&m, t, 64, 96.0, end.max(t + 1.0) + 192.0) {
+                let n2 = parse_part(&out).unwrap().0;
+                assert_eq!(n2.len(), notes.len() + 1, "insert {} {} -> {}", m, t, out);
+                assert_eq!((n2[idx].start, n2[idx].pitch), (t, 64), "insert {} {} -> {}", m, t, out);
+                assert!((n2[idx].end - t - got).abs() < 1e-6);
+            }
+        }
     }
 
     #[test]
