@@ -3177,9 +3177,11 @@ impl App {
         let p = self.pal;
         let tab_before = self.tab;
         // 안내 칸 (아래)
-        let warn_h = warn_lines * 17.0 + 8.0;
+        // 스크롤 칸은 64 보다 작아지지 않는다 (egui 기본 최소 높이)
+        let warn_h = (warn_lines * 17.0 + 8.0).max(64.0);
         let avail = ui.available_height();
-        let tabs_h = (avail - warn_h - 10.0).max(120.0);
+        // 아래 안내 칸: 글 높이 + 테두리·여백(14) + 사이 간격(4). 그만큼을 빼고 남은 높이만 위에 쓴다
+        let tabs_h = (avail - warn_h - 14.0 - 4.0 - 6.0).max(120.0);
         ui.allocate_ui(egui::vec2(ui.available_width(), tabs_h), |ui| {
             let count = self.score_texts.len();
             let res_opt = self.result.clone();
@@ -3292,7 +3294,9 @@ impl App {
                 });
             });
             egui::Frame::none().fill(p.panel).stroke(egui::Stroke::new(1.0f32, p.line)).inner_margin(6.0).show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("mml").auto_shrink([false, false]).show(ui, |ui| {
+                // 테두리 여백(6+6+2)만큼 줄여서 아래 안내 칸을 밀어내지 않게
+                let mml_h = (ui.available_height() - 14.0).max(40.0);
+                egui::ScrollArea::vertical().id_salt("mml").max_height(mml_h).auto_shrink([false, false]).show(ui, |ui| {
                     // 악보에서 고른 음을 칠한다
                     let mark = self.mml_mark.filter(|m| m.0 == i && m.2 > m.1).map(|m| (m.1, m.2));
                     let ink = ui.visuals().text_color();
@@ -3982,7 +3986,7 @@ pub fn run(files: Vec<String>) -> eframe::Result<()> {
     let pal = theme::palette(&saved.color_theme);
     let mut vb = egui::ViewportBuilder::default()
         .with_title(format!("마비노기 MML 변환기 v{}", VERSION))
-        .with_inner_size([1540.0, 900.0])
+        .with_inner_size([1540.0, std::env::var("MABIMML_SHOT_HEIGHT").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(900.0)])
         .with_min_inner_size([1080.0, 620.0])
         .with_drag_and_drop(true)
         .with_app_id("MabiMML.Converter");
