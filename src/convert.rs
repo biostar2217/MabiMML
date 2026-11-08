@@ -1267,8 +1267,14 @@ pub fn convert_song(song: &Song, opts: &Options) -> Res<ConvResult> {
         }
         return Ok(res);
     }
+    // 붙여넣은 MML 은 원본 그대로 나누되, 합주로 나누기를 켰으면 합주자로 다시 나눈다
     if opts.keep_original && song.raw_parts.as_ref().map(|r| r.len() <= 3).unwrap_or(false) {
-        return split_original(song, opts);
+        if !opts.ensemble {
+            return split_original(song, opts);
+        }
+        let mut res = convert_song(song, &Options { keep_original: false, ..opts.clone() })?;
+        res.warnings.insert(0, "합주로 나누기를 켜서 붙여넣은 MML을 원본 그대로 나누지 않고 합주자로 나눴습니다".into());
+        return Ok(res);
     }
     if opts.split_players && song.source == "mml" && song.tracks.iter().skip(3).any(|t| !t.notes.is_empty()) {
         return split_players(song, opts);
