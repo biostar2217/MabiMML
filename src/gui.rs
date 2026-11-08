@@ -2141,45 +2141,64 @@ impl App {
 
     fn top_row(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            if self.accent(ui, "파일 열기…").clicked() {
+            if self.accent(ui, "파일 열기…").on_hover_text("MIDI, MusicXML, 악보 PDF·그림, MML 텍스트. 창에 끌어다 놓아도 됩니다").clicked() {
                 self.open_file();
             }
-            ui.checkbox(&mut self.other.re_ocr, "다시 인식 (PDF)");
-            if ui.button("MML 직접 입력").clicked() {
-                self.direct_open = true;
-            }
-            if ui.button("클립보드에서 MML 읽기").clicked() {
-                self.paste_mobile();
-            }
-            if ui.button("초기화").clicked() {
-                self.dialogs.push(Dialog::ConfirmReset);
-            }
-            if ui.button("모바일용 저장…").on_hover_text("한 사람 6파트, 파트마다 2400자, 빈틈 메우기로 바꿔 저장합니다. 첫 장은 클립보드에 복사").clicked() {
-                let ctx = ui.ctx().clone();
-                self.mobile_export(&ctx);
-            }
+            ui.checkbox(&mut self.other.re_ocr, "다시 인식").on_hover_text("PDF 악보를 열 때 예전 인식 결과를 쓰지 않고 새로 인식합니다");
+            ui.menu_button("MML 넣기 ▼", |ui| {
+                if ui.button("클립보드에서 MML 읽기").clicked() {
+                    self.paste_mobile();
+                    ui.close_menu();
+                }
+                if ui.button("MML 직접 입력…").clicked() {
+                    self.direct_open = true;
+                    ui.close_menu();
+                }
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Audiveris 위치 설정…").clicked() {
-                    self.pick_audiveris();
+                ui.menu_button("더보기 ▼", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("색 테마");
+                        let mut t = self.saved.color_theme.clone();
+                        if Self::combo(ui, "theme", &mut t, &theme::THEME_NAMES, 80.0) {
+                            self.saved.color_theme = t;
+                            self.save_settings();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("업데이트 확인").clicked() {
+                        self.start_update_check(true);
+                        ui.close_menu();
+                    }
+                    if ui.checkbox(&mut self.update_on_start, "시작할 때 업데이트 확인 (하루 한 번)").changed() {
+                        updater::set_auto_check(self.update_on_start);
+                    }
+                    if ui.button("Audiveris 위치 설정…").on_hover_text("악보 PDF 인식에 쓰는 프로그램 위치").clicked() {
+                        self.pick_audiveris();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("모든 설정 초기화…").clicked() {
+                        self.dialogs.push(Dialog::ConfirmReset);
+                        ui.close_menu();
+                    }
+                });
+                let label = if self.folded { "◀ 설정 펼치기" } else { "설정 접기 ▶" };
+                if ui.button(label).on_hover_text("왼쪽 설정 칸을 접거나 펼칩니다").clicked() {
+                    self.folded = !self.folded;
                 }
-                if ui.button("업데이트 확인").clicked() {
-                    self.start_update_check(true);
-                }
-                let mut t = self.saved.color_theme.clone();
-                if Self::combo(ui, "theme", &mut t, &theme::THEME_NAMES, 70.0) {
-                    self.saved.color_theme = t;
-                    self.save_settings();
-                }
-                ui.label("색 테마");
             });
         });
     }
 
     fn tracks_box(&mut self, ui: &mut Ui, height: f32) {
         let p = self.pal;
-        group(ui, &p, "트랙 배정 (자동: 위 성부부터 멜로디 → 화음1 → 화음2)", |ui| {
-            ui.add(egui::Label::new(RichText::new(format!("파일: {}", self.file_label)).color(p.muted)).truncate());
-            egui::ScrollArea::vertical().id_salt("tracks").max_height(height).min_scrolled_height(height).auto_shrink([false, false]).show(ui, |ui| {
+        group(ui, &p, "트랙 배정", |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(RichText::new(format!("파일: {}", self.file_label)).color(p.muted)).truncate());
+            });
+            ui.label(RichText::new("자동: 위 성부부터 멜로디 → 화음1 → 화음2").size(12.0).color(p.muted));
+            egui::ScrollArea::vertical().id_salt("tracks").max_height(height).auto_shrink([false, true]).show(ui, |ui| {
                 if let Some(song) = &self.song {
                     let labels: Vec<&str> = ROLE_LABELS.iter().map(|x| x.0).collect();
                     for (i, t) in song.tracks.iter().enumerate() {
@@ -2188,7 +2207,7 @@ impl App {
                                 Self::combo(ui, &format!("role{}", i), &mut self.roles[i], &labels, 70.0);
                             }
                             let drum = if t.is_drum { " [드럼]" } else { "" };
-                            ui.label(format!("{}. {}{} — {}", i + 1, t.name, drum, t.describe()));
+                            ui.add(egui::Label::new(format!("{}. {}{} — {}", i + 1, t.name, drum, t.describe())).truncate());
                         });
                     }
                 }
@@ -2196,209 +2215,228 @@ impl App {
         });
     }
 
-    fn settings_box(&mut self, ui: &mut Ui) {
+    /// 왼쪽 설정 칸: 자주 쓰는 것은 펼쳐 두고, 세부 설정은 접어 둔다
+    fn options_panel(&mut self, ui: &mut Ui) {
         let p = self.pal;
-        group(ui, &p, "설정", |ui| {
-            egui::Grid::new("settings").num_columns(6).spacing([10.0, 5.0]).show(ui, |ui| {
-                let ranks: Vec<&str> = rank_order();
-                ui.label("작곡 랭크");
-                Self::combo(ui, "rank", &mut self.other.rank, &ranks, 70.0);
-                ui.label("양자화 격자");
-                ui.add_enabled_ui(self.other.quality != QUALITY_AUTO, |ui| {
-                    let mut g = self.other.grid.to_string();
-                    if Self::combo(ui, "grid", &mut g, &["8", "16", "32", "64"], 50.0) {
-                        self.other.grid = g.parse().unwrap_or(64);
-                        self.detail_changed();
-                    }
-                });
-                ui.label("셋잇단");
-                Self::combo(ui, "triplet", &mut self.other.triplet, &TRIPLET_LABELS.map(|x| x.0), 100.0);
-                ui.end_row();
+        let before = self.saved.clone();
+        let head = |t: &str| RichText::new(t).font(theme::bold(14.0)).color(p.wine);
+        egui::ScrollArea::vertical().id_salt("options").auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            // ── 기본
+            egui::CollapsingHeader::new(head("기본")).id_salt("sec_basic").default_open(true).show(ui, |ui| {
+                egui::Grid::new("g_basic").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("작곡 랭크");
+                    let ranks: Vec<&str> = rank_order();
+                    Self::combo(ui, "rank", &mut self.other.rank, &ranks, 80.0);
+                    ui.end_row();
 
-                ui.label("볼륨");
-                Self::combo(ui, "volume", &mut self.other.volume, &VOLUME_LABELS.map(|x| x.0), 100.0);
-                ui.label("고정 볼륨값");
-                ui.add(egui::DragValue::new(&mut self.other.fixed_vol).range(1..=15));
-                ui.label("");
-                ui.label("");
-                ui.end_row();
+                    ui.label("변환 품질");
+                    let mut q: Vec<&str> = QUALITY_PRESETS.iter().map(|x| x.0).collect();
+                    q.push(QUALITY_AUTO);
+                    let mut quality = self.other.quality.clone();
+                    if Self::combo(ui, "quality", &mut quality, &q, 150.0) {
+                        self.other.quality = quality;
+                        self.quality_chosen();
+                    }
+                    ui.end_row();
 
-                ui.label("빠르기(%)");
-                ui.horizontal(|ui| {
-                    if ui.button("느리게").clicked() {
-                        self.other.speed = (self.other.speed - 10).clamp(10, 400);
-                    }
-                    ui.add(egui::DragValue::new(&mut self.other.speed).range(10..=400).speed(1.0));
-                    if ui.button("빠르게").clicked() {
-                        self.other.speed = (self.other.speed + 10).clamp(10, 400);
-                    }
-                });
-                ui.label("템포 고정(0=원곡)");
-                ui.add(egui::DragValue::new(&mut self.other.fixed_bpm).range(0..=255));
-                ui.label(self.tempo_label.clone());
-                ui.label("");
-                ui.end_row();
+                    ui.label("연주 악기");
+                    let names: Vec<&str> = INSTRUMENTS.iter().map(|x| x.0).collect();
+                    Self::combo(ui, "instrument", &mut self.saved.instrument, &names, 150.0);
+                    ui.end_row();
 
-                ui.label("앞 자르기");
-                ui.add(egui::DragValue::new(&mut self.other.cut_start).range(0..=7200).custom_formatter(|v, _| fmt_clock(v * 1000.0)))
-                    .on_hover_text("이 시각 전은 버립니다 (그 시각이 든 마디 처음부터 남김). 0:00 은 자르지 않음");
-                ui.label("뒤 자르기");
-                ui.add(egui::DragValue::new(&mut self.other.cut_end).range(0..=7200).custom_formatter(|v, _| if v <= 0.0 { "끝까지".into() } else { fmt_clock(v * 1000.0) }))
-                    .on_hover_text("이 시각 뒤는 버립니다 (그 시각이 든 마디 끝까지 남김)");
-                ui.label("");
-                ui.label("");
-                ui.end_row();
+                    ui.label("글자 수 넘으면");
+                    Self::combo(ui, "fit", &mut self.other.fit, &FIT_LABELS.map(|x| x.0), 150.0);
+                    ui.end_row();
 
-                ui.label("변환 품질");
-                let mut q: Vec<&str> = QUALITY_PRESETS.iter().map(|x| x.0).collect();
-                q.push(QUALITY_AUTO);
-                let mut quality = self.other.quality.clone();
-                if Self::combo(ui, "quality", &mut quality, &q, 130.0) {
-                    self.other.quality = quality;
-                    self.quality_chosen();
-                }
-                ui.label("볼륨 변화 최소");
-                ui.add_enabled_ui(self.other.quality != QUALITY_AUTO, |ui| {
-                    if ui.add(egui::DragValue::new(&mut self.other.vol_step).range(1..=15)).changed() {
-                        self.detail_changed();
-                    }
-                });
-                ui.label("페달");
-                Self::combo(ui, "sustain", &mut self.saved.sustain, &SUSTAIN_LABELS.map(|x| x.0), 110.0);
-                ui.end_row();
-            });
-            ui.horizontal(|ui| {
-                ui.label("글자 수 초과 시");
-                Self::combo(ui, "fit", &mut self.other.fit, &FIT_LABELS.map(|x| x.0), 130.0);
-                ui.add_space(10.0);
-                ui.checkbox(&mut self.other.tempo_all, "템포를 모든 파트에 기록 (음 중간 쪼갬)");
-                ui.add_space(10.0);
-                ui.checkbox(&mut self.other.no_song, "노래 파트 제외 한도");
-            });
-            ui.horizontal(|ui| {
-                ui.label("음 높이");
-                ui.add(egui::DragValue::new(&mut self.other.transpose).range(-48..=48));
-                ui.label("반음");
-                for (text, delta) in [("옥타브 ▼", Some(-12)), ("옥타브 ▲", Some(12)), ("반음 ▼", Some(-1)), ("반음 ▲", Some(1)), ("원래대로", None)] {
-                    if ui.small_button(text).clicked() {
-                        self.nudge_pitch(delta);
-                    }
-                }
-                ui.label(RichText::new(self.pitch_text()).font(theme::bold(13.0)).color(p.wine));
-            });
-        });
-    }
-
-    fn play_box(&mut self, ui: &mut Ui) {
-        let p = self.pal;
-        group(ui, &p, "연주 맞춤", |ui| {
-            let before = self.saved.clone();
-            ui.horizontal(|ui| {
-                ui.label("연주 악기");
-                let names: Vec<&str> = INSTRUMENTS.iter().map(|x| x.0).collect();
-                Self::combo(ui, "instrument", &mut self.saved.instrument, &names, 130.0);
-                ui.checkbox(&mut self.saved.low_limit, "o2e 아래 음 올리기");
-                ui.checkbox(&mut self.saved.align, "MIDI 시작을 마디선에 맞추기");
-                ui.label("짧은 빈틈 메우기");
-                Self::combo(ui, "gaps", &mut self.saved.gap_mode, &GAP_LABELS.map(|x| x.0), 70.0);
-            });
-            ui.horizontal(|ui| {
-                ui.label("파트 음량 (-7~7)");
-                for k in 0..3 {
-                    ui.label(PART_NAMES[k]);
-                    ui.add(egui::DragValue::new(&mut self.saved.part_vol[k]).range(-7..=7));
-                }
-                ui.add_space(12.0);
-                ui.checkbox(&mut self.saved.v0_tempo, "템포 앞 쉼표를 v0 음표로 (64비트 이전용)");
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.saved.ensemble_fix, "64비트 합주 밀림 보정");
-                ui.add_space(12.0);
-                ui.checkbox(&mut self.saved.split_players, "모바일 MML을 두 사람 악보로 (1~3, 4~6파트)");
-                ui.add_space(12.0);
-                ui.checkbox(&mut self.saved.compact, "글자 수 줄이기 (n번호, c-·b+ 표기)")
-                    .on_hover_text("멀리 떨어진 한 음은 n번호로, 옥타브 경계 음은 c-·b+ 로 적어 옥타브 바꿈 글자를 줄입니다");
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.saved.ensemble, "합주")
-                    .on_hover_text("곡을 여러 사람이 함께 치도록 나눕니다. 합주자마다 멜로디·화음1·화음2 악보가 따로 생깁니다");
-                ui.add_enabled_ui(self.saved.ensemble, |ui| {
-                    ui.label("나누기");
-                    Self::combo(ui, "ensemble_by", &mut self.saved.ensemble_by, &ENSEMBLE_BY, 120.0);
-                    ui.label("합주자 수");
-                    Self::combo(ui, "players", &mut self.saved.players, &PLAYER_CHOICES, 60.0);
-                });
-            });
-            if self.saved.ensemble {
-                // 설명은 따로 한 줄 (길어서 창 밖으로 밀리지 않게 줄바꿈)
-                let hint = if self.saved.ensemble_by == ENSEMBLE_BY[1] {
-                    "원곡 트랙의 악기마다 합주자를 두고 어울리는 마비노기 악기를 정합니다. 합주자 수를 정하면 그 인원에 맞춰 악기를 합쳐 압축합니다 (자동은 필요한 만큼)"
-                } else {
-                    "자동: 음을 빼지 않고 한 사람이 악보 한 장에 들어가는 가장 적은 인원 (2~8명). 드럼 합주자는 인원에 세지 않습니다"
-                };
-                ui.add(egui::Label::new(RichText::new(hint).color(p.muted).size(12.0)).wrap());
-            }
-            if self.saved.ensemble {
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut self.saved.drums, "드럼 트랙은 드럼 세트 합주자로");
-                    ui.checkbox(&mut self.saved.auto_bass, "베이스 자동으로 만들기")
-                        .on_hover_text("곡 화음의 가장 낮은 음을 따라 베이스 합주자를 만듭니다 (모양은 옆의 기본/풍성하게/단순하게)");
-                    ui.checkbox(&mut self.saved.auto_drums, "드럼이 없으면 자동으로 만들기")
-                        .on_hover_text("곡에 드럼 트랙이 없으면 박자에 맞춘 드럼(킥·스네어·하이햇, 8마디마다 크래시)을 만들어 드럼 세트 합주자로 넣습니다");
-                    if self.saved.auto_drums || self.saved.auto_bass {
-                        Self::combo(ui, "drum_style", &mut self.saved.drum_style, &crate::convert::DRUM_STYLES, 80.0);
-                    }
-                    ui.checkbox(&mut self.saved.drum_compact, "드럼 글자 아끼기")
-                        .on_hover_text("고스트 스네어와 8분음표보다 잘게 친 하이햇을 빼고 볼륨을 한 가지로 적어 드럼 MML 글자를 줄입니다");
-                    ui.checkbox(&mut self.saved.drum_merge, "드럼 장 합치기")
-                        .on_hover_text("드럼 합주자는 한도 안에서 여러 장을 한 장으로 합칩니다. 다른 합주자가 장을 바꾸는 자리에는 아래 박 수만큼 쉼을 넣습니다");
-                    if self.saved.drum_merge {
-                        ui.label("장 바꿈 쉼");
-                        ui.add(egui::DragValue::new(&mut self.saved.drum_merge_rest).range(0.0..=16.0).speed(0.25).fixed_decimals(2).suffix("박"))
-                            .on_hover_text("다른 합주자가 다음 장을 시작하는 데 걸리는 시간만큼 드럼이 쉬게 합니다. 게임에서 해 보고 맞추세요");
-                    }
-                });
-                // 합주자 악기: 창 폭에 맞춰 한 줄에 몇 개씩 나눠 놓는다 (창 밖으로 잘리지 않게)
-                let per_row = (((ui.available_width() - 90.0) / 132.0).floor() as usize).clamp(1, 8);
-                ui.horizontal(|ui| {
-                    ui.label("합주자 악기");
-                    // 지금 결과의 합주자 수(드럼 제외)만큼, 없으면 고른 인원만큼
-                    let shown = self
-                        .result
-                        .as_ref()
-                        .map(|r| r.players().into_iter().filter(|&pl| !r.scores.iter().any(|s| s.player == pl && s.instrument == crate::convert::DRUM_KIT)).count())
-                        .filter(|&n| n > 0)
-                        .unwrap_or_else(|| self.saved.players.parse().unwrap_or(2))
-                        .clamp(1, 8);
-                    if self.saved.player_insts.len() < shown {
-                        self.saved.player_insts.resize(shown, String::new());
-                    }
-                    let mut names: Vec<&str> = vec![PLAYER_INST_DEFAULT];
-                    names.extend(INSTRUMENTS.iter().map(|x| x.0));
-                    ui.vertical(|ui| {
-                        for row in (0..shown).collect::<Vec<_>>().chunks(per_row) {
-                            ui.horizontal(|ui| {
-                                for &k in row {
-                                    ui.label(format!("{}", k + 1));
-                                    let mut v = if self.saved.player_insts[k].is_empty() { PLAYER_INST_DEFAULT.to_string() } else { self.saved.player_insts[k].clone() };
-                                    if Self::combo(ui, &format!("pinst{}", k), &mut v, &names, 96.0) {
-                                        self.saved.player_insts[k] = if v == PLAYER_INST_DEFAULT { String::new() } else { v };
-                                    }
-                                }
-                            });
+                    ui.label("빠르기");
+                    ui.horizontal(|ui| {
+                        if ui.small_button("−10").clicked() {
+                            self.other.speed = (self.other.speed - 10).clamp(10, 400);
+                        }
+                        ui.add(egui::DragValue::new(&mut self.other.speed).range(10..=400).suffix("%"));
+                        if ui.small_button("+10").clicked() {
+                            self.other.speed = (self.other.speed + 10).clamp(10, 400);
                         }
                     });
+                    ui.end_row();
+
+                    ui.label("음 높이");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.other.transpose).range(-48..=48).suffix(" 반음"));
+                        if ui.small_button("원래대로").clicked() {
+                            self.nudge_pitch(None);
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("");
+                    ui.horizontal(|ui| {
+                        for (text, delta) in [("옥타브 ▼", -12), ("옥타브 ▲", 12), ("반음 ▼", -1), ("반음 ▲", 1)] {
+                            if ui.small_button(text).clicked() {
+                                self.nudge_pitch(Some(delta));
+                            }
+                        }
+                    });
+                    ui.end_row();
                 });
-            }
-            ui.checkbox(&mut self.saved.keep_original, "붙여넣은 3파트 MML은 원본 그대로 나누기 (편곡 없음. 랭크, 한도, 글자 수 초과 시, 조옮김만 적용)");
-            ui.checkbox(&mut self.saved.jabchiel, "자브키엘 악보집용 (여러 장일 때 장마다 세 파트 길이를 맞추고 템포를 모든 파트에)");
-            if ui.checkbox(&mut self.update_on_start, "시작할 때 업데이트 확인 (하루 한 번)").changed() {
-                updater::set_auto_check(self.update_on_start);
-            }
-            if self.saved != before {
-                self.save_settings();
-            }
+                ui.label(RichText::new(self.pitch_text()).size(12.0).color(p.wine));
+                if !self.tempo_label.is_empty() {
+                    ui.label(RichText::new(&self.tempo_label).size(12.0).color(p.muted));
+                }
+            });
+
+            // ── 합주
+            egui::CollapsingHeader::new(head("합주")).id_salt("sec_ensemble").default_open(true).show(ui, |ui| {
+                ui.checkbox(&mut self.saved.ensemble, "합주로 나누기")
+                    .on_hover_text("곡을 여러 사람이 함께 치도록 나눕니다. 합주자마다 멜로디·화음1·화음2 악보가 따로 생깁니다");
+                if !self.saved.ensemble {
+                    ui.label(RichText::new("켜면 합주자 수, 합주자 악기, 자동 베이스·드럼을 고를 수 있어요").size(12.0).color(p.muted));
+                    return;
+                }
+                egui::Grid::new("g_ens").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("나누는 방식");
+                    Self::combo(ui, "ensemble_by", &mut self.saved.ensemble_by, &ENSEMBLE_BY, 130.0)
+                        ;
+                    ui.end_row();
+                    ui.label("합주자 수");
+                    Self::combo(ui, "players", &mut self.saved.players, &PLAYER_CHOICES, 70.0);
+                    ui.end_row();
+                });
+                let hint = if self.saved.ensemble_by == ENSEMBLE_BY[1] {
+                    "원곡 트랙 악기마다 합주자를 둡니다. 인원을 정하면 악기를 합쳐 맞춥니다"
+                } else {
+                    "자동: 음을 빼지 않고 한 사람이 한 장에 들어가는 가장 적은 인원"
+                };
+                ui.add(egui::Label::new(RichText::new(hint).size(12.0).color(p.muted)).wrap());
+
+                // 합주자 악기
+                let shown = self
+                    .result
+                    .as_ref()
+                    .map(|r| r.players().into_iter().filter(|&pl| !r.scores.iter().any(|s| s.player == pl && (s.instrument == crate::convert::DRUM_KIT))).count())
+                    .filter(|&n| n > 0)
+                    .unwrap_or_else(|| self.saved.players.parse().unwrap_or(2))
+                    .clamp(1, 8);
+                if self.saved.player_insts.len() < shown {
+                    self.saved.player_insts.resize(shown, String::new());
+                }
+                let mut names: Vec<&str> = vec![PLAYER_INST_DEFAULT];
+                names.extend(INSTRUMENTS.iter().map(|x| x.0));
+                ui.label(RichText::new("합주자 악기").strong());
+                let per_row = (((ui.available_width()) / 150.0).floor() as usize).clamp(1, 4);
+                egui::Grid::new("g_pinst").num_columns(per_row * 2).spacing([6.0, 4.0]).show(ui, |ui| {
+                    for k in 0..shown {
+                        ui.label(format!("{}", k + 1));
+                        let mut v = if self.saved.player_insts[k].is_empty() { PLAYER_INST_DEFAULT.to_string() } else { self.saved.player_insts[k].clone() };
+                        if Self::combo(ui, &format!("pinst{}", k), &mut v, &names, 110.0) {
+                            self.saved.player_insts[k] = if v == PLAYER_INST_DEFAULT { String::new() } else { v };
+                        }
+                        if (k + 1) % per_row == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(RichText::new("베이스·드럼").strong());
+                ui.checkbox(&mut self.saved.auto_bass, "베이스 자동으로 만들기").on_hover_text("곡 화음의 가장 낮은 음을 따라 베이스 합주자를 만듭니다");
+                ui.checkbox(&mut self.saved.drums, "드럼 트랙은 드럼 합주자로").on_hover_text("MIDI 드럼 트랙을 마비노기 드럼 세트 합주자로 옮깁니다");
+                ui.checkbox(&mut self.saved.auto_drums, "드럼이 없으면 자동으로 만들기")
+                    .on_hover_text("드럼 트랙이 없는 곡에 박자에 맞춘 드럼(킥·스네어·하이햇, 크래시와 필인)을 만듭니다");
+                if self.saved.auto_drums || self.saved.auto_bass {
+                    ui.horizontal(|ui| {
+                        ui.label("자동 반주 모양");
+                        Self::combo(ui, "drum_style", &mut self.saved.drum_style, &crate::convert::DRUM_STYLES, 90.0);
+                    });
+                }
+                ui.checkbox(&mut self.saved.drum_compact, "드럼 글자 아끼기")
+                    .on_hover_text("고스트 스네어와 8분음표보다 잘게 친 하이햇을 빼고 볼륨을 한 가지로 적습니다");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.saved.drum_merge, "드럼 장 합치기")
+                        .on_hover_text("드럼 합주자는 한도 안에서 여러 장을 한 장으로 합칩니다. 다른 합주자가 장을 바꾸는 자리에는 쉼을 넣습니다");
+                    if self.saved.drum_merge {
+                        ui.add(egui::DragValue::new(&mut self.saved.drum_merge_rest).range(0.0..=16.0).speed(0.25).fixed_decimals(2).prefix("쉼 ").suffix("박"))
+                            .on_hover_text("다른 합주자가 다음 장을 시작하는 데 걸리는 시간만큼 드럼이 쉽니다. 게임에서 해 보고 맞추세요");
+                    }
+                });
+            });
+
+            // ── 세부 변환
+            egui::CollapsingHeader::new(head("세부 변환")).id_salt("sec_detail").default_open(false).show(ui, |ui| {
+                egui::Grid::new("g_detail").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("양자화 격자");
+                    ui.add_enabled_ui(self.other.quality != QUALITY_AUTO, |ui| {
+                        let mut g = self.other.grid.to_string();
+                        if Self::combo(ui, "grid", &mut g, &["8", "16", "32", "64"], 60.0) {
+                            self.other.grid = g.parse().unwrap_or(64);
+                            self.detail_changed();
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("셋잇단");
+                    Self::combo(ui, "triplet", &mut self.other.triplet, &TRIPLET_LABELS.map(|x| x.0), 110.0);
+                    ui.end_row();
+                    ui.label("볼륨");
+                    Self::combo(ui, "volume", &mut self.other.volume, &VOLUME_LABELS.map(|x| x.0), 110.0);
+                    ui.end_row();
+                    ui.label("고정 볼륨값");
+                    ui.add(egui::DragValue::new(&mut self.other.fixed_vol).range(1..=15));
+                    ui.end_row();
+                    ui.label("볼륨 변화 최소");
+                    ui.add_enabled_ui(self.other.quality != QUALITY_AUTO, |ui| {
+                        if ui.add(egui::DragValue::new(&mut self.other.vol_step).range(1..=15)).changed() {
+                            self.detail_changed();
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("템포 고정");
+                    ui.add(egui::DragValue::new(&mut self.other.fixed_bpm).range(0..=255).custom_formatter(|v, _| if v <= 0.0 { "원곡".into() } else { format!("{}", v as i64) }));
+                    ui.end_row();
+                    ui.label("페달");
+                    Self::combo(ui, "sustain", &mut self.saved.sustain, &SUSTAIN_LABELS.map(|x| x.0), 120.0);
+                    ui.end_row();
+                    ui.label("앞 자르기");
+                    ui.add(egui::DragValue::new(&mut self.other.cut_start).range(0..=7200).custom_formatter(|v, _| fmt_clock(v * 1000.0)))
+                        .on_hover_text("이 시각 전은 버립니다 (그 시각이 든 마디 처음부터 남김)");
+                    ui.end_row();
+                    ui.label("뒤 자르기");
+                    ui.add(egui::DragValue::new(&mut self.other.cut_end).range(0..=7200).custom_formatter(|v, _| if v <= 0.0 { "끝까지".into() } else { fmt_clock(v * 1000.0) }))
+                        .on_hover_text("이 시각 뒤는 버립니다 (그 시각이 든 마디 끝까지 남김)");
+                    ui.end_row();
+                });
+                ui.checkbox(&mut self.other.tempo_all, "템포를 모든 파트에 기록").on_hover_text("음 중간을 쪼개서라도 모든 파트에 템포를 적습니다");
+                ui.checkbox(&mut self.other.no_song, "노래 파트 제외 한도").on_hover_text("노래 파트를 쓰지 않을 때의 글자 수 한도를 씁니다");
+            });
+
+            // ── 연주 맞춤
+            egui::CollapsingHeader::new(head("연주 맞춤")).id_salt("sec_play").default_open(false).show(ui, |ui| {
+                ui.checkbox(&mut self.saved.low_limit, "o2e 아래 음 올리기").on_hover_text("류트 계열에서 안 나는 낮은 음을 옥타브 올립니다");
+                ui.checkbox(&mut self.saved.align, "MIDI 시작을 마디선에 맞추기");
+                ui.horizontal(|ui| {
+                    ui.label("짧은 빈틈 메우기");
+                    Self::combo(ui, "gaps", &mut self.saved.gap_mode, &GAP_LABELS.map(|x| x.0), 80.0);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("파트 음량").on_hover_text("-7~7");
+                    for k in 0..3 {
+                        ui.add(egui::DragValue::new(&mut self.saved.part_vol[k]).range(-7..=7).prefix(format!("{} ", PART_NAMES[k])));
+                    }
+                });
+                ui.checkbox(&mut self.saved.compact, "글자 수 줄이기 (n번호, c-·b+)")
+                    .on_hover_text("멀리 떨어진 한 음은 n번호로, 옥타브 경계 음은 c-·b+ 로 적어 글자를 줄입니다");
+                ui.checkbox(&mut self.saved.ensemble_fix, "64비트 합주 밀림 보정");
+                ui.checkbox(&mut self.saved.v0_tempo, "템포 앞 쉼표를 v0 음표로").on_hover_text("64비트 이전 클라이언트용");
+                ui.checkbox(&mut self.saved.jabchiel, "자브키엘 악보집용")
+                    .on_hover_text("여러 장일 때 장마다 세 파트 길이를 맞추고 템포를 모든 파트에 적습니다");
+                ui.checkbox(&mut self.saved.keep_original, "붙여넣은 MML은 원본 그대로 나누기")
+                    .on_hover_text("붙여넣은 3파트 MML을 편곡하지 않고 랭크 한도에 맞춰 나누기만 합니다 (조옮김만 적용)");
+                ui.checkbox(&mut self.saved.split_players, "모바일 6파트 MML을 두 사람 악보로").on_hover_text("1~3파트와 4~6파트를 두 사람 PC 악보로");
+            });
         });
+        if self.saved != before {
+            self.save_settings();
+        }
     }
 
     fn action_bar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
@@ -2427,24 +2465,32 @@ impl App {
                 self.toggle_play();
             }
             ui.label("소리");
-            Self::combo(ui, "sound", &mut self.saved.preview_sound, &PREVIEW_SOUNDS, 100.0);
-            if ui.button("미리듣기 MIDI 저장…").clicked() {
-                self.save_preview();
+            if Self::combo(ui, "sound", &mut self.saved.preview_sound, &PREVIEW_SOUNDS, 110.0) {
+                self.save_settings();
             }
-            if ui.button("결과 텍스트 저장…").clicked() {
-                self.save_text();
-            }
-            if ui.button("악보별로 저장…").clicked() {
-                self.save_split();
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(if self.folded { "설정 펼치기" } else { "설정 접기" }).clicked() {
-                    self.folded = !self.folded;
+            ui.separator();
+            ui.menu_button("저장 ▼", |ui| {
+                if ui.button("결과 텍스트 저장…").clicked() {
+                    self.save_text();
+                    ui.close_menu();
                 }
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add(egui::Label::new(self.status.clone()).truncate()).on_hover_text(self.status.clone());
-                });
+                if ui.button("악보별로 저장…").clicked() {
+                    self.save_split();
+                    ui.close_menu();
+                }
+                if ui.button("미리듣기 MIDI 저장…").clicked() {
+                    self.save_preview();
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("모바일용 저장…").on_hover_text("한 사람 6파트, 파트마다 2400자, 빈틈 메우기로 바꿔 저장합니다. 첫 장은 클립보드에 복사").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.mobile_export(&ctx);
+                    ui.close_menu();
+                }
             });
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(RichText::new(self.status.clone()).color(self.pal.muted)).truncate()).on_hover_text(self.status.clone());
         });
         ui.horizontal(|ui| {
             ui.label("AI 명령");
@@ -2517,7 +2563,7 @@ impl App {
                         }
                     }
                     ui.add_space(6.0);
-                    if players.len() > 1 && ui.small_button(format!("✕ 합주자 {} 빼기", who)).on_hover_text("이 합주자를 합주에서 뺍니다 (뒤 합주자 번호는 앞으로 당겨짐)").clicked() {
+                    if players.len() > 1 && ui.small_button(format!("합주자 {} 빼기", who)).on_hover_text("이 합주자를 합주에서 뺍니다 (뒤 합주자 번호는 앞으로 당겨짐)").clicked() {
                         self.remove_players(&[who]);
                     }
                     if !self.other.drop_players.is_empty() && ui.small_button("뺀 합주자 되살리기").clicked() {
@@ -3167,19 +3213,23 @@ impl eframe::App for App {
         self.sheet_panel(ctx);
         let height = ctx.screen_rect().height();
         let compact = height < 800.0;
-        if self.compact != Some(compact) {
-            self.compact = Some(compact);
-            self.folded = compact;
+        self.compact = Some(compact);
+        // 왼쪽: 설정 (접을 수 있음), 가운데: 파일·트랙·재생·결과
+        if !self.folded {
+            egui::SidePanel::left("options")
+                .resizable(true)
+                .default_width(400.0)
+                .width_range(320.0..=600.0)
+                .frame(egui::Frame::none().fill(self.pal.panel).inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 8.0, bottom: 8.0 }).stroke(egui::Stroke::new(1.0f32, self.pal.line)))
+                .show(ctx, |ui| self.options_panel(ui));
         }
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(self.pal.bg).inner_margin(egui::Margin::symmetric(8.0, 6.0))).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(self.pal.bg).inner_margin(egui::Margin::symmetric(10.0, 8.0))).show(ctx, |ui| {
             self.top_row(ui);
-            self.tracks_box(ui, if compact { 50.0 } else { 100.0 });
-            if !self.folded {
-                self.settings_box(ui);
-                self.play_box(ui);
-            }
+            ui.add_space(2.0);
+            self.tracks_box(ui, if compact { 60.0 } else { 110.0 });
+            ui.add_space(2.0);
             self.action_bar(ui, ctx);
-            self.results(ui, ctx, if compact { 2.0 } else { 4.0 });
+            self.results(ui, ctx, if compact { 2.0 } else { 3.0 });
         });
         self.direct_window(ctx);
         self.loading_window(ctx);
