@@ -1316,14 +1316,35 @@ impl App {
         self.was_playing = playing;
     }
 
+    /// 악보 보기를 닫았을 때만 프로그램 아래에 재생 줄 (열려 있으면 악보 밑에 있다)
     fn seek_bar(&mut self, ctx: &egui::Context) {
+        if self.sheet_open {
+            return;
+        }
         let p = self.pal;
         egui::TopBottomPanel::bottom("seekbar")
             .frame(egui::Frame::none().fill(p.sub).inner_margin(egui::Margin::symmetric(10.0, 6.0)).stroke(egui::Stroke::new(1.0f32, p.line)))
-            .show(ctx, |ui| {
+            .show(ctx, |ui| self.seek_row(ui));
+    }
+
+    /// 스페이스 바: 재생 / 일시정지 (글을 입력하는 중이 아닐 때)
+    fn space_key(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+            self.toggle_play();
+        }
+    }
+
+    /// 재생 줄: 재생 단추, 시간, 위치 막대, 마디, 악보 보기
+    fn seek_row(&mut self, ui: &mut Ui) {
+        let p = self.pal;
+        {
+            {
                 ui.horizontal(|ui| {
                     let playing = self.player.is_playing();
-                    if self.accent(ui, if playing { "■" } else { "▶" }).on_hover_text(if playing { "정지" } else { "여기서부터 듣기" }).clicked() {
+                    if self.accent(ui, if playing { "■ 일시정지 (스페이스)" } else { "▶ 재생 (스페이스)" }).on_hover_text(if playing { "멈춘 자리에서 다시 들을 수 있어요" } else { "여기서부터 듣기" }).clicked() {
                         self.toggle_play();
                     }
                     let (total, bars) = match &self.sheet {
@@ -1333,7 +1354,7 @@ impl App {
                     let cur = self.current_ms().clamp(0.0, total.max(0.0));
                     let bar_no = self.sheet.as_ref().map(|sh| ((sh.ms_to_unit(cur) / sh.bar).floor() as usize + 1).min(bars)).unwrap_or(0);
                     ui.label(RichText::new(format!("{} / {}", fmt_clock(cur), fmt_clock(total))).font(egui::FontId::monospace(13.0)));
-                    let right_w = 190.0;
+                    let right_w = 200.0;
                     let w = (ui.available_width() - right_w).max(80.0);
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 22.0), egui::Sense::click_and_drag());
                     let painter = ui.painter_at(rect.expand(8.0));
@@ -1385,9 +1406,10 @@ impl App {
                         }
                     }
                     ui.label(RichText::new(if bars > 0 { format!("{} / {}마디", bar_no, bars) } else { "- 마디".into() }).color(p.muted));
-                    ui.checkbox(&mut self.sheet_open, "악보 보기");
+                    ui.checkbox(&mut self.sheet_open, "악보 보기").on_hover_text("끄면 악보 보기를 닫고 재생 줄이 프로그램 아래로 갑니다");
                 });
-            });
+            }
+        }
     }
 
     fn sheet_panel(&mut self, ctx: &egui::Context) {
@@ -1600,6 +1622,7 @@ impl App {
                 self.commit_part(s.score, s.part, &new);
                 let p = pitch.clamp(mml_edit::MIN_PITCH, mml_edit::MAX_PITCH);
                 self.edit_msg = format!("음 높이를 {}(으)로 바꿨습니다", pitch_name(p));
+                self.note_sound(s.score, p);
                 self.sync_edit_marks();
             }
             Err(e) => self.edit_msg = e,
@@ -1657,6 +1680,7 @@ impl App {
             Ok((new, _, got)) => {
                 self.commit_part(s.score, s.part, &new);
                 self.edit_sel = Some(EditSel { t: s.t + got, note: None, ..s });
+                self.note_sound(s.score, pitch.clamp(mml_edit::MIN_PITCH, mml_edit::MAX_PITCH));
                 self.edit_msg = format!("{} {} 넣음 · 이어서 건반을 누르면 다음 자리에 넣습니다", pitch_name(pitch), len_name(got));
                 self.sync_edit_marks();
             }
@@ -1666,6 +1690,9 @@ impl App {
 
     /// 같은 파트의 앞/뒤 음으로
     fn edit_move(&mut self, dir: i64) {
+        if self.edit_sel.is_none() {
+            self.edit_sel = self.sel_at_playhead();
+        }
         let Some(s) = self.sel_ok() else { return };
         let part = self.part_text(s.score, s.part);
         let Ok(p) = mml_edit::analyze(&part) else { return };
@@ -1676,7 +1703,44 @@ impl App {
         };
         if let Some(i) = next {
             self.select(EditSel { note: Some(i), t: p.notes[i].start, ..s });
+            // 멈춰 있으면 재생 위치도 그 음으로 (스페이스로 거기서부터 듣기)
+            if !self.player.is_playing() {
+                if let (Some((_, start)), Some(sh)) = (self.staff_of(s.score, s.staff), self.sheet.as_ref()) {
+                    let ms = sh.unit_to_ms(start + p.notes[i].start);
+                    self.commit_seek(ms);
+                }
+            }
+            self.note_sound(s.score, p.notes[i].pitch);
         }
+    }
+
+    /// 재생 위치에서 시작하는 자리 (아무것도 안 골랐을 때 화살표로 음표를 고르기 시작)
+    fn sel_at_playhead(&self) -> Option<EditSel> {
+        let sh = self.sheet.as_ref()?;
+        let t = sh.ms_to_unit(self.current_ms());
+        let cur_player = self.result.as_ref().and_then(|r| r.scores.get(self.tab)).map(|s| s.player);
+        let player_of = |i: usize| self.result.as_ref().and_then(|r| r.scores.get(i)).map(|s| s.player);
+        let mut found: Option<(usize, f64, usize)> = None;
+        for (st, g) in sh.ranges.iter().enumerate() {
+            for r in g {
+                if r.0 <= t + 1e-6 && t < r.1 - 1e-6 && (found.is_none() || player_of(r.2) == cur_player) {
+                    found = Some((st, r.0, r.2));
+                }
+            }
+        }
+        let (staff, start, score) = found.or_else(|| self.staff_of(self.tab, 0).map(|(st, s0)| (st, s0, self.tab)))?;
+        Some(EditSel { score, part: self.edit_part, note: None, t: (t - start - 1.0).max(-1.0), staff })
+    }
+
+    /// 건반·음 높이를 바꿀 때 그 음을 짧게 들려준다
+    fn note_sound(&self, score: usize, pitch: i64) {
+        let Some(r) = self.result.as_ref() else { return };
+        let mut prog = self.preview_prog();
+        if prog < 0 {
+            let inst = r.scores.get(score).map(|s| s.instrument.clone()).unwrap_or_default();
+            prog = crate::convert::preview_program(if inst.is_empty() { &self.saved.instrument } else { &inst });
+        }
+        crate::player::preview_note(pitch + r.sound_shift, prog.max(0));
     }
 
     /// 악보를 누른 곳으로 고르기
@@ -1760,10 +1824,7 @@ impl App {
 
     /// 악보 보기 단축키 (글 칸에 입력 중이 아닐 때)
     fn edit_keys(&mut self, ui: &Ui) {
-        if self.edit_sel.is_none() && self.edit_undo.is_empty() {
-            return;
-        }
-        if ui.ctx().wants_keyboard_input() {
+        if self.sheet.is_none() || ui.ctx().wants_keyboard_input() {
             return;
         }
         use egui::{Key, Modifiers};
@@ -1870,7 +1931,7 @@ impl App {
             });
         });
         let msg = if self.edit_msg.is_empty() {
-            "음표를 누르면 고르고(←→로 옮김), 빈 곳을 누르면 넣을 자리가 됩니다. 건반을 누르면 그 자리에 음을 넣거나 고른 음 높이를 바꿉니다".to_string()
+            "음표를 누르면 고르고(←→로 옮김, 스페이스로 듣기), 빈 곳을 누르면 넣을 자리가 됩니다. 건반을 누르면 그 자리에 음을 넣거나 고른 음 높이를 바꿉니다".to_string()
         } else {
             self.edit_msg.clone()
         };
@@ -1939,7 +2000,8 @@ impl App {
                 let mut clicked = None;
                 let (marks, mark_t) = self.sheet_marks();
                 let jump = std::mem::take(&mut self.sheet_jump);
-                let tools_h = if self.sheet.is_none() { 0.0 } else if self.edit_tools { 150.0 } else { 30.0 };
+                self.space_key(ui.ctx());
+                let tools_h = 40.0 + if self.sheet.is_none() { 0.0 } else if self.edit_tools { 150.0 } else { 30.0 };
                 let sheet_h = (ui.available_height() - tools_h).max(160.0);
                 ui.allocate_ui(egui::vec2(ui.available_width(), sheet_h), |ui| {
                 egui::Frame::none().fill(Color32::WHITE).stroke(egui::Stroke::new(1.0f32, p.line)).inner_margin(6.0).show(ui, |ui| {
@@ -1993,6 +2055,7 @@ impl App {
                     self.commit_seek(ms);
                     self.sheet_clicked(c);
                 }
+                self.seek_row(ui);
                 if self.sheet.is_some() {
                     self.edit_bar(ui);
                     self.edit_keys(ui);
@@ -3875,6 +3938,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
+        self.space_key(ctx);
         self.banner(ctx);
         self.seek_bar(ctx);
         self.sheet_panel(ctx);
