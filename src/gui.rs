@@ -3100,6 +3100,23 @@ impl App {
                         }
                     }
                     ui.add_space(6.0);
+                    // 이 합주자의 연주 악기 (왼쪽 '합주자 악기'와 같은 설정)
+                    let is_drum = res.scores.iter().any(|s| s.player == who && s.instrument == crate::convert::DRUM_KIT);
+                    // 합주자를 뺐으면 번호가 당겨지므로 설정은 원래 번호로
+                    let orig = res.scores.iter().find(|s| s.player == who).map(|s| if s.orig_player > 0 { s.orig_player } else { who }).unwrap_or(who);
+                    if orig >= 1 && !is_drum {
+                        let k = (orig - 1) as usize;
+                        if self.saved.player_insts.len() <= k {
+                            self.saved.player_insts.resize(k + 1, String::new());
+                        }
+                        let mut names: Vec<&str> = vec![PLAYER_INST_DEFAULT];
+                        names.extend(INSTRUMENTS.iter().map(|x| x.0));
+                        let mut v = if self.saved.player_insts[k].is_empty() { PLAYER_INST_DEFAULT.to_string() } else { self.saved.player_insts[k].clone() };
+                        ui.label("악기").on_hover_text("이 합주자가 칠 악기 (바꾸면 다시 변환합니다)");
+                        if Self::combo(ui, &format!("mid_pinst{}", k), &mut v, &names, 110.0) {
+                            self.saved.player_insts[k] = if v == PLAYER_INST_DEFAULT { String::new() } else { v };
+                        }
+                    }
                     if players.len() > 1 && ui.small_button(format!("합주자 {} 빼기", who)).on_hover_text("이 합주자를 합주에서 뺍니다 (뒤 합주자 번호는 앞으로 당겨짐)").clicked() {
                         self.remove_players(&[who]);
                     }
