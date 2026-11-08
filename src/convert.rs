@@ -426,11 +426,13 @@ pub struct Score {
     pub instrument: String,
     /// 합주자를 빼기 전의 원래 번호 (빼기 설정에 쓴다)
     pub orig_player: i64,
+    /// 미리듣기·악보 보기에서: 이 악보가 결과의 몇 번째 장에서 왔는지 (악보에서 음을 고칠 때 씀)
+    pub src: usize,
 }
 
 impl Score {
     pub fn new(parts: Vec<String>, start: f64, end: f64) -> Score {
-        Score { parts, start, end, player: 0, only: None, instrument: String::new(), orig_player: 0 }
+        Score { parts, start, end, player: 0, only: None, instrument: String::new(), orig_player: 0, src: 0 }
     }
     pub fn clipboard(&self) -> String {
         format!("MML@{};", self.parts.join(","))

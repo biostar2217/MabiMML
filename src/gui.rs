@@ -16,6 +16,7 @@ use crate::convert::{
     convert_song, load_song, preview_program, will_recognize, write_preview, write_split, ConvError, ConvResult, LoadOpts,
     Options, Score, INSTRUMENTS, INSTRUMENT_DEFAULT, PART_NAMES,
 };
+use crate::mml_edit;
 use crate::mml_parser::{parse_part, split_clipboard};
 use crate::mobile_io::{clean_part, fragments_of, has_several_parts, is_mml_text, join_fragments, read_mobile_mml, song_from_parts, split_parts};
 use crate::model::Song;
@@ -243,6 +244,94 @@ impl Default for Other {
     }
 }
 
+/// 악보에서 고른 자리
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EditSel {
+    /// 결과의 몇 번째 장
+    score: usize,
+    /// 파트 (0 멜로디, 1 화음1, 2 화음2)
+    part: usize,
+    /// 고른 음 (그 장 그 파트에서 몇 번째). None 이면 넣을 자리만
+    note: Option<usize>,
+    /// 장 안의 시간 (유닛)
+    t: f64,
+    /// 악보 보기의 큰보표
+    staff: usize,
+}
+
+/// 음 이름 (o4c, o5f# …)
+fn pitch_name(p: i64) -> String {
+    const N: [&str; 12] = ["c", "c#", "d", "d#", "e", "f", "f#", "g", "g#", "a", "a#", "b"];
+    format!("o{}{}", p.div_euclid(12) - 1, N[p.rem_euclid(12) as usize])
+}
+
+/// 길이 이름 (4분음표, 점8분음표 …)
+fn len_name(u: f64) -> String {
+    for (n, name) in [(1, "온"), (2, "2분"), (4, "4분"), (8, "8분"), (16, "16분"), (32, "32분"), (64, "64분")] {
+        let b = 384.0 / n as f64;
+        if (u - b).abs() < 0.5 {
+            return format!("{}음표", name);
+        }
+        if (u - b * 1.5).abs() < 0.5 {
+            return format!("점{}음표", name);
+        }
+    }
+    format!("{}박", (u / 96.0 * 100.0).round() / 100.0)
+}
+
+/// 피아노 건반을 그리고 누른 음을 돌려준다. oct: 가장 왼쪽 C 의 MML 옥타브
+fn piano(ui: &mut Ui, w: f32, h: f32, oct: i64, octs: i64, mark: Option<i64>) -> Option<i64> {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    let whites = (octs * 7) as usize;
+    let ww = rect.width() / whites as f32;
+    const WHITE_PC: [i64; 7] = [0, 2, 4, 5, 7, 9, 11];
+    const BLACK: [(usize, i64); 5] = [(0, 1), (1, 3), (3, 6), (4, 8), (5, 10)];
+    let base = (oct + 1) * 12;
+    let hl = Color32::from_rgb(0xF2, 0xA1, 0x4A);
+    let mut keys: Vec<(egui::Rect, i64, bool)> = Vec::new();
+    for i in 0..whites {
+        let pitch = base + (i / 7) as i64 * 12 + WHITE_PC[i % 7];
+        let r = egui::Rect::from_min_size(egui::pos2(rect.left() + i as f32 * ww, rect.top()), egui::vec2(ww, h));
+        keys.push((r, pitch, false));
+    }
+    for o in 0..octs as usize {
+        for &(after, pc) in &BLACK {
+            let x = rect.left() + (o * 7 + after + 1) as f32 * ww;
+            let r = egui::Rect::from_min_size(egui::pos2(x - ww * 0.32, rect.top()), egui::vec2(ww * 0.64, h * 0.6));
+            keys.push((r, base + o as i64 * 12 + pc, true));
+        }
+    }
+    let hover = resp.hover_pos();
+    let hit = |p: egui::Pos2| keys.iter().filter(|k| k.2).find(|k| k.0.contains(p)).or_else(|| keys.iter().filter(|k| !k.2).find(|k| k.0.contains(p))).map(|k| k.1);
+    let hovered = hover.and_then(hit);
+    for &(r, pitch, black) in keys.iter().filter(|k| !k.2).chain(keys.iter().filter(|k| k.2)) {
+        let fill = if mark == Some(pitch) {
+            hl
+        } else if hovered == Some(pitch) {
+            if black { Color32::from_gray(80) } else { Color32::from_rgb(0xFF, 0xF1, 0xDC) }
+        } else if black {
+            Color32::from_gray(30)
+        } else {
+            Color32::WHITE
+        };
+        painter.rect(r.shrink(0.5), 2.0, fill, egui::Stroke::new(1.0f32, Color32::from_gray(110)));
+        if !black && pitch.rem_euclid(12) == 0 {
+            painter.text(egui::pos2(r.center().x, r.bottom() - 3.0), egui::Align2::CENTER_BOTTOM, format!("o{}", pitch / 12 - 1), egui::FontId::proportional(10.0), Color32::from_gray(90));
+        }
+    }
+    if hovered.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if let Some(p) = hovered {
+        resp.clone().on_hover_text(pitch_name(p));
+    }
+    if resp.clicked() {
+        return resp.interact_pointer_pos().and_then(hit);
+    }
+    None
+}
+
 enum LoadMsg {
     Loaded(Song),
     Converted(Box<ConvResult>),
@@ -323,6 +412,26 @@ pub struct App {
     ai_undo: Option<serde_json::Map<String, Value>>,
     /// AI 가 MML 을 고치기 전의 결과 글 (되돌리기)
     ai_undo_texts: Option<Vec<String>>,
+    // 악보에서 고치기
+    edit_sel: Option<EditSel>,
+    /// 음을 넣을 파트, 길이(분음표), 점
+    edit_part: usize,
+    edit_len: i64,
+    edit_dot: bool,
+    /// 고치기 전의 결과 글들 (되돌리기)
+    edit_undo: Vec<Vec<String>>,
+    edit_msg: String,
+    /// 편집 도구·건반 보이기
+    edit_tools: bool,
+    /// 건반 가장 왼쪽 옥타브
+    piano_oct: i64,
+    /// MML 칸 글 커서 (장, 글자 위치)
+    mml_cursor: Option<(usize, usize)>,
+    /// MML 칸에서 칠할 글자 범위 (장, 시작, 끝)과 그리로 스크롤할지
+    mml_mark: Option<(usize, usize, usize)>,
+    mml_scroll: bool,
+    /// 악보 보기를 고른 자리가 있는 줄로 넘길지
+    sheet_jump: bool,
     /// 설정을 바꾼 뒤 새 MML 로 AI 에게 한 번 더 물을 명령 (설정과 MML 고침을 함께 할 때)
     ai_followup: Option<String>,
     /// 마지막으로 AI 에게 보낸 명령
@@ -417,6 +526,18 @@ impl App {
             ai_label: AI_HINT.into(),
             ai_undo: None,
             ai_undo_texts: None,
+            edit_sel: None,
+            edit_part: 0,
+            edit_len: 8,
+            edit_dot: false,
+            edit_undo: vec![],
+            edit_msg: String::new(),
+            edit_tools: true,
+            piano_oct: 3,
+            mml_cursor: None,
+            mml_mark: None,
+            mml_scroll: false,
+            sheet_jump: false,
             ai_followup: None,
             ai_last_cmd: String::new(),
             ai_rx: None,
@@ -865,6 +986,11 @@ impl App {
         }
         self.score_texts = res.scores.iter().map(|s| s.clipboard()).collect();
         self.tab = self.tab.min(res.scores.len().saturating_sub(1));
+        // 새 결과: 악보에서 고친 자리·되돌리기는 지난 결과 것이므로 비운다
+        self.edit_sel = None;
+        self.edit_undo.clear();
+        self.mml_cursor = None;
+        self.mml_mark = None;
         let bpms: Vec<i64> = res.tempos.iter().map(|t| t.1).collect();
         if let (Some(lo), Some(hi)) = (bpms.iter().min(), bpms.iter().max()) {
             self.tempo_label = if lo != hi { format!("결과 템포: {}~{} BPM", lo, hi) } else { format!("결과 템포: {} BPM", lo) };
@@ -890,7 +1016,7 @@ impl App {
         let original = &res.scores[i];
         let text = self.score_texts[i].trim().to_string();
         if text == original.clipboard() {
-            return Ok(original.clone());
+            return Ok(Score { src: i, ..original.clone() });
         }
         let mut parts = split_clipboard(&text);
         if parts.len() > 3 {
@@ -904,7 +1030,16 @@ impl App {
             let e = parse_part(p).map_err(|e| format!("악보 {}의 MML을 읽지 못했습니다: {}", i + 1, e))?.2;
             end = end.max(e);
         }
-        Ok(Score { parts, start: original.start, end: original.start + end.trunc(), player: original.player, only: None, instrument: original.instrument.clone(), orig_player: original.orig_player })
+        Ok(Score {
+            parts,
+            start: original.start,
+            end: original.start + end.trunc(),
+            player: original.player,
+            only: None,
+            instrument: original.instrument.clone(),
+            orig_player: original.orig_player,
+            src: i,
+        })
     }
 
     /// 합주 결과인지 (합주자 번호가 붙은 악보)
@@ -1331,6 +1466,398 @@ impl App {
         });
     }
 
+    // ---------- 악보에서 고치기 ----------
+
+    /// 장 i 의 파트 k 글 (없으면 빈 글)
+    fn part_text(&self, i: usize, k: usize) -> String {
+        let Some(t) = self.score_texts.get(i) else { return String::new() };
+        mml_edit::part_ranges(t).get(k).map(|&(a, b)| t.chars().skip(a).take(b - a).collect()).unwrap_or_default()
+    }
+
+    /// 장 i 의 길이 (변환 결과 기준: 고쳐도 장 길이는 그대로 둔다)
+    fn score_len(&self, i: usize) -> f64 {
+        self.result.as_ref().and_then(|r| r.scores.get(i)).map(|s| s.end - s.start).unwrap_or(0.0)
+    }
+
+    /// 고를 길이 (유닛)
+    fn edit_units(&self) -> f64 {
+        384.0 / self.edit_len as f64 * if self.edit_dot { 1.5 } else { 1.0 }
+    }
+
+    /// 악보 보기에서 장 i 가 놓인 (큰보표, 시작 위치). prefer: 먼저 볼 큰보표
+    fn staff_of(&self, i: usize, prefer: usize) -> Option<(usize, f64)> {
+        let sh = self.sheet.as_ref()?;
+        if let Some(r) = sh.ranges.get(prefer).and_then(|g| g.iter().find(|r| r.2 == i)) {
+            return Some((prefer, r.0));
+        }
+        sh.ranges.iter().enumerate().find_map(|(st, g)| g.iter().find(|r| r.2 == i).map(|r| (st, r.0)))
+    }
+
+    /// 고른 음/자리를 MML 칸에 칠하고 그리로 스크롤, 악보도 그 줄로
+    fn sync_edit_marks(&mut self) {
+        self.mml_mark = None;
+        self.sheet_jump = true;
+        let Some(s) = self.edit_sel else { return };
+        let Some(text) = self.score_texts.get(s.score) else { return };
+        let Some(&(a, _)) = mml_edit::part_ranges(text).get(s.part) else { return };
+        let part = self.part_text(s.score, s.part);
+        if let (Some(n), Ok(p)) = (s.note, mml_edit::analyze(&part)) {
+            if let Some((x, y)) = mml_edit::note_span(&p, n) {
+                self.mml_mark = Some((s.score, a + x, a + y));
+                self.mml_scroll = true;
+            }
+        }
+    }
+
+    fn select(&mut self, sel: EditSel) {
+        self.edit_part = sel.part;
+        self.edit_sel = Some(sel);
+        // 다른 장의 음이면 그 장의 MML 을 보여 준다 (합주 전체·이어 보기)
+        if self.tab != sel.score && sel.score < self.score_texts.len() {
+            self.tab = sel.score;
+        }
+        self.sync_edit_marks();
+    }
+
+    /// 파트 글을 바꾼다 (되돌리기에 남김)
+    fn commit_part(&mut self, i: usize, k: usize, new: &str) {
+        self.edit_undo.push(self.score_texts.clone());
+        if self.edit_undo.len() > 200 {
+            self.edit_undo.remove(0);
+        }
+        self.score_texts[i] = mml_edit::replace_part(&self.score_texts[i], k, new);
+        self.mml_cursor = None;
+    }
+
+    fn edit_undo_step(&mut self) {
+        match self.edit_undo.pop() {
+            Some(t) if t.len() == self.score_texts.len() => {
+                self.score_texts = t;
+                self.edit_msg = "되돌렸습니다".into();
+                if let Some(s) = self.edit_sel {
+                    // 음 번호가 바뀌었을 수 있으니 시간으로 다시 찾는다
+                    let part = self.part_text(s.score, s.part);
+                    let note = mml_edit::analyze(&part).ok().and_then(|p| mml_edit::note_at_time(&p, s.t));
+                    self.edit_sel = Some(EditSel { note, ..s });
+                }
+                self.sync_edit_marks();
+            }
+            _ => self.edit_msg = "되돌릴 것이 없습니다".into(),
+        }
+    }
+
+    fn edit_delete(&mut self) {
+        let Some(s) = self.edit_sel else { return };
+        let Some(n) = s.note else {
+            self.edit_msg = "지울 음을 먼저 누르세요".into();
+            return;
+        };
+        let part = self.part_text(s.score, s.part);
+        match mml_edit::delete_note(&part, n) {
+            Ok(new) => {
+                self.commit_part(s.score, s.part, &new);
+                self.edit_sel = Some(EditSel { note: None, ..s });
+                self.edit_msg = "음을 지웠습니다 (같은 길이 쉼표로 바꿔 뒤 박자는 그대로)".into();
+                self.sync_edit_marks();
+            }
+            Err(e) => self.edit_msg = e,
+        }
+    }
+
+    /// 고른 음의 높이를 pitch 로
+    fn edit_set_pitch(&mut self, pitch: i64) {
+        let Some(s) = self.edit_sel else { return };
+        let Some(n) = s.note else { return };
+        let part = self.part_text(s.score, s.part);
+        match mml_edit::set_pitch(&part, n, pitch) {
+            Ok(new) => {
+                self.commit_part(s.score, s.part, &new);
+                let p = pitch.clamp(mml_edit::MIN_PITCH, mml_edit::MAX_PITCH);
+                self.edit_msg = format!("음 높이를 {}(으)로 바꿨습니다", pitch_name(p));
+                self.sync_edit_marks();
+            }
+            Err(e) => self.edit_msg = e,
+        }
+    }
+
+    fn edit_shift(&mut self, d: i64) {
+        let Some(s) = self.edit_sel else { return };
+        let Some(n) = s.note else {
+            self.edit_msg = "높이를 바꿀 음을 먼저 누르세요".into();
+            return;
+        };
+        let part = self.part_text(s.score, s.part);
+        if let Some(p) = mml_edit::analyze(&part).ok().and_then(|p| p.notes.get(n).map(|x| x.pitch)) {
+            self.edit_set_pitch(p + d);
+        }
+    }
+
+    /// 고른 음의 길이를 지금 고른 길이로
+    fn edit_set_length(&mut self) {
+        let Some(s) = self.edit_sel else { return };
+        let Some(n) = s.note else {
+            self.edit_msg = "길이를 바꿀 음을 먼저 누르세요".into();
+            return;
+        };
+        let want = self.edit_units();
+        let part = self.part_text(s.score, s.part);
+        match mml_edit::set_length(&part, n, want) {
+            Ok((new, got)) => {
+                self.commit_part(s.score, s.part, &new);
+                self.edit_msg = if (got - want).abs() > 0.5 {
+                    format!("뒤에 쉼표가 모자라 {}까지만 늘렸습니다", len_name(got))
+                } else {
+                    format!("길이를 {}(으)로 바꿨습니다", len_name(got))
+                };
+                self.sync_edit_marks();
+            }
+            Err(e) => self.edit_msg = e,
+        }
+    }
+
+    /// 건반: 고른 음이 있으면 그 음 높이를, 자리만 골랐으면 그 자리에 음을 넣고 다음 자리로
+    fn edit_key(&mut self, pitch: i64) {
+        let Some(s) = self.edit_sel else {
+            self.edit_msg = "악보에서 음표나 넣을 자리를 먼저 누르세요".into();
+            return;
+        };
+        if s.note.is_some() {
+            self.edit_set_pitch(pitch);
+            return;
+        }
+        let part = self.part_text(s.score, s.part);
+        let limit = self.score_len(s.score);
+        match mml_edit::insert_note(&part, s.t, pitch, self.edit_units(), limit) {
+            Ok((new, _, got)) => {
+                self.commit_part(s.score, s.part, &new);
+                self.edit_sel = Some(EditSel { t: s.t + got, note: None, ..s });
+                self.edit_msg = format!("{} {} 넣음 · 이어서 건반을 누르면 다음 자리에 넣습니다", pitch_name(pitch), len_name(got));
+                self.sync_edit_marks();
+            }
+            Err(e) => self.edit_msg = e,
+        }
+    }
+
+    /// 같은 파트의 앞/뒤 음으로
+    fn edit_move(&mut self, dir: i64) {
+        let Some(s) = self.edit_sel else { return };
+        let part = self.part_text(s.score, s.part);
+        let Ok(p) = mml_edit::analyze(&part) else { return };
+        let next = if dir > 0 {
+            p.notes.iter().position(|n| n.start > s.t + 1e-6)
+        } else {
+            p.notes.iter().rposition(|n| n.start < s.t - 1e-6)
+        };
+        if let Some(i) = next {
+            self.select(EditSel { note: Some(i), t: p.notes[i].start, ..s });
+        }
+    }
+
+    /// 악보를 누른 곳으로 고르기
+    fn sheet_clicked(&mut self, c: sheet::Click) {
+        let Some(sh) = self.sheet.as_ref() else { return };
+        if let Some((k, idx)) = c.note {
+            let Some(&(src, j)) = sh.refs.get(c.staff).and_then(|r| r.get(k)).and_then(|r| r.get(idx)) else { return };
+            let start = sh.ranges.get(c.staff).and_then(|g| g.iter().find(|r| r.2 == src)).map(|r| r.0).unwrap_or(0.0);
+            let t = sh.staves[c.staff].1[k][idx].start - start;
+            self.select(EditSel { score: src, part: k, note: Some(j), t, staff: c.staff });
+            return;
+        }
+        let Some(&(start, _, src)) = sh.ranges.get(c.staff).and_then(|g| g.iter().rev().find(|r| r.0 <= c.t + 1e-6)) else { return };
+        // 16분음표 칸에 맞춘다
+        let t = ((c.t - start) / 24.0).floor().max(0.0) * 24.0;
+        let k = self.edit_part;
+        let part = self.part_text(src, k);
+        let found = mml_edit::analyze(&part).ok().and_then(|p| mml_edit::note_at_time(&p, t).map(|n| (n, p.notes[n].start)));
+        let (note, t) = match found {
+            Some((n, st)) => (Some(n), st),
+            None => (None, t),
+        };
+        let bar_no = ((c.t / sh.bar).floor() as usize) + 1;
+        self.select(EditSel { score: src, part: k, note, t, staff: c.staff });
+        if note.is_none() {
+            self.edit_msg = format!("{} 파트 {}마디에 넣을 자리를 골랐습니다. 건반을 누르면 음이 들어갑니다", PART_NAMES[k], bar_no);
+        }
+    }
+
+    /// 악보에 덧그릴 표시와 그 시간
+    fn sheet_marks(&self) -> (sheet::Marks, Option<f64>) {
+        let mut m = sheet::Marks::default();
+        let Some(s) = self.edit_sel else { return (m, None) };
+        let Some((st, start)) = self.staff_of(s.score, s.staff) else { return (m, None) };
+        let t = start + s.t;
+        match s.note {
+            Some(n) => {
+                m.selected = self
+                    .sheet
+                    .as_ref()
+                    .and_then(|sh| sh.refs.get(st)?.get(s.part)?.iter().position(|&r| r == (s.score, n)))
+                    .map(|idx| (st, s.part, idx));
+            }
+            None => m.caret = Some((st, t)),
+        }
+        (m, Some(t))
+    }
+
+    /// MML 칸 커서가 움직이면 악보에서 그 자리를 고른다
+    fn mml_cursor_moved(&mut self, i: usize, ch: usize) {
+        if self.mml_cursor == Some((i, ch)) {
+            return;
+        }
+        self.mml_cursor = Some((i, ch));
+        let ranges = mml_edit::part_ranges(&self.score_texts[i]);
+        let Some(k) = ranges.iter().position(|&(a, b)| ch >= a && ch <= b) else { return };
+        let part = self.part_text(i, k);
+        let Ok(p) = mml_edit::analyze(&part) else { return };
+        let (t, note) = mml_edit::locate_char(&p, ch - ranges[k].0);
+        let staff = self.staff_of(i, self.edit_sel.map(|s| s.staff).unwrap_or(0)).map(|x| x.0).unwrap_or(0);
+        self.edit_part = k;
+        self.edit_sel = Some(EditSel { score: i, part: k, note, t: note.map(|n| p.notes[n].start).unwrap_or(t), staff });
+        self.mml_mark = None;
+        self.sheet_jump = true;
+    }
+
+    /// 악보 보기 단축키 (글 칸에 입력 중이 아닐 때)
+    fn edit_keys(&mut self, ui: &Ui) {
+        if self.edit_sel.is_none() && self.edit_undo.is_empty() {
+            return;
+        }
+        if ui.ctx().wants_keyboard_input() {
+            return;
+        }
+        use egui::{Key, Modifiers};
+        let mut act: Vec<&str> = Vec::new();
+        ui.input_mut(|i| {
+            if i.consume_key(Modifiers::COMMAND, Key::Z) {
+                act.push("undo");
+            }
+            if i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace) {
+                act.push("del");
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::ArrowUp) {
+                act.push("oct+");
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::ArrowDown) {
+                act.push("oct-");
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                act.push("up");
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                act.push("down");
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowLeft) {
+                act.push("left");
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowRight) {
+                act.push("right");
+            }
+        });
+        for a in act {
+            match a {
+                "undo" => self.edit_undo_step(),
+                "del" => self.edit_delete(),
+                "oct+" => self.edit_shift(12),
+                "oct-" => self.edit_shift(-12),
+                "up" => self.edit_shift(1),
+                "down" => self.edit_shift(-1),
+                "left" => self.edit_move(-1),
+                _ => self.edit_move(1),
+            }
+        }
+    }
+
+    /// 악보 보기 아래: 편집 도구와 피아노 건반
+    fn edit_bar(&mut self, ui: &mut Ui) {
+        let p = self.pal;
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.edit_tools, RichText::new("악보 고치기").font(theme::bold(13.0)).color(p.wine))
+                .on_hover_text("악보에서 음표를 눌러 고르고 지우기·음 높이·길이를 바꾸거나, 빈 곳을 누르고 건반으로 음을 넣습니다");
+            if !self.edit_tools {
+                return;
+            }
+            ui.label("넣을 파트");
+            for (k, name) in PART_NAMES.iter().enumerate() {
+                let t = RichText::new(*name).color(sheet::PART_COLORS[k]);
+                if ui.selectable_label(self.edit_part == k, t).clicked() {
+                    self.edit_part = k;
+                    if let Some(s) = self.edit_sel {
+                        if s.note.is_none() && s.part != k {
+                            self.edit_sel = Some(EditSel { part: k, ..s });
+                        }
+                    }
+                }
+            }
+            ui.separator();
+            ui.label("길이");
+            for (n, name) in [(1, "온"), (2, "2분"), (4, "4분"), (8, "8분"), (16, "16분"), (32, "32분")] {
+                if ui.selectable_label(self.edit_len == n, name).clicked() {
+                    self.edit_len = n;
+                }
+            }
+            ui.checkbox(&mut self.edit_dot, "점");
+        });
+        if !self.edit_tools {
+            return;
+        }
+        let has_note = self.edit_sel.map(|s| s.note.is_some()).unwrap_or(false);
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(has_note, |ui| {
+                if ui.button("지우기").on_hover_text("고른 음을 같은 길이 쉼표로 (Delete)").clicked() {
+                    self.edit_delete();
+                }
+                if ui.button("반음 ▲").on_hover_text("↑ 키").clicked() {
+                    self.edit_shift(1);
+                }
+                if ui.button("반음 ▼").on_hover_text("↓ 키").clicked() {
+                    self.edit_shift(-1);
+                }
+                if ui.button("옥타브 ▲").on_hover_text("Shift + ↑").clicked() {
+                    self.edit_shift(12);
+                }
+                if ui.button("옥타브 ▼").on_hover_text("Shift + ↓").clicked() {
+                    self.edit_shift(-12);
+                }
+                if ui.button("고른 길이로").on_hover_text("고른 음의 길이를 위에서 고른 길이로 바꿉니다. 늘리면 뒤의 쉼표를 차지합니다").clicked() {
+                    self.edit_set_length();
+                }
+            });
+            ui.add_enabled_ui(!self.edit_undo.is_empty(), |ui| {
+                if ui.button("되돌리기").on_hover_text("Ctrl + Z").clicked() {
+                    self.edit_undo_step();
+                }
+            });
+        });
+        let msg = if self.edit_msg.is_empty() {
+            "음표를 누르면 고르고(←→로 옮김), 빈 곳을 누르면 넣을 자리가 됩니다. 건반을 누르면 그 자리에 음을 넣거나 고른 음 높이를 바꿉니다".to_string()
+        } else {
+            self.edit_msg.clone()
+        };
+        ui.label(RichText::new(msg).size(12.0).color(p.muted));
+        // 피아노 건반
+        let sel_pitch = self.edit_sel.and_then(|s| {
+            let n = s.note?;
+            let part = self.part_text(s.score, s.part);
+            mml_edit::analyze(&part).ok()?.notes.get(n).map(|x| x.pitch)
+        });
+        let mut pressed = None;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(self.piano_oct > 1, egui::Button::new("◀")).on_hover_text("낮은 옥타브").clicked() {
+                self.piano_oct -= 1;
+            }
+            let w = (ui.available_width() - 30.0).max(160.0);
+            let octs = ((w / (7.0 * 15.0)).floor() as i64).clamp(2, 8);
+            self.piano_oct = self.piano_oct.clamp(1, (9 - octs).max(1));
+            pressed = piano(ui, w, 62.0, self.piano_oct, octs, sel_pitch);
+            if ui.add_enabled(self.piano_oct + octs <= 8, egui::Button::new("▶")).on_hover_text("높은 옥타브").clicked() {
+                self.piano_oct += 1;
+            }
+        });
+        if let Some(pitch) = pressed {
+            self.edit_key(pitch);
+        }
+    }
+
     fn sheet_body(&mut self, ui: &mut Ui) {
         let p = self.pal;
         {
@@ -1362,13 +1889,18 @@ impl App {
                         ui.label(RichText::new(*name).size(12.0));
                         ui.add_space(4.0);
                     }
-                    ui.label(RichText::new("· 악보를 누르면 그 자리로 이동").size(12.0).color(p.muted));
+                    ui.label(RichText::new("· 악보를 누르면 그 자리로 이동하고 음표를 고릅니다").size(12.0).color(p.muted));
                 });
                 self.hear_row(ui);
                 if !self.sheet_err.is_empty() {
                     ui.label(RichText::new(format!("고친 MML을 읽지 못해 이전 악보를 보여 줍니다: {}", self.sheet_err)).size(12.0).color(theme::OVER));
                 }
                 let mut clicked = None;
+                let (marks, mark_t) = self.sheet_marks();
+                let jump = std::mem::take(&mut self.sheet_jump);
+                let tools_h = if self.sheet.is_none() { 0.0 } else if self.edit_tools { 150.0 } else { 30.0 };
+                let sheet_h = (ui.available_height() - tools_h).max(160.0);
+                ui.allocate_ui(egui::vec2(ui.available_width(), sheet_h), |ui| {
                 egui::Frame::none().fill(Color32::WHITE).stroke(egui::Stroke::new(1.0f32, p.line)).inner_margin(6.0).show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
                     let Some(sh) = &self.sheet else {
@@ -1391,7 +1923,9 @@ impl App {
                     let w = (ui.available_width() - 16.0).max(200.0);
                     // 합주자가 많으면 보표를 세로로 줄여 한 줄(모든 합주자)이 화면에 들어가게
                     sheet::fit_scale(sh, ui.available_height() - 34.0);
-                    if follow {
+                    if jump && mark_t.is_some() {
+                        sheet::follow_page(sh, w, mark_t, None, page);
+                    } else if follow {
                         sheet::follow_page(sh, w, head, *line, page);
                     }
                     let (npages, bars_per_page) = sheet::pages(sh, w);
@@ -1409,11 +1943,18 @@ impl App {
                         });
                     }
                     egui::ScrollArea::vertical().id_salt("sheet_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                        clicked = sheet::show(ui, sh, &p, head, if follow { Some(line) } else { None }, page, w).map(|t| sh.unit_to_ms(t));
+                        let marks = sheet::Marks { scroll: jump, focus: mark_t, ..marks };
+                        clicked = sheet::show(ui, sh, &p, head, if follow && !jump { Some(line) } else { None }, page, w, marks).map(|c| (c, sh.unit_to_ms(c.t)));
                     });
                 });
-                if let Some(ms) = clicked {
+                });
+                if let Some((c, ms)) = clicked {
                     self.commit_seek(ms);
+                    self.sheet_clicked(c);
+                }
+                if self.sheet.is_some() {
+                    self.edit_bar(ui);
+                    self.edit_keys(ui);
                 }
             }
         }
@@ -2628,13 +3169,52 @@ impl App {
             });
             egui::Frame::none().fill(p.panel).stroke(egui::Stroke::new(1.0f32, p.line)).inner_margin(6.0).show(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("mml").auto_shrink([false, false]).show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.score_texts[i])
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(8)
-                            .frame(false),
-                    );
+                    // 악보에서 고른 음을 칠한다
+                    let mark = self.mml_mark.filter(|m| m.0 == i && m.2 > m.1).map(|m| (m.1, m.2));
+                    let ink = ui.visuals().text_color();
+                    let mut layouter = |ui: &Ui, text: &str, wrap: f32| {
+                        let font = egui::TextStyle::Monospace.resolve(ui.style());
+                        let fmt = egui::TextFormat { font_id: font, color: ink, ..Default::default() };
+                        let mut job = egui::text::LayoutJob::default();
+                        match mark {
+                            Some((a, b)) => {
+                                let byte = |c: usize| text.char_indices().nth(c).map(|x| x.0).unwrap_or(text.len());
+                                let (ba, bb) = (byte(a), byte(b));
+                                job.append(&text[..ba], 0.0, fmt.clone());
+                                job.append(
+                                    &text[ba..bb],
+                                    0.0,
+                                    egui::TextFormat { background: Color32::from_rgb(0xFF, 0xD3, 0x9A), color: Color32::BLACK, ..fmt.clone() },
+                                );
+                                job.append(&text[bb..], 0.0, fmt);
+                            }
+                            None => job.append(text, 0.0, fmt),
+                        }
+                        job.wrap.max_width = wrap;
+                        ui.fonts(|f| f.layout_job(job))
+                    };
+                    let out = egui::TextEdit::multiline(&mut self.score_texts[i])
+                        .id(egui::Id::new(("mml_text", i)))
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(8)
+                        .frame(false)
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    if out.response.changed() {
+                        self.mml_mark = None;
+                    }
+                    if let (Some((a, _)), true) = (mark, self.mml_scroll) {
+                        let r = out.galley.pos_from_ccursor(egui::text::CCursor::new(a)).translate(out.galley_pos.to_vec2());
+                        ui.scroll_to_rect(r.expand(24.0), Some(egui::Align::Center));
+                        self.mml_scroll = false;
+                    }
+                    // 글 커서를 옮기면 악보에서 그 자리를 보여 준다
+                    if out.response.has_focus() {
+                        if let Some(cr) = out.cursor_range {
+                            self.mml_cursor_moved(i, cr.primary.ccursor.index);
+                        }
+                    }
                 });
             });
         });
@@ -2946,7 +3526,37 @@ impl App {
         let mut wait_ms = 0u64;
         let mut again = false;
         let ensemble_shot = std::env::var_os("MABIMML_SHOT_ENSEMBLE").is_some();
+        let edit_shot = std::env::var_os("MABIMML_SHOT_EDIT").is_some();
         match step {
+            4 if edit_shot => {
+                // 시험용: 멜로디 세 번째 음을 고른다
+                let part = self.part_text(0, 0);
+                if let Ok(p) = mml_edit::analyze(&part) {
+                    if let Some(n) = p.notes.get(30) {
+                        self.select(EditSel { score: 0, part: 0, note: Some(30), t: n.start, staff: 0 });
+                    }
+                }
+                wait_ms = 900;
+            }
+            5 if edit_shot => shot = Some("5_음표_고름.png"),
+            6 if edit_shot => {
+                // 지우고 그 자리에 건반으로 o5c 넣기, 다음 음은 반음 올리기
+                self.edit_delete();
+                self.edit_len = 8;
+                self.edit_key(72);
+                self.edit_move(1);
+                self.edit_shift(1);
+                wait_ms = 900;
+            }
+            7 if edit_shot => shot = Some("6_음_고침.png"),
+            8 if edit_shot => {
+                self.edit_undo_step();
+                self.edit_undo_step();
+                self.edit_undo_step();
+                wait_ms = 900;
+            }
+            9 if edit_shot => shot = Some("7_되돌림.png"),
+            10 if edit_shot => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             4 | 5 if ensemble_shot => {
                 // 합주 화면: 합주자 2 를 고르고 멜로디만 듣기
                 if step == 4 {
