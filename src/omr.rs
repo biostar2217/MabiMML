@@ -221,7 +221,11 @@ fn temp_dir(prefix: &str) -> PathBuf {
 
 pub type Log<'a> = Option<&'a (dyn Fn(&str) + Sync)>;
 
+/// 여러 페이지를 동시에 인식할 최대 페이지 수 (넘으면 메모리를 아끼려고 한 장씩)
+const PARALLEL_MAX_PAGES: usize = 12;
+
 /// 악보 PDF/이미지를 인식해 MusicXML 파일 경로 목록(악장 순서)을 돌려준다.
+/// 여러 페이지는 동시에 인식하고 (CPU 코어를 다 씀), 그게 실패하면 한 장씩 다시 인식한다.
 pub fn recognize(
     path: &str,
     audiveris: Option<&str>,
@@ -230,13 +234,40 @@ pub fn recognize(
     log: Log,
     progress: Option<&Arc<Progress>>,
 ) -> Result<Vec<String>, OmrError> {
+    let pages = progress::count_pdf_pages(path);
+    if (2..=PARALLEL_MAX_PAGES).contains(&pages) {
+        match recognize_with(path, audiveris, keep_dir, timeout, log, progress, true) {
+            Err(OmrError::Msg(m)) if !m.contains("너무 오래") && !m.contains(NOT_FOUND_MSG) => {
+                if let Some(l) = log {
+                    l("페이지 동시 인식이 안 돼서 한 장씩 다시 인식합니다");
+                }
+            }
+            r => return r,
+        }
+    }
+    recognize_with(path, audiveris, keep_dir, timeout, log, progress, false)
+}
+
+fn recognize_with(
+    path: &str,
+    audiveris: Option<&str>,
+    keep_dir: Option<&Path>,
+    timeout: u64,
+    log: Log,
+    progress: Option<&Arc<Progress>>,
+    parallel: bool,
+) -> Result<Vec<String>, OmrError> {
     let exe = match audiveris.map(|s| s.to_string()).or_else(find_audiveris) {
         Some(e) if Path::new(&e).is_file() => e,
         _ => return Err(OmrError::Msg(NOT_FOUND_MSG.into())),
     };
     let out = temp_dir("mabimml_omr_");
     let mut cmd = Command::new(&exe);
-    cmd.args(["-batch", "-transcribe", "-export", "-output"])
+    cmd.arg("-batch");
+    if parallel {
+        cmd.args(["-constant", "org.audiveris.omr.sheet.Book.processAllStubsInParallel=true"]);
+    }
+    cmd.args(["-transcribe", "-export", "-output"])
         .arg(&out)
         .arg("--")
         .arg(abspath(path))
@@ -258,7 +289,7 @@ pub fn recognize(
         p.add_process(child.id());
     }
     let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let meter = Arc::new(Mutex::new(AudiverisProgress::new(pages)));
+    let meter = Arc::new(Mutex::new(AudiverisProgress { parallel, ..AudiverisProgress::new(pages) }));
     let mut readers = Vec::new();
     for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
                    child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)]
@@ -286,8 +317,13 @@ pub fn recognize(
                     if let Some(p) = &prog {
                         let total = m.sheets;
                         let cur = m.current_sheet();
-                        let mut detail =
-                            if total > 0 && cur > 0 { format!("{}/{}장 인식 중", cur, total) } else { String::new() };
+                        let mut detail = if parallel && total > 0 {
+                            format!("{}장 동시 인식 중", total)
+                        } else if total > 0 && cur > 0 {
+                            format!("{}/{}장 인식 중", cur, total)
+                        } else {
+                            String::new()
+                        };
                         if m.exporting {
                             detail = "악보 파일로 내보내는 중".into();
                         }

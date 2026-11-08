@@ -45,6 +45,8 @@ pub struct AudiverisProgress {
     pub sheets: usize,
     pub done: BTreeMap<usize, usize>,
     pub exporting: bool,
+    /// 페이지를 동시에 인식하면 뒤 장이 보였다고 앞 장이 끝난 게 아니다
+    pub parallel: bool,
 }
 
 impl AudiverisProgress {
@@ -64,7 +66,7 @@ impl AudiverisProgress {
             let e = self.done.entry(sheet).or_insert(0);
             *e = (*e).max(idx);
             for (s, v) in self.done.iter_mut() {
-                if *s < sheet {
+                if *s < sheet && !self.parallel {
                     *v = OMR_STEPS.len();
                 }
             }
