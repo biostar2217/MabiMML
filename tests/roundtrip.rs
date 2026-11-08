@@ -127,7 +127,11 @@ fn roundtrip_random_songs() {
     let r = check(&p, &Options { rank: "무제한".into(), auto_detail: true, ..opts() });
     assert!(r.warnings[0].contains("64분음표"), "{:?}", r.warnings);
     let r = check(&p, &Options { rank: "1".into(), auto_detail: true, ..opts() });
-    assert!(r.warnings[0].starts_with("원곡 느낌"));
+    assert!(r.warnings[0].starts_with("한 장에 자동 맞춤"));
+    // 한 장에 들어갔다고 하면 정말 한 장
+    if !r.warnings[0].contains("들어가지 않아") {
+        assert_eq!(r.scores.len(), 1);
+    }
     let long_notes: Vec<Note> = (0..120).map(|i| n((i * 48) as f64, (i * 48 + 48) as f64, 60 + (i * 7) % 24, (40 + (i * 13) % 80) as f64)).collect();
     let song = Song { tracks: vec![Track::new("x", long_notes)], tempos: vec![(0.0, 100.0)], ..Default::default() };
     let fine = convert_song(&song, &Options { rank: "1".into(), grid: 64, volume_threshold: 1, ..opts() }).unwrap();
@@ -234,11 +238,15 @@ fn lecture_rules() {
     let mut ps: Vec<i64> = read_midi(&pv, true, true).unwrap().tracks.iter().flat_map(|t| t.notes.iter().map(|n| n.pitch)).collect();
     ps.sort();
     assert_eq!(ps, vec![72, 76]);
-    let r = one(vec![n(0.0, 96.0, 39, 100.0)], "", Options { instrument: "피아노".into(), transpose: 12, ..opts() });
+    let r = one(vec![n(0.0, 96.0, 39, 100.0)], "", Options { instrument: "튜닝 플루트".into(), transpose: 12, ..opts() });
     assert_eq!(r.parts_notes[0][0].pitch, 39);
     assert!(r.warnings.iter().any(|w| w.contains("안 날 수") && w.contains("마디 1")));
+    // 피아노는 o2e 아래도 나므로 안내하지 않는다
+    let r = one(vec![n(0.0, 96.0, 39, 100.0)], "", Options { instrument: "피아노".into(), transpose: 12, ..opts() });
+    assert_eq!(r.parts_notes[0][0].pitch, 39);
+    assert!(!r.warnings.iter().any(|w| w.contains("안 날 수")));
     assert_eq!(one(vec![n(0.0, 96.0, 39, 100.0)], "", Options { instrument: "만돌린".into(), ..opts() }).parts_notes[0][0].pitch, 51);
-    assert!(one(base.clone(), "", Options { instrument: "실로폰".into(), ..opts() }).warnings.iter().any(|w| w.contains("화음 파트가 안 날 수")));
+    assert!(one(base.clone(), "", Options { instrument: "실로폰".into(), ..opts() }).warnings.iter().any(|w| w.contains("한 파트 악기")));
     // 낮은 음
     let low = vec![n(0.0, 96.0, 39, 100.0), n(384.0, 480.0, 40, 100.0), n(768.0, 864.0, 28, 100.0)];
     let r = one(low.clone(), "", opts());
@@ -361,7 +369,7 @@ fn mobile_mml() {
     let r = convert_song(&song, &Options { split_players: true, ..opts() }).unwrap();
     let players: std::collections::BTreeSet<i64> = r.scores.iter().map(|s| s.player).collect();
     assert_eq!(players.into_iter().collect::<Vec<_>>(), vec![1, 2]);
-    assert!(r.text().contains("[연주자 2]"));
+    assert!(r.text().contains("[합주자 2]"));
     assert_eq!(convert_song(&read_mobile_mml("c,d,e").unwrap(), &Options { split_players: true, ..opts() }).unwrap().scores[0].player, 0);
     // 이름표, 쉼표, 줄바꿈
     assert_eq!(split_parts("Melody: CDE\nChord1: EFG\nChord 2: GAB"), ["CDE", "EFG", "GAB"]);
@@ -578,4 +586,337 @@ fn musicxml_measure_ending_with_backup_does_not_overlap_next() {
     let starts = |pc: i64| song.tracks[0].notes.iter().filter(|x| x.pitch == 60 + pc).map(|x| x.start).collect::<Vec<_>>();
     assert_eq!(starts(7), vec![384.0]);
     assert_eq!(starts(11), vec![1152.0]);
+}
+
+#[test]
+fn ensemble_players() {
+    // 다섯 음 화음: 혼자서는 음을 빼야 하지만 두 사람이면 다 들어간다
+    let mut notes = vec![];
+    for b in 0..16 {
+        for (j, p) in [48, 55, 64, 67, 72].iter().enumerate() {
+            notes.push(n((b * 96) as f64, (b * 96 + 96) as f64, p + (b % 3) as i64 + j as i64 * 0, 100.0));
+        }
+    }
+    let song = Song { tracks: vec![Track::new("t", notes.clone())], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let solo = convert_song(&song, &Options { rank: "무제한".into(), ..opts() }).unwrap();
+    assert!(solo.warnings.iter().any(|w| w.contains("뺐습니다")));
+    let r = convert_song(&song, &Options { rank: "무제한".into(), players: 2, ..opts() }).unwrap();
+    assert_eq!(r.scores.iter().map(|s| s.player).collect::<Vec<_>>(), vec![1, 2]);
+    assert!(!r.warnings.iter().any(|w| w.contains("뺐습니다")), "{:?}", r.warnings);
+    // 두 사람 악보를 합치면 원래 음이 모두 있다
+    let (parts, _) = scores_to_notes(&r.scores).unwrap();
+    let total: usize = parts.iter().map(|p| p.iter().filter(|n| n.vel > 0.0).count()).sum();
+    assert_eq!(total, notes.len());
+    // 자동: 음을 빼지 않는 가장 적은 인원 (2명)
+    let a = convert_song(&song, &Options { rank: "무제한".into(), players: 0, ..opts() }).unwrap();
+    assert_eq!(a.scores.last().unwrap().player, 2);
+    assert!(a.warnings[0].contains("자동"));
+    // 글자 수: 긴 멜로디는 자동 합주에서 다른 합주자에게 뒷부분이 넘어가 한 사람 한 장에 들어간다
+    let mut rng = Rng(3);
+    let mel: Vec<Note> = (0..1600).map(|i| n((i * 24) as f64, (i * 24 + 24) as f64, 72 + rng.range(0, 11), 90.0)).collect();
+    let long = Song { tracks: vec![Track::new("m", mel)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let one_p = convert_song(&long, &Options { rank: "5".into(), ..opts() }).unwrap();
+    assert!(one_p.scores.len() > 1);
+    let e = convert_song(&long, &Options { rank: "5".into(), players: 0, ..opts() }).unwrap();
+    let players = e.scores.last().unwrap().player as usize;
+    assert_eq!(e.scores.len(), players, "{:?}", e.warnings);
+    assert!(e.scores.iter().all(|sc| sc.lengths().iter().zip(e.limits.iter()).all(|(l, m)| l <= m)));
+    let (parts, _) = scores_to_notes(&e.scores).unwrap();
+    let total: usize = parts.iter().map(|p| p.iter().filter(|n| n.vel > 0.0).count()).sum();
+    assert_eq!(total, 1600);
+    // '무제한'이어도 합주 악보는 게임 한도(1랭크)로 나눈다
+    let u = convert_song(&long, &Options { rank: "무제한".into(), players: 2, ..opts() }).unwrap();
+    assert!(u.limits[0] < 100000 && u.scores.iter().all(|sc| sc.lengths().iter().zip(u.limits.iter()).all(|(l, m)| l <= m)));
+    assert!(u.warnings.iter().any(|w| w.contains("1랭크")));
+    // 여러 장이면 모든 합주자가 같은 마디에서 잘리고, 장마다 세 파트 길이가 구간 길이와 같다 (장 바꿀 때 싱크)
+    let m = convert_song(&long, &Options { rank: "연습".into(), players: 2, jabchiel: false, ..opts() }).unwrap();
+    let p1: Vec<&Score> = m.scores.iter().filter(|s| s.player == 1).collect();
+    let p2: Vec<&Score> = m.scores.iter().filter(|s| s.player == 2).collect();
+    assert!(p1.len() > 1 && p1.len() == p2.len(), "{} {}", p1.len(), p2.len());
+    for (a, b) in p1.iter().zip(p2.iter()) {
+        assert_eq!((a.start, a.end), (b.start, b.end));
+        for sc in [a, b] {
+            for mml in &sc.parts {
+                assert!((parse_part(mml).unwrap().2 - (sc.end - sc.start)).abs() < 1e-6);
+            }
+        }
+    }
+    assert!(m.scores.iter().all(|sc| sc.lengths().iter().zip(m.limits.iter()).all(|(l, x)| l <= x)));
+}
+
+#[test]
+fn ensemble_by_instrument_and_narrow_instruments() {
+    let mut tracks = vec![];
+    let mk = |name: &str, prog: i64, base: i64| {
+        let notes: Vec<Note> = (0..32).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, base + (i % 5) as i64, 100.0)).collect();
+        let mut t = Track::new(name, notes);
+        t.program = prog;
+        t.channel = 0;
+        t
+    };
+    tracks.push(mk("Track 1", 40, 79)); // 바이올린 (프로그램 번호로)
+    tracks.push(mk("Piano", 0, 60));
+    tracks.push(mk("Electric Bass", 33, 36));
+    let song = Song { tracks, tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], source: "midi".into(), ..Default::default() };
+    let r = convert_song(&song, &Options { players: 0, by_instrument: true, ..opts() }).unwrap();
+    let insts: Vec<(i64, String)> = r.scores.iter().map(|s| (s.player, s.instrument.clone())).collect();
+    assert_eq!(insts.len(), 3, "{:?} {:?}", insts, r.warnings);
+    let names: Vec<&str> = insts.iter().map(|x| x.1.as_str()).collect();
+    assert!(names.contains(&"바이올린") && names.contains(&"피아노") && names.contains(&"베이스"), "{:?}", names);
+    assert!(r.warnings[0].contains("악기별"));
+    // 피아노는 한 옥타브 낮춰 적고, 베이스는 o1c~o4b 안에 적는다
+    for sc in &r.scores {
+        let (notes, _) = scores_to_notes(&[sc.clone()]).unwrap();
+        let ps: Vec<i64> = notes.iter().flatten().filter(|x| x.vel > 0.0).map(|x| x.pitch).collect();
+        match sc.instrument.as_str() {
+            "피아노" => assert_eq!(*ps.iter().min().unwrap(), 48),
+            "베이스" => assert!(ps.iter().all(|&p| (24..=71).contains(&p))),
+            _ => {}
+        }
+    }
+    assert!(r.text().contains("[합주자 1 · "));
+    // 미리듣기: 합주자마다 그 악기 소리 (바이올린 40, 피아노 0, 베이스 33)
+    let (bytes, _) = mabimml::convert::preview_midi(&r.scores, 0, -1, true).unwrap();
+    let progs: Vec<u8> = bytes.windows(2).filter(|w| w[0] & 0xF0 == 0xC0 && w[0] & 0x0F < 8).map(|w| w[1]).collect();
+    for p in [40u8, 0, 33] {
+        assert!(progs.contains(&p), "{:?}", progs);
+    }
+    // 가야금 혼자: 높은 멜로디도 o1~o4 안으로
+    let high: Vec<Note> = (0..16).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 84 + (i % 7) as i64, 100.0)).collect();
+    let g = convert_song(
+        &Song { tracks: vec![Track::new("m", high)], tempos: vec![(0.0, 120.0)], ..Default::default() },
+        &Options { instrument: "가야금".into(), ..opts() },
+    )
+    .unwrap();
+    assert!(g.parts_notes[0].iter().all(|x| (24..=71).contains(&x.pitch)));
+    assert!(g.warnings.iter().any(|w| w.contains("가야금")));
+}
+
+#[test]
+fn drums_mobile_compact_one_part() {
+    // 드럼: GM 번호를 드럼 세트 음으로 (킥 36 -> o2f, 스네어 38 -> o2a, 약한 스네어 -> o3d 고스트, 클로즈드 하이햇 42 -> o3a)
+    let mut drum_notes = vec![];
+    for b in 0..8 {
+        let t = (b * 96) as f64;
+        drum_notes.push(n(t, t + 24.0, if b % 2 == 0 { 36 } else { 38 }, if b == 3 { 30.0 } else { 110.0 }));
+        drum_notes.push(n(t, t + 24.0, 42, 80.0));
+    }
+    let mut dt = Track::new("Drums", drum_notes);
+    dt.is_drum = true;
+    let mel = Track::new("m", (0..8).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 72 + i as i64, 100.0)).collect());
+    let song = Song { tracks: vec![mel, dt], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let solo = convert_song(&song, &Options { roles: Some([(0, "auto".to_string()), (1, "auto".to_string())].into_iter().collect()), ..opts() }).unwrap();
+    assert!(solo.warnings.iter().any(|w| w.contains("드럼 트랙은 혼자")));
+    assert!(solo.parts_notes.iter().flatten().all(|x| x.pitch >= 72));
+    let e = convert_song(&song, &Options { players: 2, include_drums: true, ..opts() }).unwrap();
+    let drum: Vec<&Score> = e.scores.iter().filter(|s| s.instrument == "드럼 세트").collect();
+    assert_eq!(drum.len(), 1, "{:?}", e.warnings);
+    let (dn, _) = scores_to_notes(&[drum[0].clone()]).unwrap();
+    let pitches: std::collections::BTreeSet<i64> = dn.iter().flatten().filter(|x| x.vel > 0.0).map(|x| x.pitch).collect();
+    assert_eq!(pitches.into_iter().collect::<Vec<_>>(), vec![41, 45, 50, 57]);
+    let (bytes, _) = mabimml::convert::preview_midi(&e.scores, 0, -1, true).unwrap();
+    assert!(bytes.windows(3).any(|w| w[0] == 0x99 && w[1] == 36), "드럼은 10번 채널로");
+
+    // 모바일: 6파트까지, 파트마다 2400자 안
+    let mut rng = Rng(5);
+    let dense: Vec<Note> = (0..1200)
+        .flat_map(|i| {
+            let t = (i * 48) as f64;
+            [72, 64, 55, 48].iter().map(move |&p| (t, p)).collect::<Vec<_>>()
+        })
+        .map(|(t, p)| n(t, t + 48.0, p + rng.range(0, 4), 90.0))
+        .collect();
+    let big = Song { tracks: vec![Track::new("d", dense)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let m = mabimml::convert::mobile_export(&big, &opts()).unwrap();
+    assert!(!m.sheets.is_empty());
+    assert!(m.sheets.iter().all(|sh| sh.len() <= 6 && sh.len() >= 4 && sh.iter().all(|p| p.chars().count() <= 2400)), "{:?}", m.warnings);
+    assert!(m.sheets.iter().flatten().all(|p| !p.contains("c-") && !p.contains("b+")));
+    assert!(m.text().contains("MML@"));
+
+    // 글자 수 줄이기: 경계 음과 멀리 떨어진 한 음
+    let jumpy: Vec<Note> = (0..16)
+        .map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, match i % 4 { 1 => 59, 3 => 96, _ => 60 }, 100.0))
+        .collect();
+    let c = one(jumpy.clone(), "", opts());
+    let plain = one(jumpy.clone(), "", Options { flats: false, n_numbers: false, ..opts() });
+    let txt = &c.scores[0].parts[0];
+    assert!(txt.contains("c-") && txt.contains("n84"), "{}", txt);
+    assert!(txt.len() < plain.scores[0].parts[0].len());
+    let (back, _, _) = parse_part(txt).unwrap();
+    assert_eq!(back.iter().map(|x| x.pitch).collect::<Vec<_>>(), jumpy.iter().map(|x| x.pitch).collect::<Vec<_>>());
+
+    // 실로폰(핸드 차임): 멜로디 한 파트, 볼륨 v11까지
+    let chord: Vec<Note> = (0..8).flat_map(|i| [72, 67, 60].map(|p| n((i * 96) as f64, (i * 96 + 96) as f64, p, 127.0))).collect();
+    let x = one(chord, "", Options { instrument: "실로폰".into(), ..opts() });
+    assert!(x.scores[0].parts[1].is_empty() && x.scores[0].parts[2].is_empty());
+    assert!(x.scores[0].parts[0].contains("v11") && !x.scores[0].parts[0].contains("v15"));
+}
+
+#[test]
+fn player_instruments_and_one_plus_drums() {
+    let mut drum_notes = vec![];
+    for b in 0..8 {
+        drum_notes.push(n((b * 96) as f64, (b * 96 + 24) as f64, 36, 100.0));
+    }
+    let mut dt = Track::new("Drums", drum_notes);
+    dt.is_drum = true;
+    let mel = Track::new("m", (0..8).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 60 + i as i64, 100.0)).collect());
+    let song = Song { tracks: vec![mel, dt], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    // 합주자 1명(전기기타) + 드럼
+    let r = convert_song(
+        &song,
+        &Options { players: 1, ensemble: true, include_drums: true, player_instruments: vec!["전기기타".into()], ..opts() },
+    )
+    .unwrap();
+    let who: Vec<(i64, String)> = r.scores.iter().map(|s| (s.player, s.instrument.clone())).collect();
+    assert_eq!(who, vec![(1, "전기기타".to_string()), (2, "드럼 세트".to_string())], "{:?}", r.warnings);
+    // 피아노로 바꾸면 한 옥타브 낮춰 적는다
+    let p = convert_song(&song, &Options { players: 1, ensemble: true, player_instruments: vec!["피아노".into()], ..opts() }).unwrap();
+    assert_eq!(p.scores[0].instrument, "피아노");
+    assert_eq!(p.parts_notes[0][0].pitch, 48);
+    assert!(p.warnings.iter().any(|w| w.contains("합주자 1: 피아노")));
+}
+
+#[test]
+fn auto_drums_follow_meter() {
+    // 4/4, 9마디 동안 음이 나는 곡에 드럼 트랙이 없을 때
+    let mel = Track::new("m", (0..36).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 72 + (i % 5) as i64, 100.0)).collect());
+    let song = Song { tracks: vec![mel], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let r = convert_song(&song, &Options { players: 1, ensemble: true, auto_drums: true, ..opts() }).unwrap();
+    let drum: Vec<&Score> = r.scores.iter().filter(|s| s.instrument == "드럼 세트").collect();
+    assert_eq!(drum.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings.iter().any(|w| w.contains("자동으로 만들었습니다")));
+    let (dn, _) = scores_to_notes(&[drum[0].clone()]).unwrap();
+    let mut hits: Vec<(i64, i64)> = dn.iter().flatten().filter(|x| x.vel > 0.0).map(|x| (x.start as i64, x.pitch)).collect();
+    hits.sort();
+    let bar1: Vec<(i64, i64)> = hits.iter().cloned().filter(|h| h.0 < 384).collect();
+    // 킥 o2f(41) 1·3박, 스네어 o2a(45) 2·4박, 하이햇 o3a(57) 8분음표, 첫 박 크래시 o4c(60)
+    for want in [(0, 41), (192, 41), (96, 45), (288, 45), (0, 60), (48, 57), (336, 57)] {
+        assert!(bar1.contains(&want), "{:?} 없음: {:?}", want, bar1);
+    }
+    // 8번째 마디 끝 필인(탐), 9번째 마디 첫 박 크래시
+    assert!(hits.iter().any(|h| h.0 >= 7 * 384 + 288 && h.0 < 8 * 384 && h.1 == 53), "{:?}", &hits[hits.len().saturating_sub(30)..]);
+    assert!(hits.contains(&(8 * 384, 60)));
+    // 풍성하게: 당김음 킥(2박 뒤 8분), 오픈 하이햇(o3g=55), 뒤 4마디 라이드(o4e=64), 4마디마다 필인
+    let rich = convert_song(&song, &Options { players: 1, ensemble: true, auto_drums: true, drum_style: "풍성하게".into(), ..opts() }).unwrap();
+    let d = rich.scores.iter().find(|s| s.instrument == "드럼 세트").unwrap().clone();
+    let (dn, _) = scores_to_notes(&[d]).unwrap();
+    let hits: Vec<(i64, i64)> = dn.iter().flatten().filter(|x| x.vel > 0.0).map(|x| (x.start as i64, x.pitch)).collect();
+    assert!(hits.contains(&(144, 41)) && hits.contains(&(336, 55)), "{:?}", &hits[..20.min(hits.len())]);
+    assert!(hits.iter().any(|h| h.0 >= 4 * 384 && h.0 < 8 * 384 && h.1 == 64));
+    assert!(hits.iter().any(|h| h.0 >= 3 * 384 + 288 && h.0 < 4 * 384 && h.1 == 53));
+    assert!(hits.len() > 120, "{}", hits.len());
+}
+
+#[test]
+fn cut_start_and_end() {
+    // 4/4, 120 BPM: 한 마디 = 2초. 9초는 5번째 마디 중간 -> 5번째 마디 처음(1536)부터 남긴다
+    let notes: Vec<Note> = (0..40).map(|i| n((i * 96) as f64, (i * 96 + 96) as f64, 60 + (i % 12) as i64, 100.0)).collect();
+    let song = Song { tracks: vec![Track::new("m", notes)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let r = convert_song(&song, &Options { cut_start_sec: 9.0, cut_end_sec: 15.0, ..opts() }).unwrap();
+    let p = &r.parts_notes[0];
+    assert_eq!(p.first().map(|x| (x.start, x.pitch)), Some((0.0, 60 + (16 % 12) as i64)));
+    // 15초는 8번째 마디 중간 -> 8번째 마디 끝(3072)까지: 16~31번 음 16개
+    assert_eq!(p.len(), 16, "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("잘라 냈습니다"));
+}
+
+#[test]
+fn drop_players_keeps_original_numbers() {
+    let mut notes = vec![];
+    for b in 0..16 {
+        for p in [48, 55, 64, 67, 72] {
+            notes.push(n((b * 96) as f64, (b * 96 + 96) as f64, p, 100.0));
+        }
+    }
+    let song = Song { tracks: vec![Track::new("t", notes)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let r = convert_song(&song, &Options { players: 3, drop_players: vec![2], ..opts() }).unwrap();
+    let who: Vec<(i64, i64)> = r.scores.iter().map(|s| (s.player, s.orig_player)).collect();
+    assert_eq!(who, vec![(1, 1), (2, 3)], "{:?}", r.warnings);
+    assert!(r.warnings.iter().any(|w| w.contains("뺐습니다")));
+}
+
+#[test]
+fn drum_merge_inserts_rests_at_sheet_changes() {
+    let mut rng = Rng(9);
+    let mel: Vec<Note> = (0..1600).map(|i| n((i * 24) as f64, (i * 24 + 24) as f64, 72 + rng.range(0, 11), 90.0)).collect();
+    let song = Song { tracks: vec![Track::new("m", mel)], tempos: vec![(0.0, 120.0)], timesigs: vec![(0.0, 4, 4)], ..Default::default() };
+    let o = Options { rank: "연습".into(), players: 1, ensemble: true, auto_drums: true, drum_compact: true, drum_merge: true, drum_merge_rest: 1.0, ..opts() };
+    let r = convert_song(&song, &o).unwrap();
+    let mel_sheets: Vec<&Score> = r.scores.iter().filter(|s| s.player == 1).collect();
+    let drum: Vec<&Score> = r.scores.iter().filter(|s| s.instrument == "드럼 세트").collect();
+    assert!(mel_sheets.len() > 1 && drum.len() < mel_sheets.len(), "{} {}", mel_sheets.len(), drum.len());
+    // 드럼 첫 장 길이 = 합친 구간 + 장 경계마다 1박
+    let d = drum[0];
+    let covered = mel_sheets.iter().filter(|s| s.end <= d.start + (d.end - d.start) + 1.0 && s.start >= d.start).count();
+    let (_, _, len) = parse_part(&d.parts[0]).unwrap();
+    let plain: f64 = mel_sheets.iter().take(covered).map(|s| s.end - s.start).sum();
+    assert!((len - (plain + 96.0 * (covered as f64 - 1.0))).abs() < 1.0 || covered <= 1, "len {} plain {} covered {}", len, plain, covered);
+}
+
+#[test]
+fn musicxml_overfull_measure_does_not_shift_later_bars() {
+    // 악보 인식이 박자를 잘못 읽어 마디가 4박보다 길어도 다음 마디는 제자리(4박 뒤)에서 시작하고 두 손이 어긋나지 않는다
+    let n = |step: &str, dur: i64| format!("<note><pitch><step>{}</step><octave>4</octave></pitch><duration>{}</duration></note>", step, dur);
+    let attrs = "<attributes><divisions>48</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>";
+    let rh = format!(
+        "<part id=\"P1\"><measure number=\"1\">{}{}</measure><measure number=\"2\">{}{}{}{}{}</measure><measure number=\"3\">{}</measure></part>",
+        attrs, n("C", 192), n("D", 6), n("C", 36), n("C", 9), n("G", 48), n("B", 96), n("E", 192)
+    );
+    let lh = format!(
+        "<part id=\"P2\"><measure number=\"1\">{}{}</measure><measure number=\"2\">{}{}</measure><measure number=\"3\">{}</measure></part>",
+        attrs, n("C", 192), n("A", 96), n("F", 102), n("G", 192)
+    );
+    let xml = format!(
+        "<score-partwise><identification><encoding><software>Audiveris 5.11</software></encoding></identification><part-list><score-part id=\"P1\"><part-name>a</part-name></score-part><score-part id=\"P2\"><part-name>b</part-name></score-part></part-list>{}{}</score-partwise>",
+        rh, lh
+    );
+    let song = mabimml::musicxml_io::read_musicxml_text(&xml).unwrap();
+    assert_eq!(song.bars.as_ref().unwrap(), &vec![0.0, 384.0, 768.0]);
+    let start = |t: usize, p: i64| song.tracks[t].notes.iter().find(|x| x.pitch == p).unwrap().start;
+    assert_eq!(start(0, 64), 768.0);
+    assert_eq!(start(1, 67), 768.0);
+    assert!(song.tracks.iter().flat_map(|t| t.notes.iter()).filter(|x| x.start >= 384.0 && x.start < 768.0).all(|x| x.end <= 768.0 + 1e-6));
+}
+
+#[test]
+fn omr_chunk_plan_uses_cores() {
+    use mabimml::omr::plan_chunks;
+    // 한 페이지는 나누지 않음
+    assert_eq!(plan_chunks(1, 32, None).0.len(), 0);
+    // 6쪽, 코어 32개: 한 번에 6쪽 모두 동시에
+    assert_eq!(plan_chunks(6, 32, Some(60.0)), (vec![(1, 6)], 1));
+    // 6쪽, 코어 4개: 3쪽씩 두 덩어리
+    assert_eq!(plan_chunks(6, 4, None), (vec![(1, 3), (4, 6)], 1));
+    // 40쪽, 코어 32개: 10쪽씩 4덩어리를 2개씩 동시에 (20쪽 동시 >= 코어 절반)
+    let (c, p) = plan_chunks(40, 32, Some(60.0));
+    assert_eq!(c.len(), 4);
+    assert!(c.iter().map(|x| x.1 - x.0 + 1).max().unwrap() * p >= 16);
+    assert_eq!(c.first().unwrap().0, 1);
+    assert_eq!(c.last().unwrap().1, 40);
+    // 메모리가 모자라면 덜 동시에
+    let (c, p) = plan_chunks(40, 32, Some(3.0));
+    assert!(c.iter().map(|x| x.1 - x.0 + 1).max().unwrap() * p <= 4);
+}
+
+#[test]
+fn musicxml_clamp_only_for_omr_and_composite_meter() {
+    let n = |step: &str, dur: i64| format!("<note><pitch><step>{}</step><octave>4</octave></pitch><duration>{}</duration></note>", step, dur);
+    // 사람이 만든 악보: 반복 앞에서 쪼갠 3박 마디는 그대로 (쉼을 끼우지 않음)
+    let attrs = "<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>";
+    let xml = format!(
+        "<score-partwise><part-list><score-part id=\"P1\"><part-name>a</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\">{}{}</measure><measure number=\"2\">{}</measure><measure number=\"3\">{}</measure></part></score-partwise>",
+        attrs, n("C", 4), n("D", 3), n("E", 4)
+    );
+    let song = mabimml::musicxml_io::read_musicxml_text(&xml).unwrap();
+    assert_eq!(song.tracks[0].notes.iter().find(|x| x.pitch == 64).unwrap().start, 672.0);
+    // 3+2/8 은 5/8 (240) 으로 읽는다
+    let attrs = "<attributes><divisions>2</divisions><time><beats>3+2</beats><beat-type>8</beat-type></time></attributes>";
+    let xml = format!(
+        "<score-partwise><identification><encoding><software>Audiveris</software></encoding></identification><part-list><score-part id=\"P1\"><part-name>a</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\">{}{}{}</measure><measure number=\"2\">{}</measure></part></score-partwise>",
+        attrs, n("C", 3), n("D", 2), n("E", 5)
+    );
+    let song = mabimml::musicxml_io::read_musicxml_text(&xml).unwrap();
+    assert_eq!(song.bars.as_ref().unwrap(), &vec![0.0, 240.0]);
+    assert_eq!(song.tracks[0].notes.iter().find(|x| x.pitch == 62).unwrap().start, 144.0);
 }

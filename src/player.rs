@@ -36,6 +36,76 @@ fn mci(_cmd: &str) -> Result<String, PlayerError> {
     Err(PlayerError("바로 듣기는 Windows에서만 됩니다. 미리듣기 MIDI를 저장해서 들어 주세요.".into()))
 }
 
+/// 건반 소리용 MIDI 장치 (핸들, 마지막으로 낸 음 번호). 장치는 한 번에 하나만 열 수 있어 함께 쓴다
+#[cfg(windows)]
+static NOTE_OUT: std::sync::Mutex<(usize, u64)> = std::sync::Mutex::new((0, 0));
+
+/// 건반을 누를 때 음 하나를 짧게 들려준다 (Windows 기본 MIDI 장치, 실패하면 소리 없이 넘어감). program 128 이상은 드럼.
+/// 잠시 뒤 아무 음도 더 안 누르면 장치를 닫는다 (미리듣기 재생이 장치를 쓸 수 있게)
+#[cfg(windows)]
+pub fn preview_note(pitch: i64, program: i64) {
+    use windows_sys::Win32::Media::Audio::{midiOutOpen, midiOutShortMsg, HMIDIOUT};
+    let p = pitch.clamp(0, 127) as u32;
+    // 128 이상이면 드럼 (10번 채널)
+    let drum = program >= 128;
+    let prog = program.clamp(0, 127) as u32;
+    let gen = {
+        let mut g = NOTE_OUT.lock().unwrap();
+        if g.0 == 0 {
+            let mut h: HMIDIOUT = std::ptr::null_mut();
+            // MIDI_MAPPER (-1): 기본 장치. 미리듣기가 재생 중이면 열리지 않으므로 그냥 넘어간다
+            if unsafe { midiOutOpen(&mut h, u32::MAX, 0, 0, 0) } != 0 || h.is_null() {
+                return;
+            }
+            g.0 = h as usize;
+        }
+        let h = g.0 as HMIDIOUT;
+        unsafe {
+            if drum {
+                midiOutShortMsg(h, 0x99 | (p << 8) | (100 << 16));
+            } else {
+                midiOutShortMsg(h, 0xC0 | (prog << 8));
+                midiOutShortMsg(h, 0x90 | (p << 8) | (100 << 16));
+            }
+        }
+        g.1 += 1;
+        g.1
+    };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let mut g = NOTE_OUT.lock().unwrap();
+        if g.0 != 0 {
+            unsafe { midiOutShortMsg(g.0 as HMIDIOUT, if drum { 0x89 } else { 0x80 } | (p << 8)) };
+            if g.1 == gen {
+                close_note_out(&mut g);
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+fn close_note_out(g: &mut (usize, u64)) {
+    use windows_sys::Win32::Media::Audio::{midiOutClose, midiOutReset, HMIDIOUT};
+    if g.0 != 0 {
+        unsafe {
+            midiOutReset(g.0 as HMIDIOUT);
+            midiOutClose(g.0 as HMIDIOUT);
+        }
+        g.0 = 0;
+    }
+}
+
+/// 건반 소리 장치를 닫는다 (미리듣기 재생 전에)
+#[cfg(windows)]
+pub fn release_preview_note() {
+    close_note_out(&mut NOTE_OUT.lock().unwrap());
+}
+
+#[cfg(not(windows))]
+pub fn preview_note(_pitch: i64, _program: i64) {}
+#[cfg(not(windows))]
+pub fn release_preview_note() {}
+
 #[derive(Default)]
 pub struct PianoPlayer {
     path: Option<std::path::PathBuf>,
@@ -54,6 +124,7 @@ impl PianoPlayer {
     /// from_ms 밀리초 위치부터 재생한다.
     pub fn play_from(&mut self, scores: &[Score], shift: i64, program: i64, from_ms: u64) -> Result<usize, PlayerError> {
         self.stop();
+        release_preview_note();
         let (bytes, skipped) = preview_midi(scores, shift, program, true).map_err(|e| PlayerError(e.to_string()))?;
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         let path = std::env::temp_dir().join(format!("mabimml_{}_{}.mid", std::process::id(), stamp));

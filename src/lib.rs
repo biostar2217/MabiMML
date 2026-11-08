@@ -8,6 +8,7 @@ pub mod config;
 pub mod convert;
 pub mod encoder;
 pub mod midi_io;
+pub mod mml_edit;
 pub mod mml_parser;
 pub mod mml_split;
 pub mod mobile_io;
@@ -24,5 +25,5 @@ pub mod sheet;
 pub mod theme;
 pub mod zipread;
 
-pub const VERSION: &str = "2.2";
+pub const VERSION: &str = "3.0.1";
 pub const AUTHOR: &str = "LT 남븝";
