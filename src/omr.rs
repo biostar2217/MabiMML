@@ -3,6 +3,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -221,11 +222,56 @@ fn temp_dir(prefix: &str) -> PathBuf {
 
 pub type Log<'a> = Option<&'a (dyn Fn(&str) + Sync)>;
 
-/// 여러 페이지를 동시에 인식할 최대 페이지 수 (넘으면 메모리를 아끼려고 한 장씩)
+/// Audiveris 한 번이 동시에 인식할 최대 페이지 수 (자바 메모리 8GB 안에서)
 const PARALLEL_MAX_PAGES: usize = 12;
+/// 페이지 하나를 인식할 때 드는 메모리 (대략, GB)
+const GB_PER_PAGE: f64 = 0.5;
+/// Audiveris 를 하나 더 띄울 때 드는 기본 메모리 (대략, GB)
+const GB_PER_PROCESS: f64 = 1.0;
+
+/// 지금 쓸 수 있는 메모리 (GB). 모르면 None.
+fn free_memory_gb() -> Option<f64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
+            return Some(m.ullAvailPhys as f64 / 1024.0 / 1024.0 / 1024.0);
+        }
+    }
+    None
+}
+
+/// 페이지를 몇 장씩 몇 덩어리로 나눠 동시에 인식할지 정한다.
+/// 돌려주는 값: (덩어리마다 페이지 범위 [시작, 끝] 1부터, 동시에 돌릴 Audiveris 수)
+/// 동시에 인식하는 페이지 수는 CPU 논리 코어의 3/4 (최소 절반), 남은 메모리에 맞춘다.
+pub fn plan_chunks(pages: usize, cores: usize, free_gb: Option<f64>) -> (Vec<(usize, usize)>, usize) {
+    if pages <= 1 {
+        return (vec![], 1);
+    }
+    let cores = cores.max(1);
+    let mut want = (cores - cores / 4).max((cores + 1) / 2).max(1);
+    if let Some(gb) = free_gb {
+        let fit = ((gb - GB_PER_PROCESS) / GB_PER_PAGE).floor().max(1.0) as usize;
+        want = want.min(fit);
+    }
+    let want = want.min(pages);
+    if want <= 1 {
+        return (vec![], 1);
+    }
+    let size = want.min(PARALLEL_MAX_PAGES);
+    let n = (pages + size - 1) / size;
+    // 덩어리 크기를 고르게
+    let size = (pages + n - 1) / n;
+    let chunks: Vec<(usize, usize)> =
+        (0..n).map(|i| (i * size + 1, ((i + 1) * size).min(pages))).filter(|c| c.0 <= c.1).collect();
+    let procs = (want / size).max(1).min(chunks.len());
+    (chunks, procs)
+}
 
 /// 악보 PDF/이미지를 인식해 MusicXML 파일 경로 목록(악장 순서)을 돌려준다.
-/// 여러 페이지는 동시에 인식하고 (CPU 코어를 다 씀), 그게 실패하면 한 장씩 다시 인식한다.
+/// 여러 페이지는 CPU 코어에 맞춰 나눠서 동시에 인식하고, 그게 실패하면 한 장씩 다시 인식한다.
 pub fn recognize(
     path: &str,
     audiveris: Option<&str>,
@@ -234,38 +280,134 @@ pub fn recognize(
     log: Log,
     progress: Option<&Arc<Progress>>,
 ) -> Result<Vec<String>, OmrError> {
-    let pages = progress::count_pdf_pages(path);
-    if (2..=PARALLEL_MAX_PAGES).contains(&pages) {
-        match recognize_with(path, audiveris, keep_dir, timeout, log, progress, true) {
-            Err(OmrError::Msg(m)) if !m.contains("너무 오래") && !m.contains(NOT_FOUND_MSG) => {
-                if let Some(l) = log {
-                    l("페이지 동시 인식이 안 돼서 한 장씩 다시 인식합니다");
-                }
-            }
-            r => return r,
-        }
-    }
-    recognize_with(path, audiveris, keep_dir, timeout, log, progress, false)
-}
-
-fn recognize_with(
-    path: &str,
-    audiveris: Option<&str>,
-    keep_dir: Option<&Path>,
-    timeout: u64,
-    log: Log,
-    progress: Option<&Arc<Progress>>,
-    parallel: bool,
-) -> Result<Vec<String>, OmrError> {
     let exe = match audiveris.map(|s| s.to_string()).or_else(find_audiveris) {
         Some(e) if Path::new(&e).is_file() => e,
         _ => return Err(OmrError::Msg(NOT_FOUND_MSG.into())),
     };
+    if let Some(l) = log {
+        l("악보 인식 중… (페이지 수에 따라 몇 분 걸릴 수 있습니다)");
+    }
+    let pages = progress::count_pdf_pages(path);
+    let cores = std::env::var("MABIMML_OMR_CORES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    let (chunks, procs) = plan_chunks(pages, cores, free_memory_gb());
+    let started = Instant::now();
+    let mut found: Option<Vec<String>> = None;
+    if !chunks.is_empty() {
+        if let Some(l) = log {
+            l(&format!("CPU 코어 {}개: {}쪽을 {}덩어리로 나눠 동시에 인식합니다", cores, pages, chunks.len()));
+        }
+        let meter = Arc::new(Mutex::new(AudiverisProgress {
+            parallel: true,
+            chunks: chunks.len(),
+            ..AudiverisProgress::new(pages)
+        }));
+        let results: Vec<Mutex<Option<Result<Vec<String>, OmrError>>>> = chunks.iter().map(|_| Mutex::new(None)).collect();
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..procs {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= chunks.len() {
+                        break;
+                    }
+                    let sheets = if chunks.len() > 1 { Some(chunks[i]) } else { None };
+                    let r = run_audiveris(&exe, path, timeout, progress, meter.clone(), true, sheets);
+                    let failed = r.is_err();
+                    *results[i].lock().unwrap() = Some(r);
+                    if failed {
+                        // 하나라도 실패하면 남은 덩어리는 시작하지 않는다
+                        next.store(chunks.len(), Ordering::SeqCst);
+                        break;
+                    }
+                });
+            }
+        });
+        let mut all = Vec::new();
+        let mut err: Option<OmrError> = None;
+        for r in results {
+            match r.into_inner().unwrap() {
+                Some(Ok(f)) => all.extend(f),
+                Some(Err(e)) => {
+                    err.get_or_insert(e);
+                }
+                None => {}
+            }
+        }
+        match err {
+            Some(OmrError::Msg(m)) if !m.contains("너무 오래") => {
+                if let Some(l) = log {
+                    l("나눠서 동시 인식이 안 돼서 한 장씩 다시 인식합니다");
+                }
+            }
+            Some(e) => return Err(e),
+            None => found = Some(all),
+        }
+    }
+    let found = match found {
+        Some(f) => f,
+        None => {
+            let meter = Arc::new(Mutex::new(AudiverisProgress::new(pages)));
+            run_audiveris(&exe, path, timeout, progress, meter, false, None)?
+        }
+    };
+    if let Some(p) = progress {
+        if !p.is_cancelled() && pages > 0 {
+            let mut cfg = config::load();
+            let old = cfg.get(progress::CFG_OMR_SPEED).and_then(|v| v.as_f64());
+            let new = progress::update_average(old, started.elapsed().as_secs_f64() / pages as f64, 0.4);
+            cfg.insert(progress::CFG_OMR_SPEED.into(), serde_json::json!((new * 100.0).round() / 100.0));
+            config::save(&cfg);
+        }
+    }
+    if let Some(keep) = keep_dir {
+        let fname = Path::new(path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        for f in backup_results(&keep.join(&fname).to_string_lossy()) {
+            if let Some(l) = log {
+                l(&format!("기존 인식 결과 보존: {}", f));
+            }
+        }
+        let base = Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut kept = Vec::new();
+        let many = found.len() > 1;
+        for (i, f) in found.iter().enumerate() {
+            let suffix = if many { format!("_{}", i + 1) } else { String::new() };
+            let ext = Path::new(f).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+            let dst = keep.join(format!("{}_인식{}{}", base, suffix, ext));
+            match std::fs::copy(f, &dst) {
+                Ok(_) => kept.push(dst.to_string_lossy().into_owned()),
+                Err(_) => kept.push(f.clone()),
+            }
+        }
+        return Ok(kept);
+    }
+    Ok(found)
+}
+
+/// Audiveris 를 한 번 돌려 결과 MusicXML 목록(악장 순서)을 돌려준다. sheets: 이 페이지 범위만 인식
+fn run_audiveris(
+    exe: &str,
+    path: &str,
+    timeout: u64,
+    progress: Option<&Arc<Progress>>,
+    meter: Arc<Mutex<AudiverisProgress>>,
+    parallel: bool,
+    sheets: Option<(usize, usize)>,
+) -> Result<Vec<String>, OmrError> {
     let out = temp_dir("mabimml_omr_");
-    let mut cmd = Command::new(&exe);
+    let mut cmd = Command::new(exe);
     cmd.arg("-batch");
     if parallel {
         cmd.args(["-constant", "org.audiveris.omr.sheet.Book.processAllStubsInParallel=true"]);
+    }
+    if let Some((a, b)) = sheets {
+        cmd.arg("-sheets");
+        for k in a..=b {
+            cmd.arg(k.to_string());
+        }
     }
     cmd.args(["-transcribe", "-export", "-output"])
         .arg(&out)
@@ -279,17 +421,12 @@ fn recognize_with(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    if let Some(l) = log {
-        l("악보 인식 중… (페이지 수에 따라 몇 분 걸릴 수 있습니다)");
-    }
-    let pages = progress::count_pdf_pages(path);
     let started = Instant::now();
     let mut child = cmd.spawn().map_err(|e| OmrError::Msg(format!("Audiveris 실행 실패: {}", e)))?;
     if let Some(p) = progress {
         p.add_process(child.id());
     }
     let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let meter = Arc::new(Mutex::new(AudiverisProgress { parallel, ..AudiverisProgress::new(pages) }));
     let mut readers = Vec::new();
     for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
                    child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)]
@@ -354,15 +491,6 @@ fn recognize_with(
         if p.is_cancelled() {
             return Err(OmrError::Cancelled);
         }
-        let m = meter.lock().unwrap();
-        let sheets = if m.sheets > 0 { m.sheets } else { pages };
-        if status.success() && sheets > 0 {
-            let mut cfg = config::load();
-            let old = cfg.get(progress::CFG_OMR_SPEED).and_then(|v| v.as_f64());
-            let new = progress::update_average(old, started.elapsed().as_secs_f64() / sheets as f64, 0.4);
-            cfg.insert(progress::CFG_OMR_SPEED.into(), serde_json::json!((new * 100.0).round() / 100.0));
-            config::save(&cfg);
-        }
     }
     let mut found = Vec::new();
     find_results(&out, &mut found);
@@ -381,27 +509,6 @@ fn recognize_with(
         )));
     }
     found.sort_by_key(|p| movement_key(p));
-    if let Some(keep) = keep_dir {
-        let fname = Path::new(path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        for f in backup_results(&keep.join(&fname).to_string_lossy()) {
-            if let Some(l) = log {
-                l(&format!("기존 인식 결과 보존: {}", f));
-            }
-        }
-        let base = Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut kept = Vec::new();
-        let many = found.len() > 1;
-        for (i, f) in found.iter().enumerate() {
-            let suffix = if many { format!("_{}", i + 1) } else { String::new() };
-            let ext = Path::new(f).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-            let dst = keep.join(format!("{}_인식{}{}", base, suffix, ext));
-            match std::fs::copy(f, &dst) {
-                Ok(_) => kept.push(dst.to_string_lossy().into_owned()),
-                Err(_) => kept.push(f.clone()),
-            }
-        }
-        return Ok(kept);
-    }
     Ok(found)
 }
 

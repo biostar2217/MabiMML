@@ -273,7 +273,15 @@ pub fn merge_songs(mut songs: Vec<Song>) -> Song {
         if let Some(last) = s.timesigs.last() {
             bar = last.1 as f64 * UNITS_PER_WHOLE as f64 / last.2 as f64;
         }
-        let end = -floordiv(-end, bar) * bar;
+        let mut end = -floordiv(-end, bar) * bar;
+        // 마디 위치를 알면 마지막 마디 끝에서 다음 악장(덩어리)을 잇는다 (못갖춘마디·끝의 쉬는 마디도 맞게)
+        if let Some(&last) = s.bars.as_ref().and_then(|b| b.last()) {
+            let note_end = s.end_unit();
+            end = last + bar;
+            while end < note_end - 1e-6 {
+                end += bar;
+            }
+        }
         for (i, t) in s.tracks.iter().enumerate() {
             if i >= tracks.len() {
                 tracks.push(Track { name: t.name.clone(), notes: vec![], channel: t.channel, program: t.program, is_drum: false });

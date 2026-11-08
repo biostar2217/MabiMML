@@ -874,3 +874,23 @@ fn musicxml_overfull_measure_does_not_shift_later_bars() {
     assert_eq!(start(1, 67), 768.0);
     assert!(song.tracks.iter().flat_map(|t| t.notes.iter()).filter(|x| x.start >= 384.0 && x.start < 768.0).all(|x| x.end <= 768.0 + 1e-6));
 }
+
+#[test]
+fn omr_chunk_plan_uses_cores() {
+    use mabimml::omr::plan_chunks;
+    // 한 페이지는 나누지 않음
+    assert_eq!(plan_chunks(1, 32, None).0.len(), 0);
+    // 6쪽, 코어 32개: 한 번에 6쪽 모두 동시에
+    assert_eq!(plan_chunks(6, 32, Some(60.0)), (vec![(1, 6)], 1));
+    // 6쪽, 코어 4개: 3쪽씩 두 덩어리
+    assert_eq!(plan_chunks(6, 4, None), (vec![(1, 3), (4, 6)], 1));
+    // 40쪽, 코어 32개: 10쪽씩 4덩어리를 2개씩 동시에 (20쪽 동시 >= 코어 절반)
+    let (c, p) = plan_chunks(40, 32, Some(60.0));
+    assert_eq!(c.len(), 4);
+    assert!(c.iter().map(|x| x.1 - x.0 + 1).max().unwrap() * p >= 16);
+    assert_eq!(c.first().unwrap().0, 1);
+    assert_eq!(c.last().unwrap().1, 40);
+    // 메모리가 모자라면 덜 동시에
+    let (c, p) = plan_chunks(40, 32, Some(3.0));
+    assert!(c.iter().map(|x| x.1 - x.0 + 1).max().unwrap() * p <= 4);
+}

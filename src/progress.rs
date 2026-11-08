@@ -47,6 +47,9 @@ pub struct AudiverisProgress {
     pub exporting: bool,
     /// 페이지를 동시에 인식하면 뒤 장이 보였다고 앞 장이 끝난 게 아니다
     pub parallel: bool,
+    /// 나눠서 돌리는 Audiveris 수. 모두 내보내기에 들어가야 내보내는 중
+    pub chunks: usize,
+    pub exports: usize,
 }
 
 impl AudiverisProgress {
@@ -73,7 +76,10 @@ impl AudiverisProgress {
             return true;
         }
         if export_re().is_match(line) {
-            self.exporting = true;
+            if line.contains("Exporting sheet") {
+                self.exports += 1;
+            }
+            self.exporting = self.exports >= self.chunks.max(1);
             return true;
         }
         false
