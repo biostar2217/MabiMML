@@ -368,6 +368,8 @@ pub struct Options {
     pub drum_merge: bool,
     /// 드럼 장을 합칠 때 다른 합주자가 장을 바꾸는 자리마다 넣을 쉼 (박)
     pub drum_merge_rest: f64,
+    /// 화음 파트를 이 간격(유닛)의 박에서 시작하는 음만 남겨 단순하게 (0 = 그대로). '한 장에 자동 맞춤'의 마지막 단계
+    pub thin_chords: i64,
     /// 합주에서 곡 화음을 따라 베이스 합주자를 자동으로 만든다 (모양은 drum_style 을 따름)
     pub auto_bass: bool,
 }
@@ -418,6 +420,7 @@ impl Default for Options {
             drum_compact: false,
             drum_merge: false,
             drum_merge_rest: 1.0,
+            thin_chords: 0,
             auto_bass: false,
         }
     }
@@ -1087,22 +1090,83 @@ fn max_end(parts: &[Vec<Note>]) -> i64 {
     parts.iter().flatten().map(|n| n.end).fold(0.0f64, |a, b| if b > a { b } else { a }) as i64
 }
 
-fn pick_detail(song: &Song, opts: &Options) -> Res<(i64, i64)> {
-    let all: Vec<&Note> = song.tracks.iter().flat_map(|t| t.notes.iter()).collect();
-    let short = all.iter().filter(|n| n.key_or_end() - n.start < 24.0).count();
-    let mut ladder: Vec<(i64, i64)> = DETAIL_FINE.to_vec();
-    if (short as f64) < all.len() as f64 * 0.05 {
-        ladder.extend(DETAIL_COARSE);
+/// 화음 파트(3개씩 묶음의 2·3번째)를 step 박에서 시작하는 음만 남기고, 남긴 음은 다음 남긴 음까지 늘인다
+fn thin_chord_parts(parts: &mut [Vec<Note>], step: i64) {
+    if step <= 0 {
+        return;
     }
-    for (grid, step) in ladder {
-        let o = Options { grid, volume_threshold: step, auto_detail: false, ..opts.clone() };
-        let (parts, tempos, limits, _) = arrange(song, &o, &mut Vec::new())?;
-        let end = max_end(&parts);
-        if fits(&encode_segment(&parts, &tempos, 0, end, &o)?, &limits) {
-            return Ok((grid, step));
+    let step = step as f64;
+    for (i, part) in parts.iter_mut().enumerate() {
+        if i % 3 == 0 || part.is_empty() {
+            continue;
+        }
+        let mut kept: Vec<Note> = part.iter().filter(|n| n.vel == 0.0 || (n.start / step - (n.start / step).round()).abs() < 1e-6).cloned().collect();
+        if kept.is_empty() {
+            continue;
+        }
+        let ends: Vec<f64> = part.iter().map(|n| n.end).collect();
+        let last_end = ends.iter().cloned().fold(0.0, f64::max);
+        for j in 0..kept.len() {
+            let next = kept.get(j + 1).map(|n| n.start).unwrap_or(last_end);
+            if kept[j].vel != 0.0 && next > kept[j].end {
+                // 빠진 음 자리까지 소리를 이어 화음이 비지 않게 (한 박을 넘기지는 않음)
+                kept[j].end = next.min(kept[j].start + step * 2.0).max(kept[j].end);
+            }
+        }
+        *part = kept;
+    }
+}
+
+/// '한 장에 자동 맞춤': 가장 세밀한 것부터 차례로 단순하게 바꿔 보며 (합주자마다) 한 장에 들어가는 첫 설정으로 변환한다.
+/// 실제로 변환해 장 수를 세므로 합주·자브키엘 등 어떤 설정에서도 결과가 맞다.
+/// 가장 단순하게 해도 넘치면 장 수가 가장 적은 결과를 쓰고 그렇다고 알린다.
+fn auto_fit(song: &Song, opts: &Options) -> Res<ConvResult> {
+    let mut ladder: Vec<(i64, i64, Option<&str>)> = DETAIL_FINE.iter().chain(DETAIL_COARSE.iter()).map(|&(g, s)| (g, s, None)).collect();
+    // 그래도 넘치면 볼륨 변화를 적지 않고 격자를 더 굵게
+    ladder.extend([(32, 3, Some("fixed")), (16, 3, Some("fixed")), (8, 3, Some("fixed"))]);
+    // 마지막: 화음 파트를 8분음표 박, 4분음표 박에서 치는 음만 남겨 단순하게
+    let mut rungs: Vec<(i64, i64, Option<&str>, i64)> = ladder.into_iter().map(|(g, s, v)| (g, s, v, 0)).collect();
+    rungs.extend([(16, 3, Some("fixed"), 48), (16, 3, Some("fixed"), 96), (8, 3, Some("fixed"), 96)]);
+    let mut best: Option<(usize, ConvResult, String)> = None;
+    for (grid, step, vol, thin) in rungs {
+        let o = Options {
+            grid,
+            volume_threshold: step,
+            volume_mode: vol.map(|v| v.to_string()).unwrap_or_else(|| opts.volume_mode.clone()),
+            auto_detail: false,
+            thin_chords: thin,
+            ..opts.clone()
+        };
+        let mut res = convert_song(song, &o)?;
+        let players = {
+            let mut p: Vec<i64> = res.scores.iter().map(|s| s.player).collect();
+            p.sort();
+            p.dedup();
+            p.len().max(1)
+        };
+        let mut label = format!("{}분음표 격자, {}", grid, if vol.is_some() { "볼륨 고정".to_string() } else { format!("볼륨 변화 {} 이상 기록", step) });
+        if thin > 0 {
+            label += &format!(", 화음은 {}분음표 박에서 치는 음만", 384 / thin);
+        }
+        if res.scores.len() <= players {
+            res.warnings.insert(0, format!("한 장에 자동 맞춤: {}", label));
+            return Ok(res);
+        }
+        let extra = res.scores.len() - players;
+        if best.as_ref().map(|b| extra < b.0).unwrap_or(true) {
+            best = Some((extra, res, label));
         }
     }
-    Ok(DETAIL_FALLBACK)
+    let (_, mut res, label) = best.ok_or_else(|| ConvError::Msg("변환 결과가 없습니다".into()))?;
+    let n = res.scores.len();
+    res.warnings.insert(
+        0,
+        format!(
+            "한 장에 자동 맞춤: 가장 단순하게 해도 한 장에 다 들어가지 않아 장 수가 가장 적은 설정({})으로 {}장으로 나눴습니다. 한 장만 쓰려면 '글자 수 넘으면'을 '앞부분만'으로 하거나 합주로 나누거나 랭크를 올리세요",
+            label, n
+        ),
+    );
+    Ok(res)
 }
 
 fn split_players(song: &Song, opts: &Options) -> Res<ConvResult> {
@@ -1299,10 +1363,7 @@ pub fn convert_song(song: &Song, opts: &Options) -> Res<ConvResult> {
         return Ok(res);
     }
     if opts.auto_detail {
-        let (grid, step) = pick_detail(song, opts)?;
-        let mut res = convert_song(song, &Options { grid, volume_threshold: step, auto_detail: false, ..opts.clone() })?;
-        res.warnings.insert(0, format!("원곡 느낌 자동 맞춤: {}분음표 격자, 볼륨 변화 {} 이상 기록", grid, step));
-        return Ok(res);
+        return auto_fit(song, opts);
     }
     if opts.players != 1 || opts.ensemble {
         return convert_ensemble(song, opts);
@@ -1314,7 +1375,8 @@ pub fn convert_song(song: &Song, opts: &Options) -> Res<ConvResult> {
     if auto_drums {
         warnings.push("드럼 트랙은 혼자 칠 악보에 넣지 않았습니다. 합주를 켜면 마비노기 드럼 세트 합주자로 따로 나옵니다".into());
     }
-    let (parts, tempos, limits, grid) = arrange(song, opts, &mut warnings)?;
+    let (mut parts, tempos, limits, grid) = arrange(song, opts, &mut warnings)?;
+    thin_chord_parts(&mut parts, opts.thin_chords);
     let shift = -instrument_shift(&opts.instrument);
     let end = max_end(&parts);
     let res_tempos: Vec<(f64, i64)> = tempos.iter().map(|&(u, b)| (u as f64, b)).collect();
@@ -1452,6 +1514,7 @@ fn pick_players(song: &Song, opts: &Options, candidates: &[usize], stop_early: b
     for &n in candidates {
         let mut w = Vec::new();
         let ((mut parts, tempos, limits, grid), dropped) = arrange_players(song, opts, n, &mut w)?;
+        thin_chord_parts(&mut parts, opts.thin_chords);
         let bars = song_bars(song, &grid, max_end(&parts) as f64);
         // 빈 합주자가 있으면 먼저 파트를 통째로 나눠 줘서 모두 처음부터 함께 치게 하고,
         // 그래도 넘치는 파트만 뒷부분을 넘긴다

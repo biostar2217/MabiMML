@@ -127,7 +127,11 @@ fn roundtrip_random_songs() {
     let r = check(&p, &Options { rank: "무제한".into(), auto_detail: true, ..opts() });
     assert!(r.warnings[0].contains("64분음표"), "{:?}", r.warnings);
     let r = check(&p, &Options { rank: "1".into(), auto_detail: true, ..opts() });
-    assert!(r.warnings[0].starts_with("원곡 느낌"));
+    assert!(r.warnings[0].starts_with("한 장에 자동 맞춤"));
+    // 한 장에 들어갔다고 하면 정말 한 장
+    if !r.warnings[0].contains("들어가지 않아") {
+        assert_eq!(r.scores.len(), 1);
+    }
     let long_notes: Vec<Note> = (0..120).map(|i| n((i * 48) as f64, (i * 48 + 48) as f64, 60 + (i * 7) % 24, (40 + (i * 13) % 80) as f64)).collect();
     let song = Song { tracks: vec![Track::new("x", long_notes)], tempos: vec![(0.0, 100.0)], ..Default::default() };
     let fine = convert_song(&song, &Options { rank: "1".into(), grid: 64, volume_threshold: 1, ..opts() }).unwrap();
