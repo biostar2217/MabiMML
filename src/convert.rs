@@ -1354,6 +1354,38 @@ fn max_overlap(notes: &[Note]) -> usize {
 /// 자동 합주 인원을 고를 때 시험해 보는 범위
 pub const AUTO_PLAYERS: std::ops::RangeInclusive<usize> = 2..=8;
 
+fn silent(part: &[Note]) -> bool {
+    part.iter().all(|n| n.vel == 0.0)
+}
+
+/// 아무 파트도 없는 합주자에게, 파트가 여럿인 합주자의 파트를 통째로 옮긴다 (모두 곡 처음부터 함께 친다).
+/// 옮길 파트는 글자 수 한도에 비해 가장 긴 것, 받는 자리는 한도가 가장 큰 멜로디 칸.
+fn spread_parts(parts: &mut [Vec<Note>], tempos: &[(i64, i64)], limits: &[i64; 3], opts: &Options) -> Res<usize> {
+    let mut spread = 0;
+    loop {
+        let players = parts.len() / 3;
+        let Some(empty) = (0..players).find(|&p| (0..3).all(|k| silent(&parts[3 * p + k]))) else { break };
+        // 소리 나는 파트가 가장 많은 합주자 (2개 이상이어야 줄 수 있음)
+        let count = |p: usize, parts: &[Vec<Note>]| (0..3).filter(|&k| !silent(&parts[3 * p + k])).count();
+        let Some(donor) = (0..players).filter(|&p| count(p, parts) >= 2).max_by_key(|&p| (count(p, parts), std::cmp::Reverse(p))) else { break };
+        let chunk = &parts[3 * donor..3 * donor + 3];
+        let end = max_end(chunk);
+        let lens = encode_segment(chunk, tempos, 0, end.max(1), opts)?.lengths();
+        let k = (0..3)
+            .filter(|&k| !silent(&chunk[k]))
+            .max_by(|&a, &b| {
+                let ra = lens.get(a).copied().unwrap_or(0) as f64 / limits[a].max(1) as f64;
+                let rb = lens.get(b).copied().unwrap_or(0) as f64 / limits[b].max(1) as f64;
+                ra.partial_cmp(&rb).unwrap().then(a.cmp(&b))
+            })
+            .unwrap();
+        let moved = std::mem::take(&mut parts[3 * donor + k]);
+        parts[3 * empty] = moved;
+        spread += 1;
+    }
+    Ok(spread)
+}
+
 /// 너무 긴 파트의 뒷부분을 빈 파트(다른 합주자 자리)로 옮겨 한 사람이 칠 글자 수를 줄인다.
 fn balance_parts(parts: &mut [Vec<Note>], tempos: &[(i64, i64)], limits: &[i64; 3], bars: &[i64], opts: &Options) -> Res<usize> {
     let mut moved = 0;
@@ -1421,6 +1453,12 @@ fn pick_players(song: &Song, opts: &Options, candidates: &[usize], stop_early: b
         let mut w = Vec::new();
         let ((mut parts, tempos, limits, grid), dropped) = arrange_players(song, opts, n, &mut w)?;
         let bars = song_bars(song, &grid, max_end(&parts) as f64);
+        // 빈 합주자가 있으면 먼저 파트를 통째로 나눠 줘서 모두 처음부터 함께 치게 하고,
+        // 그래도 넘치는 파트만 뒷부분을 넘긴다
+        let spread = spread_parts(&mut parts, &tempos, &limits, opts)?;
+        if spread > 0 {
+            w.push(format!("파트 {}개를 다른 합주자에게 통째로 나눠 모두 곡 처음부터 함께 치게 했습니다", spread));
+        }
         let moved = if opts.fit == "none" { 0 } else { balance_parts(&mut parts, &tempos, &limits, &bars, opts)? };
         // 한 장에 안 들어가는 합주자 수
         let mut over = 0usize;
