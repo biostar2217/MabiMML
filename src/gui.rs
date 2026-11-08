@@ -2156,7 +2156,7 @@ impl App {
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("더보기 ▼", |ui| {
+                ui.menu_button("설정 ▼", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("색 테마");
                         let mut t = self.saved.color_theme.clone();
@@ -2183,10 +2183,6 @@ impl App {
                         ui.close_menu();
                     }
                 });
-                let label = if self.folded { "◀ 설정 펼치기" } else { "설정 접기 ▶" };
-                if ui.button(label).on_hover_text("왼쪽 설정 칸을 접거나 펼칩니다").clicked() {
-                    self.folded = !self.folded;
-                }
             });
         });
     }
