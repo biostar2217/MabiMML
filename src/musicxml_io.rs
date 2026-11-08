@@ -183,10 +183,14 @@ pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
         let mut vel = 80.0f64;
         let mut notes: Vec<Note> = Vec::new();
         let mut open_ties: HashMap<(i64, String), usize> = HashMap::new();
-        for measure in children(&part, "measure") {
+        // 박자표가 정한 한 마디 길이 (96 = 4분음표)
+        let mut meas_len: Option<f64> = None;
+        for (mi, measure) in children(&part, "measure").enumerate() {
             if pi == 0 {
                 bars.push(pos);
             }
+            let mstart = pos;
+            let implicit = measure.attribute("implicit") == Some("yes");
             // 마디 안에서 가장 멀리 간 위치. 마지막 성부가 짧거나 <backup> 으로 끝나도
             // 다음 마디는 여기서 시작해야 마디끼리 겹치지 않는다 (악보 인식 결과에 흔함).
             let mut furthest = pos;
@@ -199,14 +203,15 @@ pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
                             divisions = d;
                         }
                     }
-                    if pi == 0 {
-                        for tm in children(&el, "time") {
-                            let b = child(&tm, "beats")
-                                .and_then(|x| text_of(&x).map(|s| py_strip(s).to_string()))
-                                .and_then(|s| parse_int(s.split('+').next().unwrap_or("")));
-                            let bt = num_i(&tm, "beat-type");
-                            if let (Some(b), Some(bt)) = (b, bt) {
-                                if b != 0 && bt != 0 {
+                    for tm in children(&el, "time") {
+                        let b = child(&tm, "beats")
+                            .and_then(|x| text_of(&x).map(|s| py_strip(s).to_string()))
+                            .and_then(|s| parse_int(s.split('+').next().unwrap_or("")));
+                        let bt = num_i(&tm, "beat-type");
+                        if let (Some(b), Some(bt)) = (b, bt) {
+                            if b > 0 && bt > 0 {
+                                meas_len = Some(b as f64 * 384.0 / bt as f64);
+                                if pi == 0 {
                                     timesigs.push((pos, b, bt));
                                 }
                             }
@@ -320,6 +325,31 @@ pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
                 }
             }
             pos = pos.max(furthest);
+            // 악보 인식이 박자를 잘못 읽어 마디가 박자표보다 길거나 짧으면, 그 차이가 뒤로 계속 밀려
+            // 손(파트)끼리 어긋나고 뒤의 모든 음이 엉뚱한 박자가 된다. 마디 길이를 박자표에 맞춘다.
+            if let Some(l) = meas_len {
+                let content = pos - mstart;
+                if content > l + 0.5 {
+                    // 넘친 마디: 그 마디 안의 음을 박자표 길이에 맞게 줄인다
+                    let f = l / content;
+                    let mend = mstart + l;
+                    for nt in notes.iter_mut() {
+                        if nt.start >= mstart - 1e-6 {
+                            nt.start = mstart + (nt.start - mstart) * f;
+                        }
+                        if nt.end > mstart + 1e-6 {
+                            nt.end = mstart + (nt.end - mstart) * f;
+                        }
+                    }
+                    for t in tempos.iter_mut().filter(|t| t.0 > mstart) {
+                        t.0 = mstart + (t.0 - mstart) * f;
+                    }
+                    pos = mend;
+                } else if content < l - 0.5 && mi > 0 && !implicit {
+                    // 모자란 마디(중간에 쉼표를 못 읽음): 나머지는 쉼으로 채운다. 첫 마디(못갖춘마디)는 그대로
+                    pos = mstart + l;
+                }
+            }
         }
         sort_start_desc_pitch(&mut notes);
         let nm = names.get(&pid).cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("파트 {}", pi + 1));

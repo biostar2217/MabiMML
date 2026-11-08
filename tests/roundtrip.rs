@@ -849,3 +849,28 @@ fn drum_merge_inserts_rests_at_sheet_changes() {
     let plain: f64 = mel_sheets.iter().take(covered).map(|s| s.end - s.start).sum();
     assert!((len - (plain + 96.0 * (covered as f64 - 1.0))).abs() < 1.0 || covered <= 1, "len {} plain {} covered {}", len, plain, covered);
 }
+
+#[test]
+fn musicxml_overfull_measure_does_not_shift_later_bars() {
+    // 악보 인식이 박자를 잘못 읽어 마디가 4박보다 길어도 다음 마디는 제자리(4박 뒤)에서 시작하고 두 손이 어긋나지 않는다
+    let n = |step: &str, dur: i64| format!("<note><pitch><step>{}</step><octave>4</octave></pitch><duration>{}</duration></note>", step, dur);
+    let attrs = "<attributes><divisions>48</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>";
+    let rh = format!(
+        "<part id=\"P1\"><measure number=\"1\">{}{}</measure><measure number=\"2\">{}{}{}{}{}</measure><measure number=\"3\">{}</measure></part>",
+        attrs, n("C", 192), n("D", 6), n("C", 36), n("C", 9), n("G", 48), n("B", 96), n("E", 192)
+    );
+    let lh = format!(
+        "<part id=\"P2\"><measure number=\"1\">{}{}</measure><measure number=\"2\">{}{}</measure><measure number=\"3\">{}</measure></part>",
+        attrs, n("C", 192), n("A", 96), n("F", 102), n("G", 192)
+    );
+    let xml = format!(
+        "<score-partwise><part-list><score-part id=\"P1\"><part-name>a</part-name></score-part><score-part id=\"P2\"><part-name>b</part-name></score-part></part-list>{}{}</score-partwise>",
+        rh, lh
+    );
+    let song = mabimml::musicxml_io::read_musicxml_text(&xml).unwrap();
+    assert_eq!(song.bars.as_ref().unwrap(), &vec![0.0, 384.0, 768.0]);
+    let start = |t: usize, p: i64| song.tracks[t].notes.iter().find(|x| x.pitch == p).unwrap().start;
+    assert_eq!(start(0, 64), 768.0);
+    assert_eq!(start(1, 67), 768.0);
+    assert!(song.tracks.iter().flat_map(|t| t.notes.iter()).filter(|x| x.start >= 384.0 && x.start < 768.0).all(|x| x.end <= 768.0 + 1e-6));
+}
