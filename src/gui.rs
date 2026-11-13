@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::ai;
 use crate::config;
+use crate::feedback;
 use crate::convert::{
     convert_song, load_song, preview_program, will_recognize, write_preview, write_split, ConvError, ConvResult, LoadOpts,
     Options, Score, INSTRUMENTS, INSTRUMENT_DEFAULT, PART_NAMES,
@@ -445,6 +446,14 @@ pub struct App {
     ai_rx: Option<Receiver<Result<serde_json::Map<String, Value>, String>>>,
     // 업데이트
     update_rx: Option<(Receiver<updater::CheckResult>, bool)>,
+    // 의견 보내기 창
+    fb_open: bool,
+    fb_kind: String,
+    fb_text: String,
+    fb_contact: String,
+    fb_attach: bool,
+    fb_status: String,
+    fb_rx: Option<Receiver<Result<String, String>>>,
     download: Option<Download>,
     // 그림
     icon_tex: Option<egui::TextureHandle>,
@@ -551,6 +560,13 @@ impl App {
             ai_last_cmd: String::new(),
             ai_rx: None,
             update_rx: None,
+            fb_open: false,
+            fb_kind: feedback::KINDS[0].1.to_string(),
+            fb_text: String::new(),
+            fb_contact: config::load().get(feedback::CFG_CONTACT).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            fb_attach: false,
+            fb_status: String::new(),
+            fb_rx: None,
             download: None,
             icon_tex: None,
             icon_theme: String::new(),
@@ -581,6 +597,7 @@ impl App {
         };
         app.last_fingerprint = app.fingerprint();
         // 악보 보기를 따로 띄운 창으로 시작 (설정에 기억. 시험용 화면 찍기는 기본으로 붙여서)
+        app.fb_open = std::env::var_os("MABIMML_SHOT_FEEDBACK").is_some();
         app.sheet_window = app.saved.sheet_window && (std::env::var_os("MABIMML_SHOTS").is_none() || std::env::var_os("MABIMML_SHOT_SHEETWIN").is_some());
         app
     }
@@ -2837,6 +2854,14 @@ impl App {
                             let _ = webbrowser::open(theme::CALENDAR_URL);
                         }
                         ui.add_space(6.0);
+                        let fb = ui
+                            .add(egui::Button::new(RichText::new("의견 보내기").font(theme::bold(12.5)).color(Color32::WHITE)).frame(false))
+                            .on_hover_text("버그 제보나 바라는 기능을 제작자에게 보내요")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if fb.clicked() {
+                            self.fb_open = true;
+                        }
+                        ui.add_space(6.0);
                         let made = ui
                             .add(egui::Label::new(RichText::new(format!("제작 {}", AUTHOR)).size(12.5).color(p.sub)).sense(egui::Sense::click()))
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -3454,6 +3479,94 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(&self.warnings).size(12.5)).wrap());
             });
         });
+    }
+
+    // ---------- 의견 보내기 ----------
+    fn poll_feedback(&mut self) {
+        let Some(rx) = &self.fb_rx else { return };
+        let Ok(r) = rx.try_recv() else { return };
+        self.fb_rx = None;
+        match r {
+            Ok(id) => {
+                self.fb_text.clear();
+                self.fb_attach = false;
+                self.fb_status.clear();
+                self.fb_open = false;
+                let no = if id.is_empty() { String::new() } else { format!("
+접수 번호: {}", id) };
+                self.info("의견 보내기", &format!("보냈어요. 고맙습니다!{}", no));
+            }
+            Err(e) => self.fb_status = e,
+        }
+    }
+
+    fn feedback_window(&mut self, ctx: &egui::Context) {
+        self.poll_feedback();
+        if !self.fb_open {
+            return;
+        }
+        if self.fb_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        let p = self.pal;
+        let mut open = true;
+        let mut send = false;
+        let sending = self.fb_rx.is_some();
+        let has_mml = !self.score_texts.is_empty();
+        egui::Window::new("의견 보내기").open(&mut open).default_width(480.0).resizable(false).collapsible(false).show(ctx, |ui| {
+            ui.label(RichText::new("버그나 바라는 기능을 적어 주세요. 제작자에게 바로 전달돼요.").color(p.muted));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("종류");
+                let labels: Vec<&str> = feedback::KINDS.iter().map(|(_, l)| *l).collect();
+                Self::combo(ui, "fb_kind", &mut self.fb_kind, &labels, 120.0);
+            });
+            ui.add(
+                egui::TextEdit::multiline(&mut self.fb_text)
+                    .desired_rows(8)
+                    .desired_width(f32::INFINITY)
+                    .char_limit(feedback::MAX_MESSAGE)
+                    .hint_text(RichText::new("예: 이 곡을 열면 화음2가 비어 나와요").color(p.line)),
+            );
+            ui.horizontal(|ui| {
+                ui.label("답장 받을 곳 (선택)");
+                ui.add(egui::TextEdit::singleline(&mut self.fb_contact).desired_width(240.0).char_limit(feedback::MAX_CONTACT).hint_text(RichText::new("이메일, 디스코드, 게임 닉네임").color(p.line)));
+            });
+            ui.add_enabled(has_mml, egui::Checkbox::new(&mut self.fb_attach, "지금 곡 이름과 MML 함께 보내기"))
+                .on_hover_text("문제가 난 곡을 제작자가 그대로 볼 수 있어요");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let can = !sending && !self.fb_text.trim().is_empty();
+                if ui.add_enabled(can, egui::Button::new(RichText::new(if sending { "보내는 중…" } else { "보내기" }).font(theme::bold(13.0)))).clicked() {
+                    send = true;
+                }
+                if !self.fb_status.is_empty() {
+                    ui.label(RichText::new(&self.fb_status).color(Color32::from_rgb(200, 60, 60)));
+                }
+            });
+        });
+        if send {
+            let attach = self.fb_attach && has_mml;
+            let f = feedback::Feedback {
+                kind: feedback::kind_value(&self.fb_kind).to_string(),
+                message: self.fb_text.clone(),
+                contact: self.fb_contact.clone(),
+                song: if attach { base_name(&self.path) } else { String::new() },
+                mml: if attach { self.score_texts.join("
+
+") } else { String::new() },
+            };
+            config::set(feedback::CFG_CONTACT, json!(self.fb_contact.trim()));
+            self.fb_status.clear();
+            let (tx, rx) = channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(feedback::send(&f, VERSION, &feedback::feedback_url()));
+            });
+            self.fb_rx = Some(rx);
+        }
+        if !open {
+            self.fb_open = false;
+        }
     }
 
     fn direct_window(&mut self, ctx: &egui::Context) {
@@ -4079,6 +4192,7 @@ impl eframe::App for App {
             self.results(ui, ctx, if compact { 2.0 } else { 3.0 });
         });
         self.direct_window(ctx);
+        self.feedback_window(ctx);
         self.loading_window(ctx);
         self.download_window(ctx);
         self.dialogs_ui(ctx);

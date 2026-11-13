@@ -5,6 +5,7 @@ pub mod arrange;
 pub mod bundle;
 pub mod cli;
 pub mod config;
+pub mod feedback;
 pub mod convert;
 pub mod encoder;
 pub mod midi_io;
