@@ -2853,15 +2853,7 @@ impl App {
                         if r.clicked() {
                             let _ = webbrowser::open(theme::CALENDAR_URL);
                         }
-                        ui.add_space(6.0);
-                        let fb = ui
-                            .add(egui::Button::new(RichText::new("의견 보내기").font(theme::bold(12.5)).color(Color32::WHITE)).frame(false))
-                            .on_hover_text("버그 제보나 바라는 기능을 제작자에게 보내요")
-                            .on_hover_cursor(egui::CursorIcon::PointingHand);
-                        if fb.clicked() {
-                            self.fb_open = true;
-                        }
-                        ui.add_space(6.0);
+                        ui.add_space(10.0);
                         let made = ui
                             .add(egui::Label::new(RichText::new(format!("제작 {}", AUTHOR)).size(12.5).color(p.sub)).sense(egui::Sense::click()))
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -2870,6 +2862,26 @@ impl App {
                                 "프로그램 정보",
                                 &format!("마비노기 MML 변환기 v{} (Rust판)\n\n제작: {}\n{}: {}\n\n함께 들어 있는 프로그램의 라이선스는 '라이선스' 폴더에 있습니다.", VERSION, AUTHOR, theme::CALENDAR_NAME, theme::CALENDAR_URL),
                             );
+                        }
+                        ui.add_space(6.0);
+                        let fb = ui
+                            .add(egui::Button::new(RichText::new("피드백 보내기").font(theme::bold(12.5)).color(Color32::WHITE)).frame(false))
+                            .on_hover_text("버그 제보나 바라는 기능을 제작자에게 보내요")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if fb.clicked() {
+                            self.fb_open = true;
+                        }
+                        ui.add_space(6.0);
+                        let busy = self.update_rx.is_some() || self.download.is_some();
+                        let up = ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(RichText::new(if busy { "업데이트 확인 중…" } else { "업데이트" }).font(theme::bold(12.5)).color(Color32::WHITE)).frame(false),
+                            )
+                            .on_hover_text("새 버전이 있는지 확인하고, 있으면 바로 업데이트해요")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if up.clicked() {
+                            self.start_update_check(true);
                         }
                     });
                 });
