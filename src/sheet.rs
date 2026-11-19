@@ -16,15 +16,66 @@ pub const PART_COLORS: [Color32; 3] = [
     Color32::from_rgb(0x2F, 0x8A, 0x52),
 ];
 
+/// 고른 음 테두리, 넣을 자리 표시 색
+pub const SELECT: Color32 = Color32::from_rgb(0xE0, 0x6A, 0x00);
+pub const CARET: Color32 = Color32::from_rgb(0x1E, 0x7B, 0xE0);
+
 pub struct Sheet {
     pub parts: Vec<Vec<Note>>,
+    /// 큰보표마다 (이름, 파트들). 합주자별로 나눠 보면 여러 개, 아니면 하나
+    pub staves: Vec<(String, Vec<Vec<Note>>)>,
     /// 한 마디 길이 (유닛)
     pub bar: f64,
     pub end: f64,
     /// 여러 장을 이어 그릴 때 각 악보의 시작 위치와 이름
     pub starts: Vec<(f64, String)>,
+    /// 지금 고른 악보 (starts 의 번호): 바탕을 조금 진하게
+    pub highlight: Option<usize>,
     /// (유닛, 그 위치의 밀리초, bpm) — midi_io::unit_to_ms 와 같은 계산
     marks: Vec<(f64, f64, f64)>,
+    /// staves 의 음마다 (결과의 몇 번째 장, 그 장 그 파트에서 몇 번째 음). 악보에서 음을 고칠 때 쓴다
+    pub refs: Vec<Vec<Vec<(usize, usize)>>>,
+    /// 큰보표마다 그 위에 놓인 장들: (시작, 끝, 결과의 몇 번째 장)
+    pub ranges: Vec<Vec<(f64, f64, usize)>>,
+}
+
+/// 악보 보기에 덧그릴 편집 표시
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Marks {
+    /// 고른 음 (큰보표, 파트, 음 번호)
+    pub selected: Option<(usize, usize, usize)>,
+    /// 넣을 자리·글 커서 위치 (큰보표, 시간)
+    pub caret: Option<(usize, f64)>,
+    /// 표시가 있는 줄로 스크롤
+    pub scroll: bool,
+    /// 스크롤할 시간 (고른 음이나 넣을 자리)
+    pub focus: Option<f64>,
+}
+
+/// 악보를 누른 곳
+#[derive(Clone, Copy, Debug)]
+pub struct Click {
+    pub t: f64,
+    pub staff: usize,
+    /// 누른 음 (파트, 음 번호)
+    pub note: Option<(usize, usize)>,
+}
+
+/// 악보들의 음마다 출처(장 번호, 음 번호)와 장의 자리. scores_to_notes 와 같은 순서
+fn refs_of(scores: &[Score]) -> (Vec<Vec<(usize, usize)>>, Vec<(f64, f64, usize)>) {
+    let mut refs: Vec<Vec<(usize, usize)>> = vec![vec![], vec![], vec![]];
+    for sc in scores {
+        for (k, mml) in sc.parts.iter().enumerate() {
+            while refs.len() <= k {
+                refs.push(vec![]);
+            }
+            if sc.only.map(|o| o == k).unwrap_or(true) {
+                let n = crate::mml_parser::parse_part(mml).map(|r| r.0.len()).unwrap_or(0);
+                refs[k].extend((0..n).map(|j| (sc.src, j)));
+            }
+        }
+    }
+    (refs, scores.iter().map(|s| (s.start, s.end, s.src)).collect())
 }
 
 impl Sheet {
@@ -46,7 +97,30 @@ impl Sheet {
             marks.push((t, ms, b));
         }
         let starts = scores.iter().zip(names).filter(|(_, n)| !n.is_empty()).map(|(s, n)| (s.start, n)).collect();
-        Ok(Sheet { parts, bar: if bar > 0.0 { bar } else { 384.0 }, end, starts, marks })
+        let staves = vec![(String::new(), parts.clone())];
+        let (r, g) = refs_of(scores);
+        Ok(Sheet { parts, staves, bar: if bar > 0.0 { bar } else { 384.0 }, end, starts, highlight: None, marks, refs: vec![r], ranges: vec![g] })
+    }
+
+    /// 합주자마다 큰보표 하나씩: groups = [(이름, 그 사람의 악보들)]. 박과 템포는 모두 같은 줄에 맞춘다.
+    pub fn build_staves(groups: &[(String, Vec<Score>)], bar: f64) -> Result<Sheet, String> {
+        let all: Vec<Score> = groups.iter().flat_map(|g| g.1.iter().cloned()).collect();
+        let mut sheet = Sheet::build(&all, vec![String::new(); all.len()], bar)?;
+        let mut staves = Vec::new();
+        let (mut refs, mut ranges) = (Vec::new(), Vec::new());
+        for (name, scores) in groups {
+            let (parts, _) = scores_to_notes(scores).map_err(|e| e.to_string())?;
+            staves.push((name.clone(), parts));
+            let (r, g) = refs_of(scores);
+            refs.push(r);
+            ranges.push(g);
+        }
+        if !staves.is_empty() {
+            sheet.staves = staves;
+            sheet.refs = refs;
+            sheet.ranges = ranges;
+        }
+        Ok(sheet)
     }
 
     pub fn unit_to_ms(&self, t: f64) -> f64 {
@@ -82,15 +156,55 @@ impl Sheet {
 
 // ---------- 그리기 ----------
 
-const SP: f32 = 7.0; // 오선 한 칸
-const STEP: f32 = SP / 2.0; // 한 음(도-레) 높이
+thread_local! {
+    /// 세로 크기 배율: 합주자가 많으면 줄여서 한 줄(모든 합주자)이 화면에 들어가게 한다
+    static SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+fn k() -> f32 {
+    SCALE.with(|c| c.get())
+}
+#[allow(non_snake_case)]
+fn SP() -> f32 {
+    7.0 * k() // 오선 한 칸
+}
+#[allow(non_snake_case)]
+fn STEP() -> f32 {
+    SP() / 2.0 // 한 음(도-레) 높이
+}
 const LEFT: f32 = 40.0; // 음자리표 자리
 const RIGHT: f32 = 10.0;
-const TOP: f32 = 34.0; // 덧줄과 마디 번호 자리
-const GAP: f32 = 6.0 * SP; // 두 오선 사이
-const BOTTOM: f32 = 30.0;
-const SYS_H: f32 = TOP + 4.0 * SP + GAP + 4.0 * SP + BOTTOM;
-/// 높은음자리표 맨 아래 줄 E4, 낮은음자리표 맨 아래 줄 G2 (온음 번호)
+#[allow(non_snake_case)]
+fn TOP() -> f32 {
+    34.0 * k().max(0.75) // 덧줄과 마디 번호 자리
+}
+#[allow(non_snake_case)]
+fn GAP() -> f32 {
+    6.0 * SP() // 두 오선 사이
+}
+#[allow(non_snake_case)]
+fn BOTTOM() -> f32 {
+    30.0 * k()
+}
+/// 큰보표 하나의 높이와, 여러 큰보표를 쌓을 때 사이 (이름과 덧줄 자리)
+#[allow(non_snake_case)]
+fn STAFF_H() -> f32 {
+    4.0 * SP() + GAP() + 4.0 * SP()
+}
+#[allow(non_snake_case)]
+fn STAFF_GAP() -> f32 {
+    7.0 * SP()
+}
+
+/// 보이는 높이에 맞춰 세로 배율을 정한다: 큰보표가 여럿이면 한 줄이 화면에 다 들어가도록 줄인다 (0.5~1)
+pub fn fit_scale(sheet: &Sheet, view_h: f32) {
+    SCALE.with(|c| c.set(1.0));
+    let n = sheet.staves.len().max(1);
+    if n > 1 && view_h > 100.0 {
+        let full = sys_height(n);
+        let want = ((view_h - 20.0) / full).clamp(0.5, 1.0);
+        SCALE.with(|c| c.set(want));
+    }
+}
 const TREBLE_BOTTOM: i64 = 30;
 const BASS_BOTTOM: i64 = 18;
 
@@ -122,7 +236,7 @@ fn kind_of(dur: f64) -> (i64, bool) {
 }
 
 fn head_points(c: Pos2) -> Vec<Pos2> {
-    let (rx, ry, a) = (4.4f32, 3.1f32, -0.35f32);
+    let (rx, ry, a) = (4.4f32 * k(), 3.1f32 * k(), -0.35f32);
     let (sa, ca) = a.sin_cos();
     (0..14)
         .map(|i| {
@@ -138,17 +252,53 @@ struct Layout {
     per_line: usize,
     bar_w: f32,
     lines: usize,
+    sys_h: f32,
+    /// 이 쪽의 첫 줄 (긴 곡은 쪽으로 나눠 그린다)
+    first: usize,
+}
+
+/// 한 쪽에 그릴 줄 수: 화면에 아주 긴 그림을 만들지 않도록 (긴 MIDI에서 악보가 잘리던 문제)
+fn lines_per_page(sys_h: f32) -> usize {
+    ((6000.0 / sys_h).floor() as usize).clamp(4, 40)
+}
+
+fn sys_height(nst: usize) -> f32 {
+    TOP() + nst as f32 * STAFF_H() + (nst.max(1) - 1) as f32 * STAFF_GAP() + BOTTOM() + if nst > 1 { 12.0 } else { 0.0 }
+}
+
+fn per_line_for(width: f32) -> usize {
+    (((width.max(200.0) - LEFT - RIGHT) / 190.0).floor() as usize).max(1)
+}
+
+/// 재생 위치가 다른 줄로 넘어갔으면 그 줄이 있는 쪽으로 넘긴다 (쪽 버튼으로 넘긴 쪽은 그대로 둔다)
+pub fn follow_page(sheet: &Sheet, width: f32, playhead: Option<f64>, last_line: Option<usize>, page: &mut usize) {
+    let Some(t) = playhead else { return };
+    let per_line = per_line_for(width);
+    let lines = sheet.bars().div_ceil(per_line).max(1);
+    let lpp = lines_per_page(sys_height(sheet.staves.len().max(1)));
+    let line = ((t / (sheet.bar * per_line as f64)).floor().max(0.0) as usize).min(lines - 1);
+    if last_line != Some(line) {
+        *page = line / lpp;
+    }
+}
+
+/// (쪽 수, 한 쪽의 마디 수)
+pub fn pages(sheet: &Sheet, width: f32) -> (usize, usize) {
+    let per_line = per_line_for(width);
+    let lines = sheet.bars().div_ceil(per_line).max(1);
+    let lpp = lines_per_page(sys_height(sheet.staves.len().max(1)));
+    (lines.div_ceil(lpp), lpp * per_line)
 }
 
 impl Layout {
     fn sys_top(&self, line: usize) -> f32 {
-        self.rect.top() + line as f32 * SYS_H
+        self.rect.top() + (line as f32 - self.first as f32) * self.sys_h
     }
-    fn treble_bottom(&self, line: usize) -> f32 {
-        self.sys_top(line) + TOP + 4.0 * SP
+    fn treble_bottom(&self, line: usize, st: usize) -> f32 {
+        self.sys_top(line) + TOP() + st as f32 * (STAFF_H() + STAFF_GAP()) + 4.0 * SP()
     }
-    fn bass_bottom(&self, line: usize) -> f32 {
-        self.treble_bottom(line) + GAP + 4.0 * SP
+    fn bass_bottom(&self, line: usize, st: usize) -> f32 {
+        self.treble_bottom(line, st) + GAP() + 4.0 * SP()
     }
     fn line_units(&self, sheet: &Sheet) -> f64 {
         sheet.bar * self.per_line as f64
@@ -161,38 +311,68 @@ impl Layout {
         ((t / self.line_units(sheet)).floor().max(0.0) as usize).min(self.lines.saturating_sub(1))
     }
     /// (y, 높은음자리 여부)
-    fn y_of(&self, line: usize, pitch: i64) -> (f32, bool) {
+    fn y_of(&self, line: usize, st: usize, pitch: i64) -> (f32, bool) {
         let (d, _) = diatonic(pitch);
         if pitch >= 60 {
-            (self.treble_bottom(line) - (d - TREBLE_BOTTOM) as f32 * STEP, true)
+            (self.treble_bottom(line, st) - (d - TREBLE_BOTTOM) as f32 * STEP(), true)
         } else {
-            (self.bass_bottom(line) - (d - BASS_BOTTOM) as f32 * STEP, false)
+            (self.bass_bottom(line, st) - (d - BASS_BOTTOM) as f32 * STEP(), false)
         }
     }
-    fn clamp_y(&self, line: usize, y: f32) -> f32 {
-        let top = self.sys_top(line);
-        y.clamp(top + 6.0, top + SYS_H - 6.0)
+    fn clamp_y(&self, line: usize, st: usize, y: f32) -> f32 {
+        let top = self.treble_bottom(line, st) - 4.0 * SP() - TOP().min(STAFF_GAP()) + 6.0;
+        let bottom = self.bass_bottom(line, st) + BOTTOM().min(STAFF_GAP() / 2.0) - 6.0;
+        y.clamp(top, bottom)
     }
 }
 
 /// 악보를 그린다. 누른 곳의 위치(유닛)를 돌려준다.
 /// follow_line: 재생 위치가 있는 줄이 바뀌면 그 줄로 스크롤한다 (마지막으로 따라간 줄 번호).
-pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, follow_line: Option<&mut Option<usize>>) -> Option<f64> {
-    let width = ui.available_width().max(200.0);
-    let per_line = (((width - LEFT - RIGHT) / 190.0).floor() as usize).max(1);
+/// page: 보고 있는 쪽 (재생 위치를 따라가면 바뀐다)
+/// width: 악보를 그릴 폭. 쪽 계산(pages, follow_page)과 같은 값을 넘겨야 쪽이 어긋나지 않는다.
+/// 쪽을 재생 위치에 맞추는 일은 follow_page 가 먼저 한다.
+pub fn show(
+    ui: &mut Ui,
+    sheet: &Sheet,
+    pal: &Palette,
+    playhead: Option<f64>,
+    follow_line: Option<&mut Option<usize>>,
+    page: &mut usize,
+    width: f32,
+    marks: Marks,
+) -> Option<Click> {
+    let width = width.max(200.0);
+    let per_line = per_line_for(width);
     let bar_w = (width - LEFT - RIGHT) / per_line as f32;
     let lines = sheet.bars().div_ceil(per_line).max(1);
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, lines as f32 * SYS_H), Sense::click());
-    let lay = Layout { rect, per_line, bar_w, lines };
+    let nst = sheet.staves.len().max(1);
+    let sys_h = sys_height(nst);
+    let lpp = lines_per_page(sys_h);
+    *page = (*page).min((lines - 1) / lpp);
+    let first = *page * lpp;
+    let count = lpp.min(lines - first);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, count as f32 * sys_h), Sense::click());
+    let lay = Layout { rect, per_line, bar_w, lines, sys_h, first };
     let painter = ui.painter_at(rect);
     let clip = ui.clip_rect();
 
-    if let (Some(t), Some(last)) = (playhead, follow_line) {
+    if let (Some(t), true) = (marks.focus, marks.scroll) {
         let line = lay.line_of(sheet, t);
-        if *last != Some(line) {
+        if line >= first && line < first + count {
+            let r = Rect::from_min_size(pos2(rect.left(), lay.sys_top(line)), vec2(width, sys_h));
+            let view_h = ui.clip_rect().height();
+            let align = if sys_h > view_h * 0.6 { egui::Align::Min } else { egui::Align::Center };
+            ui.scroll_to_rect(r, Some(align));
+        }
+    } else if let (Some(t), Some(last)) = (playhead, follow_line) {
+        let line = lay.line_of(sheet, t);
+        if *last != Some(line) && line >= first && line < first + count {
             *last = Some(line);
-            let r = Rect::from_min_size(pos2(rect.left(), lay.sys_top(line)), vec2(width, SYS_H));
-            ui.scroll_to_rect(r, Some(egui::Align::Center));
+            let r = Rect::from_min_size(pos2(rect.left(), lay.sys_top(line)), vec2(width, sys_h));
+            // 보표가 화면보다 크면(합주자가 많을 때) 가운데가 아니라 위쪽을 맞춘다
+            let view_h = ui.clip_rect().height();
+            let align = if sys_h > view_h * 0.6 { egui::Align::Min } else { egui::Align::Center };
+            ui.scroll_to_rect(r, Some(align));
         }
     }
 
@@ -203,61 +383,106 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
     let total_bars = sheet.bars();
     let lu = lay.line_units(sheet);
 
-    for line in 0..lines {
+    for line in first..first + count {
         let top = lay.sys_top(line);
-        if top > clip.bottom() || top + SYS_H < clip.top() {
+        if top > clip.bottom() || top + sys_h < clip.top() {
             continue;
+        }
+        // 악보(장)마다 바탕을 번갈아 칠해 구분한다. 고른 장은 조금 진하게
+        if sheet.starts.len() >= 2 {
+            let (la, lb) = (line as f64 * lu, (line + 1) as f64 * lu);
+            let y0 = top + 10.0;
+            let y1 = lay.bass_bottom(line, nst - 1) + 8.0;
+            for (k, (s0, _)) in sheet.starts.iter().enumerate() {
+                let s1 = sheet.starts.get(k + 1).map(|x| x.0).unwrap_or(sheet.end);
+                let (a, b) = (s0.max(la), s1.min(lb));
+                if b <= a {
+                    continue;
+                }
+                let fill = if sheet.highlight == Some(k) {
+                    Color32::from_rgba_unmultiplied(pal.wine.r(), pal.wine.g(), pal.wine.b(), 38)
+                } else if k % 2 == 1 {
+                    Color32::from_rgba_unmultiplied(110, 110, 110, 24)
+                } else {
+                    continue;
+                };
+                let xa = lay.x_of(sheet, line, a).max(rect.left() + LEFT - 4.0);
+                let xb = lay.x_of(sheet, line, b);
+                painter.rect_filled(Rect::from_min_max(pos2(xa, y0), pos2(xb, y1)), 2.0, fill);
+            }
         }
         let x0 = rect.left() + LEFT;
         let first_bar = line * per_line;
         let bars_here = per_line.min(total_bars - first_bar.min(total_bars));
         let x1 = x0 + bars_here as f32 * bar_w;
-        let tb = lay.treble_bottom(line);
-        let bb = lay.bass_bottom(line);
-        // 오선
-        for k in 0..5 {
-            let y = tb - k as f32 * SP;
-            painter.line_segment([pos2(rect.left() + 6.0, y), pos2(x1, y)], staff);
-            let y = bb - k as f32 * SP;
-            painter.line_segment([pos2(rect.left() + 6.0, y), pos2(x1, y)], staff);
-        }
-        // 첫 세로줄과 묶음
-        painter.line_segment([pos2(rect.left() + 6.0, tb - 4.0 * SP), pos2(rect.left() + 6.0, bb)], Stroke::new(1.5f32, Color32::from_gray(90)));
-        // 음자리표
-        if has_music {
-            painter.text(pos2(rect.left() + 21.0, tb - 1.0 * SP + 1.0), Align2::CENTER_CENTER, "\u{1D11E}", FontId::new(36.0, music.clone()), Color32::from_gray(40));
-            painter.text(pos2(rect.left() + 20.0, bb - 3.0 * SP + 3.0), Align2::CENTER_CENTER, "\u{1D122}", FontId::new(27.0, music.clone()), Color32::from_gray(40));
-        } else {
-            painter.text(pos2(rect.left() + 20.0, tb - 2.0 * SP), Align2::CENTER_CENTER, "G", theme::bold(16.0), Color32::from_gray(40));
-            painter.text(pos2(rect.left() + 20.0, bb - 2.0 * SP), Align2::CENTER_CENTER, "F", theme::bold(16.0), Color32::from_gray(40));
-        }
-        // 마디선과 마디 번호
-        for b in 0..=bars_here {
-            let x = x0 + b as f32 * bar_w;
-            let last = first_bar + b == total_bars;
-            let stroke = if last { Stroke::new(2.5f32, Color32::from_gray(60)) } else { barline };
-            if b > 0 || line == 0 {
-                painter.line_segment([pos2(x, tb - 4.0 * SP), pos2(x, bb)], stroke);
+        for st in 0..nst {
+            let tb = lay.treble_bottom(line, st);
+            let bb = lay.bass_bottom(line, st);
+            // 오선
+            for k in 0..5 {
+                let y = tb - k as f32 * SP();
+                painter.line_segment([pos2(rect.left() + 6.0, y), pos2(x1, y)], staff);
+                let y = bb - k as f32 * SP();
+                painter.line_segment([pos2(rect.left() + 6.0, y), pos2(x1, y)], staff);
             }
-            if b < bars_here {
-                painter.text(pos2(x + 2.0, tb - 4.0 * SP - 4.0), Align2::LEFT_BOTTOM, format!("{}", first_bar + b + 1), FontId::proportional(10.0), pal.muted);
+            // 첫 세로줄과 묶음
+            painter.line_segment([pos2(rect.left() + 6.0, tb - 4.0 * SP()), pos2(rect.left() + 6.0, bb)], Stroke::new(1.5f32, Color32::from_gray(90)));
+            // 음자리표
+            if has_music {
+                painter.text(pos2(rect.left() + 21.0, tb - 1.0 * SP() + 1.0), Align2::CENTER_CENTER, "\u{1D11E}", FontId::new(36.0, music.clone()), Color32::from_gray(40));
+                painter.text(pos2(rect.left() + 20.0, bb - 3.0 * SP() + 3.0), Align2::CENTER_CENTER, "\u{1D122}", FontId::new(27.0, music.clone()), Color32::from_gray(40));
+            } else {
+                painter.text(pos2(rect.left() + 20.0, tb - 2.0 * SP()), Align2::CENTER_CENTER, "G", theme::bold(16.0), Color32::from_gray(40));
+                painter.text(pos2(rect.left() + 20.0, bb - 2.0 * SP()), Align2::CENTER_CENTER, "F", theme::bold(16.0), Color32::from_gray(40));
+            }
+            // 합주자 이름 (오선 위 왼쪽)
+            let label = &sheet.staves.get(st).map(|s| s.0.clone()).unwrap_or_default();
+            if !label.is_empty() {
+                painter.text(pos2(rect.left() + 6.0, tb - 4.0 * SP() - 16.0), Align2::LEFT_BOTTOM, label, theme::bold(11.0), pal.wine);
+            }
+            // 마디선과 마디 번호 (번호는 맨 위 보표에만)
+            for b in 0..=bars_here {
+                let x = x0 + b as f32 * bar_w;
+                let last = first_bar + b == total_bars;
+                let stroke = if last { Stroke::new(2.5f32, Color32::from_gray(60)) } else { barline };
+                if b > 0 || line == 0 {
+                    painter.line_segment([pos2(x, tb - 4.0 * SP()), pos2(x, bb)], stroke);
+                }
+                if b < bars_here && st == 0 {
+                    painter.text(pos2(x + 2.0, tb - 4.0 * SP() - 4.0), Align2::LEFT_BOTTOM, format!("{}", first_bar + b + 1), FontId::proportional(10.0), pal.muted);
+                }
             }
         }
-        // 악보 경계
-        for (t, name) in &sheet.starts {
-            if *t < line as f64 * lu - 0.5 || *t >= (line + 1) as f64 * lu - 0.5 || sheet.starts.len() < 2 {
-                continue;
+        let bb = lay.bass_bottom(line, nst - 1);
+        // 악보 경계: 줄 첫머리가 장의 시작이 아니어도 그 줄이 무슨 장인지 왼쪽 위에 적는다
+        if sheet.starts.len() >= 2 {
+            let la = line as f64 * lu;
+            let cur = sheet.starts.iter().rposition(|(t, _)| *t <= la + 0.5);
+            for (k, (t, name)) in sheet.starts.iter().enumerate() {
+                let starts_here = *t >= la - 0.5 && *t < (line + 1) as f64 * lu - 0.5;
+                if !starts_here {
+                    continue;
+                }
+                let x = lay.x_of(sheet, line, *t);
+                let w = if sheet.highlight == Some(k) { 2.5f32 } else { 1.5f32 };
+                painter.line_segment([pos2(x, top + 10.0), pos2(x, bb + 6.0)], Stroke::new(w, pal.wine));
+                // 줄 첫머리면 합주자 이름과 겹치지 않게 조금 오른쪽에
+                let lx = if nst > 1 && x < rect.left() + LEFT + 80.0 { rect.left() + LEFT + 80.0 } else { x + 3.0 };
+                painter.text(pos2(lx, top + 2.0), Align2::LEFT_TOP, name, theme::bold(12.0), pal.wine);
             }
-            let x = lay.x_of(sheet, line, *t);
-            painter.line_segment([pos2(x, top + 10.0), pos2(x, bb + 6.0)], Stroke::new(1.5f32, pal.wine_soft));
-            painter.text(pos2(x + 3.0, top + 4.0), Align2::LEFT_TOP, name, theme::bold(11.0), pal.wine);
+            if let Some(k) = cur {
+                if sheet.starts[k].0 < la - 0.5 {
+                    painter.text(pos2(rect.right() - 4.0, top + 2.0), Align2::RIGHT_TOP, format!("{} 이어서", sheet.starts[k].1), FontId::proportional(10.0), pal.muted);
+                }
+            }
         }
     }
 
-    // 음표 (화음2 -> 화음1 -> 멜로디 순으로 그려 멜로디가 위에 오게)
-    for k in (0..sheet.parts.len()).rev() {
+    // 음표 (화음2 -> 화음1 -> 멜로디 순으로 그려 멜로디가 위에 오게), 큰보표마다
+    for (st, (_, sparts)) in sheet.staves.iter().enumerate() {
+    for k in (0..sparts.len()).rev() {
         let color = PART_COLORS[k.min(2)];
-        let notes = &sheet.parts[k];
+        let notes = &sparts[k];
         let mut i = 0;
         while i < notes.len() {
             // 같은 시작 위치의 음을 화음 하나로 묶는다
@@ -266,16 +491,17 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
                 j += 1;
             }
             let group = &notes[i..j];
+            let gi = i;
             i = j;
             let start = group[0].start;
             let line = lay.line_of(sheet, start);
             let top = lay.sys_top(line);
-            if top > clip.bottom() || top + SYS_H < clip.top() {
+            if top > clip.bottom() || top + sys_h < clip.top() {
                 // 줄을 넘어가는 띠만 그릴 수도 있으니 다음 줄도 검사한다
                 let end_line = lay.line_of(sheet, group.iter().map(|n| n.end).fold(0.0, f64::max) - 0.01);
                 let any = (line..=end_line).any(|l| {
                     let t = lay.sys_top(l);
-                    t <= clip.bottom() && t + SYS_H >= clip.top()
+                    t <= clip.bottom() && t + sys_h >= clip.top()
                 });
                 if !any {
                     continue;
@@ -288,8 +514,8 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
                 for l in line..=end_line {
                     let a = if l == line { n.start } else { l as f64 * lu };
                     let b = if l == end_line { n.end } else { (l + 1) as f64 * lu };
-                    let (y, _) = lay.y_of(l, n.pitch);
-                    let y = lay.clamp_y(l, y);
+                    let (y, _) = lay.y_of(l, st, n.pitch);
+                    let y = lay.clamp_y(l, st, y);
                     let xa = lay.x_of(sheet, l, a) + if l == line { 3.0 } else { 0.0 };
                     let xb = lay.x_of(sheet, l, b) - 1.0;
                     if xb > xa {
@@ -302,38 +528,43 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
             let (n_kind, dotted) = kind_of(group[0].end - group[0].start);
             // 높은음/낮은음 오선별로 따로 기둥을 세운다
             for treble in [true, false] {
-                let heads: Vec<(f32, &Note)> = group
+                let heads: Vec<(f32, &Note, usize)> = group
                     .iter()
-                    .filter_map(|n| {
-                        let (y, tr) = lay.y_of(line, n.pitch);
-                        (tr == treble).then_some((y, n))
+                    .enumerate()
+                    .filter_map(|(o, n)| {
+                        let (y, tr) = lay.y_of(line, st, n.pitch);
+                        (tr == treble).then_some((y, n, gi + o))
                     })
                     .collect();
                 if heads.is_empty() {
                     continue;
                 }
-                let (bottom_line_y, bottom_d) = if treble { (lay.treble_bottom(line), TREBLE_BOTTOM) } else { (lay.bass_bottom(line), BASS_BOTTOM) };
-                let middle_y = bottom_line_y - 2.0 * SP;
-                for &(y_raw, n) in &heads {
-                    let y = lay.clamp_y(line, y_raw);
+                let (bottom_line_y, bottom_d) = if treble { (lay.treble_bottom(line, st), TREBLE_BOTTOM) } else { (lay.bass_bottom(line, st), BASS_BOTTOM) };
+                let middle_y = bottom_line_y - 2.0 * SP();
+                for &(y_raw, n, idx) in &heads {
+                    let y = lay.clamp_y(line, st, y_raw);
                     let (d, sharp) = diatonic(n.pitch);
                     // 덧줄
                     let ledger = Stroke::new(1.0f32, Color32::from_gray(110));
                     let mut l = bottom_d - 2;
                     while l >= d {
-                        let ly = lay.clamp_y(line, bottom_line_y - (l - bottom_d) as f32 * STEP);
+                        let ly = lay.clamp_y(line, st, bottom_line_y - (l - bottom_d) as f32 * STEP());
                         painter.line_segment([pos2(x - 7.0, ly), pos2(x + 7.0, ly)], ledger);
                         l -= 2;
                     }
                     let mut l = bottom_d + 10;
                     while l <= d {
-                        let ly = lay.clamp_y(line, bottom_line_y - (l - bottom_d) as f32 * STEP);
+                        let ly = lay.clamp_y(line, st, bottom_line_y - (l - bottom_d) as f32 * STEP());
                         painter.line_segment([pos2(x - 7.0, ly), pos2(x + 7.0, ly)], ledger);
                         l += 2;
                     }
                     let c = pos2(x, y);
                     if sounding {
                         painter.circle_filled(c, 7.5, Color32::from_rgba_unmultiplied(pal.gold.r(), pal.gold.g(), pal.gold.b(), 200));
+                    }
+                    if marks.selected == Some((st, k, idx)) {
+                        painter.circle_filled(c, 9.5, Color32::from_rgba_unmultiplied(SELECT.r(), SELECT.g(), SELECT.b(), 70));
+                        painter.circle_stroke(c, 9.5, Stroke::new(2.0f32, SELECT));
                     }
                     let pts = head_points(c);
                     if n_kind <= 2 {
@@ -345,7 +576,7 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
                         painter.text(pos2(x - 7.0, y), Align2::RIGHT_CENTER, "#", FontId::proportional(11.0), color);
                     }
                     if dotted {
-                        let dy = if (d - bottom_d).rem_euclid(2) == 0 { -STEP } else { 0.0 };
+                        let dy = if (d - bottom_d).rem_euclid(2) == 0 { -STEP() } else { 0.0 };
                         painter.circle_filled(pos2(x + 7.5, y + dy), 1.4, color);
                     }
                 }
@@ -353,13 +584,14 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
                     continue;
                 }
                 // 기둥과 꼬리
-                let ys: Vec<f32> = heads.iter().map(|h| lay.clamp_y(line, h.0)).collect();
+                let ys: Vec<f32> = heads.iter().map(|h| lay.clamp_y(line, st, h.0)).collect();
+                let _ = &heads;
                 let lo = ys.iter().cloned().fold(f32::MIN, f32::max); // 화면에서 아래 (큰 y)
                 let hi = ys.iter().cloned().fold(f32::MAX, f32::min);
                 let mean = ys.iter().sum::<f32>() / ys.len() as f32;
                 let up = mean >= middle_y;
                 let stem = Stroke::new(1.2f32, color);
-                let (sx, y_from, y_to) = if up { (x + 4.0, lo, hi - 3.5 * SP) } else { (x - 4.0, hi, lo + 3.5 * SP) };
+                let (sx, y_from, y_to) = if up { (x + 4.0, lo, hi - 3.5 * SP()) } else { (x - 4.0, hi, lo + 3.5 * SP()) };
                 painter.line_segment([pos2(sx, y_from), pos2(sx, y_to)], stem);
                 let flags = match n_kind {
                     8 => 1,
@@ -377,22 +609,71 @@ pub fn show(ui: &mut Ui, sheet: &Sheet, pal: &Palette, playhead: Option<f64>, fo
         }
     }
 
+    }
+
     // 재생 위치 선
     if let Some(t) = playhead {
         let line = lay.line_of(sheet, t);
         let x = lay.x_of(sheet, line, t);
         let top = lay.sys_top(line);
-        painter.line_segment([pos2(x, top + 14.0), pos2(x, lay.bass_bottom(line) + 12.0)], Stroke::new(2.0f32, theme::OVER));
+        painter.line_segment([pos2(x, top + 14.0), pos2(x, lay.bass_bottom(line, nst - 1) + 12.0)], Stroke::new(2.0f32, theme::OVER));
         painter.circle_filled(pos2(x, top + 14.0), 3.5, theme::OVER);
     }
 
-    // 누른 곳으로 옮기기
+    // 넣을 자리(글 커서) 표시: 파란 점선
+    if let Some((st, t)) = marks.caret {
+        let st = st.min(nst - 1);
+        let line = lay.line_of(sheet, t);
+        if line >= first && line < first + count {
+            let x = lay.x_of(sheet, line, t) + 1.0;
+            let (ya, yb) = (lay.treble_bottom(line, st) - 4.0 * SP() - 8.0, lay.bass_bottom(line, st) + 8.0);
+            let mut y = ya;
+            while y < yb {
+                painter.line_segment([pos2(x, y), pos2(x, (y + 5.0).min(yb))], Stroke::new(2.0f32, CARET));
+                y += 8.0;
+            }
+            painter.add(Shape::convex_polygon(vec![pos2(x - 5.0, ya - 6.0), pos2(x + 5.0, ya - 6.0), pos2(x, ya)], CARET, Stroke::NONE));
+        }
+    }
+
+    // 누른 곳: 시간, 큰보표, 가까운 음
     if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
-            let line = (((p.y - rect.top()) / SYS_H).floor().max(0.0) as usize).min(lines - 1);
+            let line = (first + ((p.y - rect.top()) / sys_h).floor().max(0.0) as usize).min(lines - 1);
             let rel = ((p.x - rect.left() - LEFT) / bar_w).max(0.0) as f64;
-            let t = line as f64 * lu + rel * sheet.bar;
-            return Some(t.clamp(0.0, sheet.end));
+            let t = (line as f64 * lu + rel * sheet.bar).clamp(0.0, sheet.end);
+            // 누른 높이에 있는 큰보표
+            let mut staff = 0;
+            let mut best = f32::MAX;
+            for st in 0..nst {
+                let (a, b) = (lay.treble_bottom(line, st) - 4.0 * SP() - 14.0, lay.bass_bottom(line, st) + 14.0);
+                let d = if p.y < a { a - p.y } else if p.y > b { p.y - b } else { 0.0 };
+                if d < best {
+                    best = d;
+                    staff = st;
+                }
+            }
+            // 음 머리 가까이를 눌렀으면 그 음
+            let mut note = None;
+            let mut nd = 11.0f32;
+            if let Some((_, sparts)) = sheet.staves.get(staff) {
+                for (k, notes) in sparts.iter().enumerate() {
+                    // 합주자 여럿을 한 보표에 겹쳐 보면 시간순이 아니므로 모두 본다
+                    for (idx, n) in notes.iter().enumerate() {
+                        if lay.line_of(sheet, n.start) != line {
+                            continue;
+                        }
+                        let x = lay.x_of(sheet, line, n.start) + 5.0;
+                        let y = lay.clamp_y(line, staff, lay.y_of(line, staff, n.pitch).0);
+                        let d = ((x - p.x).powi(2) + (y - p.y).powi(2)).sqrt();
+                        if d < nd {
+                            nd = d;
+                            note = Some((k, idx));
+                        }
+                    }
+                }
+            }
+            return Some(Click { t, staff, note });
         }
     }
     if resp.hovered() {

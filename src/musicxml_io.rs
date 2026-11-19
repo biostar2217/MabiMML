@@ -143,11 +143,29 @@ where
 }
 
 pub fn read_musicxml(path: &str) -> Result<Song, String> {
+    read_musicxml_with(path, None)
+}
+
+/// default_sig: 악보에 박자표가 없을 때 쓸 박자 (나눠 인식한 뒤쪽 페이지는 박자표가 안 적혀 있다)
+pub fn read_musicxml_with(path: &str, default_sig: Option<(i64, i64)>) -> Result<Song, String> {
     let text = load_text(path)?;
-    read_musicxml_text(&text)
+    read_musicxml_text_with(&text, default_sig)
 }
 
 pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
+    read_musicxml_text_with(text, None)
+}
+
+/// 박자표의 박 수: '3+2' 같은 합친 박자는 더한다
+fn beats_of(s: &str) -> Option<i64> {
+    let mut sum = 0;
+    for x in s.split('+') {
+        sum += parse_int(py_strip(x))?;
+    }
+    Some(sum)
+}
+
+pub fn read_musicxml_text_with(text: &str, default_sig: Option<(i64, i64)>) -> Result<Song, String> {
     let doc = parse_doc(text)?;
     let root = doc.root_element();
     if name(&root) == "score-timewise" {
@@ -171,6 +189,9 @@ pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
     let title = if !wt.is_empty() { wt } else { findtext(&root, "movement-title").unwrap_or_default() };
     let title = py_strip(&title).to_string();
 
+    // 마디 길이를 박자표에 맞추는 일은 악보 인식(Audiveris) 결과에만: 사람이 만든 악보의
+    // 반복 기호 앞에서 쪼갠 마디, 카덴차 같은 일부러 다른 길이의 마디는 그대로 둔다
+    let omr = descendants_named(&root, "software").any(|s| text_of(&s).map(|t| t.contains("Audiveris")).unwrap_or(false));
     let mut tracks = Vec::new();
     let mut tempos: Vec<(f64, f64)> = Vec::new();
     let mut timesigs: Vec<(f64, i64, i64)> = Vec::new();
@@ -183,10 +204,14 @@ pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
         let mut vel = 80.0f64;
         let mut notes: Vec<Note> = Vec::new();
         let mut open_ties: HashMap<(i64, String), usize> = HashMap::new();
-        for measure in children(&part, "measure") {
+        // 박자표가 정한 한 마디 길이 (96 = 4분음표)
+        let mut meas_len: Option<f64> = default_sig.filter(|s| s.0 > 0 && s.1 > 0).map(|(b, bt)| b as f64 * 384.0 / bt as f64);
+        for (mi, measure) in children(&part, "measure").enumerate() {
             if pi == 0 {
                 bars.push(pos);
             }
+            let mstart = pos;
+            let implicit = measure.attribute("implicit") == Some("yes");
             // 마디 안에서 가장 멀리 간 위치. 마지막 성부가 짧거나 <backup> 으로 끝나도
             // 다음 마디는 여기서 시작해야 마디끼리 겹치지 않는다 (악보 인식 결과에 흔함).
             let mut furthest = pos;
@@ -199,16 +224,25 @@ pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
                             divisions = d;
                         }
                     }
-                    if pi == 0 {
-                        for tm in children(&el, "time") {
-                            let b = child(&tm, "beats")
-                                .and_then(|x| text_of(&x).map(|s| py_strip(s).to_string()))
-                                .and_then(|s| parse_int(s.split('+').next().unwrap_or("")));
-                            let bt = num_i(&tm, "beat-type");
-                            if let (Some(b), Some(bt)) = (b, bt) {
-                                if b != 0 && bt != 0 {
-                                    timesigs.push((pos, b, bt));
-                                }
+                    for tm in children(&el, "time") {
+                        // 박자 한 쌍씩 (2/4+3/8 처럼 여러 쌍이면 길이를 더한다)
+                        let beats: Vec<Option<i64>> = children(&tm, "beats").map(|x| text_of(&x).and_then(beats_of)).collect();
+                        let types: Vec<Option<i64>> = children(&tm, "beat-type").map(|x| text_of(&x).and_then(|s| parse_int(py_strip(s)))).collect();
+                        let mut len = 0.0;
+                        let mut ok = !beats.is_empty() && beats.len() == types.len();
+                        for (b, bt) in beats.iter().zip(&types) {
+                            match (b, bt) {
+                                (Some(b), Some(bt)) if *b > 0 && *bt > 0 => len += *b as f64 * 384.0 / *bt as f64,
+                                _ => ok = false,
+                            }
+                        }
+                        // 읽지 못한 박자표면 마디 길이를 맞추지 않는다
+                        meas_len = if ok { Some(len) } else { None };
+                        if let (true, Some(Some(b)), Some(Some(bt))) = (ok, beats.first(), types.first()) {
+                            if pi == 0 {
+                                // 표시용: 박 수는 한 쌍이면 그대로, 여러 쌍이면 첫 박자 단위로 환산
+                                let shown = if beats.len() == 1 { *b } else { (len * *bt as f64 / 384.0).round() as i64 };
+                                timesigs.push((pos, shown, *bt));
                             }
                         }
                     }
@@ -320,6 +354,34 @@ pub fn read_musicxml_text(text: &str) -> Result<Song, String> {
                 }
             }
             pos = pos.max(furthest);
+            // 악보 인식이 박자를 잘못 읽어 마디가 박자표보다 길거나 짧으면, 그 차이가 뒤로 계속 밀려
+            // 손(파트)끼리 어긋나고 뒤의 모든 음이 엉뚱한 박자가 된다. 마디 길이를 박자표에 맞춘다.
+            if let (Some(l), true) = (meas_len, omr) {
+                let content = pos - mstart;
+                if content > l + 0.5 {
+                    // 넘친 마디: 그 마디 안의 음을 박자표 길이에 맞게 줄인다
+                    let f = l / content;
+                    let mend = mstart + l;
+                    for nt in notes.iter_mut() {
+                        if nt.start >= mstart - 1e-6 {
+                            nt.start = mstart + (nt.start - mstart) * f;
+                        }
+                        if nt.end > mstart + 1e-6 {
+                            nt.end = mstart + (nt.end - mstart) * f;
+                        }
+                    }
+                    // 템포는 첫 파트에서만 모으므로, 첫 파트의 그 마디 안에 있는 것만 함께 줄인다
+                    if pi == 0 {
+                        for t in tempos.iter_mut().filter(|t| t.0 > mstart && t.0 < mstart + content - 1e-6) {
+                            t.0 = mstart + (t.0 - mstart) * f;
+                        }
+                    }
+                    pos = mend;
+                } else if content < l - 0.5 && mi > 0 && !implicit {
+                    // 모자란 마디(중간에 쉼표를 못 읽음): 나머지는 쉼으로 채운다. 첫 마디(못갖춘마디)는 그대로
+                    pos = mstart + l;
+                }
+            }
         }
         sort_start_desc_pitch(&mut notes);
         let nm = names.get(&pid).cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("파트 {}", pi + 1));

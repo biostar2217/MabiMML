@@ -52,10 +52,12 @@ fn byte(d: &[u8], at: usize) -> Result<u8, String> {
 }
 
 pub fn decode_name(md: &[u8]) -> String {
-    match std::str::from_utf8(md) {
+    let s = match std::str::from_utf8(md) {
         Ok(s) => s.to_string(),
         Err(_) => encoding_rs::EUC_KR.decode(md).0.into_owned(),
-    }
+    };
+    // 이름 끝의 NUL 같은 제어 문자는 뺀다 (텍스트 저장 파일이 깨지지 않게)
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 pub fn read_midi_bytes(data0: &[u8], pedal: bool, expression: bool) -> Result<Song, String> {
@@ -342,13 +344,19 @@ pub fn midi_bytes(parts: &[Vec<Note>], tempos: &[(f64, f64)], programs: Option<&
         ev.push((t, 0u8, vec![0xFF, 0x51, 0x03, b[1], b[2], b[3]]));
     }
     chunks.push(track_bytes(ev));
+    let mut next_ch = 0usize;
     for (ci, notes) in parts.iter().enumerate() {
-        let ch = (if ci < 9 { ci } else { ci + 1 }).min(15) as u8;
-        let prog = match programs {
-            Some(p) => p.get(ci).copied().unwrap_or(0).clamp(0, 127) as u8,
-            None => 0,
+        let raw = programs.and_then(|p| p.get(ci).copied()).unwrap_or(0);
+        // 128 이상 = 드럼 채널(10번)
+        let ch = if raw >= 128 {
+            9u8
+        } else {
+            let c = (if next_ch < 9 { next_ch } else { next_ch + 1 }).min(15) as u8;
+            next_ch += 1;
+            c
         };
-        let mut ev = vec![(0.0, 0u8, vec![0xC0 | ch, prog])];
+        let prog = raw.clamp(0, 127) as u8;
+        let mut ev = if ch == 9 { vec![] } else { vec![(0.0, 0u8, vec![0xC0 | ch, prog])] };
         for n in notes {
             if !(0..=127).contains(&n.pitch) {
                 skipped += 1;

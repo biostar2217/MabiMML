@@ -146,6 +146,10 @@ pub struct Event {
     pub cont: bool,
     pub tempo: Option<i64>,
     pub need_v0: bool,
+    /// 음 이름 대신 쓸 글자 (옥타브를 안 바꾸는 c-, b+)
+    pub spell: Option<&'static str>,
+    /// n번호로 적을 후보 (옥타브를 안 바꾼다)
+    pub n_try: bool,
 }
 
 /// notes: 단음, 정렬, 정수 유닛. tempo_points: [(unit, bpm)] (seg_start 의 초기 템포 포함).
@@ -234,6 +238,8 @@ pub fn build_events(notes: &[Note], seg_start: i64, seg_end: i64, tempo_points: 
                     cont: cont && kind == EvKind::Note,
                     tempo,
                     need_v0: false,
+                    spell: None,
+                    n_try: false,
                 });
             }
             pos = b;
@@ -243,8 +249,25 @@ pub fn build_events(notes: &[Note], seg_start: i64, seg_end: i64, tempo_points: 
     events
 }
 
-fn clip_volume(v: i64) -> i64 {
-    v.clamp(1, 15)
+fn clip_volume(v: i64, max: i64) -> i64 {
+    v.clamp(1, max.clamp(1, 15))
+}
+
+/// 글자 쓰는 방식
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EncodeStyle {
+    /// 볼륨 최댓값 (타악기·핸드 차임은 11)
+    pub max_volume: i64,
+    /// 옥타브 경계 음을 c-, b+ 로 적어 옥타브 바꿈을 줄인다
+    pub flats: bool,
+    /// 멀리 떨어진 한 음을 n번호로 적는다
+    pub n_numbers: bool,
+}
+
+impl Default for EncodeStyle {
+    fn default() -> Self {
+        EncodeStyle { max_volume: 15, flats: true, n_numbers: true }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -264,11 +287,15 @@ impl VolumeMode {
     }
 }
 
+fn note_name(ev: &Event) -> &'static str {
+    ev.spell.unwrap_or(PC_NAMES[ev.pitch.rem_euclid(12) as usize])
+}
+
 fn piece_cost(ev: &Event) -> (i64, i64) {
     if ev.kind != EvKind::Note {
         return (1, 0);
     }
-    let name = PC_NAMES[ev.pitch.rem_euclid(12) as usize].len() as i64;
+    let name = note_name(ev).len() as i64;
     if ev.cont {
         (name + 1, 0)
     } else {
@@ -289,6 +316,7 @@ pub fn encode_part(
     volume_offset: i64,
     v0_tempo: bool,
     pad_end: bool,
+    style: EncodeStyle,
 ) -> Result<String, EncodeError> {
     let mut events = build_events(notes, seg_start, seg_end, tempo_points, pad_end);
     if events.is_empty() {
@@ -304,12 +332,26 @@ pub fn encode_part(
         }
     }
 
+    // 다음 음(이어지는 조각 제외)의 옥타브: 옥타브를 잠깐 바꿨다 돌아오는 자리를 찾는다
+    let mut next_oct: Vec<Option<i64>> = vec![None; events.len()];
+    let mut next_cont: Vec<bool> = vec![false; events.len()];
+    {
+        let mut nxt: Option<i64> = None;
+        for k in (0..events.len()).rev() {
+            next_oct[k] = nxt;
+            next_cont[k] = events.get(k + 1).map(|e| e.cont).unwrap_or(false);
+            if events[k].kind == EvKind::Note && !events[k].cont {
+                nxt = Some(events[k].pitch.div_euclid(12) - 1);
+            }
+        }
+    }
     // 1) 음높이/볼륨 앞 토큰
     let mut pre: Vec<String> = Vec::with_capacity(events.len());
+    let mut octave_at: Vec<i64> = vec![0; events.len()];
     let mut octave = DEFAULT_OCTAVE;
     let mut volume = DEFAULT_VOLUME;
     let mut first_note = true;
-    for ev in events.iter_mut() {
+    for (k, ev) in events.iter_mut().enumerate() {
         let mut toks = String::new();
         if let Some(t) = ev.tempo {
             toks += &format!("t{}", t);
@@ -325,14 +367,14 @@ pub fn encode_part(
                 }
                 volume = 0;
             } else if volume_mode == VolumeMode::Dynamic {
-                let want = clip_volume(vel_to_volume(ev.vel) + volume_offset);
+                let want = clip_volume(vel_to_volume(ev.vel) + volume_offset, style.max_volume);
                 if (first_note && want != volume) || volume == 0 || (want - volume).abs() >= volume_threshold {
                     toks += &format!("v{}", want);
                     volume = want;
                 }
             } else {
                 let base = if volume_mode == VolumeMode::Fixed { fixed_volume } else { DEFAULT_VOLUME };
-                let want = clip_volume(base + volume_offset);
+                let want = clip_volume(base + volume_offset, style.max_volume);
                 if want != volume {
                     toks += &format!("v{}", want);
                     volume = want;
@@ -342,8 +384,20 @@ pub fn encode_part(
                 first_note = false;
             }
             let o = ev.pitch.div_euclid(12) - 1;
-            toks += &octave_text(octave, o);
-            octave = o;
+            let pc = ev.pitch.rem_euclid(12);
+            octave_at[k] = octave;
+            // 옥타브를 바꿨다가 다음 음에서 바로 돌아오면: 경계 음은 c-, b+ 로, 멀리 떨어진 한 음은 n번호로
+            let back = o != octave && !next_cont[k] && next_oct[k].map(|n| n == octave).unwrap_or(false);
+            if back && style.flats && pc == 11 && o == octave - 1 {
+                ev.spell = Some("c-");
+            } else if back && style.flats && pc == 0 && o == octave + 1 {
+                ev.spell = Some("b+");
+            } else if back && style.n_numbers && (o - octave).abs() >= 2 && ev.vel != 0.0 {
+                ev.n_try = true;
+            } else {
+                toks += &octave_text(octave, o);
+                octave = o;
+            }
         }
         pre.push(toks);
     }
@@ -426,8 +480,21 @@ pub fn encode_part(
                     s += &len_text(*n, *d, l);
                 }
             }
+            EvKind::Note if ev.n_try => {
+                // 기본 길이 한 조각이면 n번호, 아니면 옥타브를 바꿨다가 바로 되돌린다
+                if pieces.len() == 1 && pieces[0] == (l, false) {
+                    s += &format!("n{}", ev.pitch - 12);
+                } else {
+                    let o = ev.pitch.div_euclid(12) - 1;
+                    let name = PC_NAMES[ev.pitch.rem_euclid(12) as usize];
+                    let parts: Vec<String> = pieces.iter().map(|(n, d)| format!("{}{}", name, len_text(*n, *d, l))).collect();
+                    s += &octave_text(octave_at[k], o);
+                    s += &parts.join("&");
+                    s += &octave_text(o, octave_at[k]);
+                }
+            }
             EvKind::Note => {
-                let name = PC_NAMES[ev.pitch.rem_euclid(12) as usize];
+                let name = note_name(ev);
                 let parts: Vec<String> = pieces.iter().map(|(n, d)| format!("{}{}", name, len_text(*n, *d, l))).collect();
                 if ev.cont {
                     s.push('&');

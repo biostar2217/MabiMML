@@ -18,6 +18,15 @@ MIDI / MusicXML / 악보 PDF 파일을 PC판 마비노기 MML(MML@멜로디,화�
   --mobile-text, --mml-text 글자   파일 대신 MML 글자를 직접 넣기
   --rearrange                3파트 이하 MML도 편곡 단계를 거침
   --split-players            모바일 MML의 1~3파트, 4~6파트를 두 사람 PC 악보로 나눔
+  --players N|auto           합주: N명(2~8)이 함께 치도록 나눔. auto 는 음을 빼지 않고 한 사람 한 장에 들어가는 인원
+  --by-instrument            합주를 원곡 악기(트랙)별로 나누고 합주자마다 어울리는 마비노기 악기를 정함 (합주 켜짐)
+  --auto-drums               합주에서 드럼 트랙이 없으면 박자에 맞춘 드럼을 만들어 드럼 세트 합주자로
+  --drum-style 모양           자동 드럼 모양: 기본, 풍성하게, 단순하게
+  --auto-bass                합주에서 곡 화음을 따라 베이스 합주자를 자동으로 만듦
+  --drum-compact             드럼 글자 아끼기 (고스트·잘게 친 하이햇 빼기, 볼륨 한 가지)
+  --drum-merge               드럼 합주자는 한도 안에서 여러 장을 한 장으로 합침
+  --mobile                   모바일용으로 내보냄 (한 사람 6파트, 파트마다 2400자, 빈틈 메우기)
+  --no-compact               글자 수 줄이기(n번호, c-/b+ 표기)를 쓰지 않음
   --instrument 악기          연주 악기 (높게 나는 악기는 낮춰 적음)
   --no-low-limit             o2e 아래 음을 올리지 않음
   --fill-gaps auto|on|off    짧은 빈틈 메우기
@@ -64,6 +73,15 @@ struct Args {
     mobile_text: Option<String>,
     rearrange: bool,
     split_players: bool,
+    players: Option<usize>,
+    by_instrument: bool,
+    mobile: bool,
+    auto_drums: bool,
+    drum_style: Option<String>,
+    drum_compact: bool,
+    auto_bass: bool,
+    drum_merge: bool,
+    no_compact: bool,
     instrument: String,
     no_low_limit: bool,
     fill_gaps: String,
@@ -149,6 +167,26 @@ fn parse(argv: &[String]) -> Result<Option<Args>, String> {
             "--mobile-text" | "--mml-text" => a.mobile_text = Some(val(&mut i)?),
             "--rearrange" => a.rearrange = true,
             "--split-players" => a.split_players = true,
+            "--by-instrument" => a.by_instrument = true,
+            "--mobile" => a.mobile = true,
+            "--auto-drums" => a.auto_drums = true,
+            "--drum-compact" => a.drum_compact = true,
+            "--auto-bass" => a.auto_bass = true,
+            "--drum-merge" => a.drum_merge = true,
+            "--drum-style" => a.drum_style = Some(choice(val(&mut i)?, &["기본", "풍성하게", "단순하게"], "--drum-style")?),
+            "--no-compact" => a.no_compact = true,
+            "--players" => {
+                let v = val(&mut i)?;
+                a.players = Some(if v.trim().eq_ignore_ascii_case("auto") {
+                    0
+                } else {
+                    let n = int(v, "--players")?;
+                    if !(1..=8).contains(&n) {
+                        return Err("--players 는 1~8 또는 auto".into());
+                    }
+                    n as usize
+                });
+            }
             "--instrument" => {
                 let v = val(&mut i)?;
                 let names: Vec<&str> = INSTRUMENTS.iter().map(|x| x.0).collect();
@@ -326,14 +364,42 @@ pub fn main(argv: &[String]) -> i32 {
         keep_original: !a.rearrange,
         sustain: if a.no_pedal { "off".into() } else { a.sustain.clone() },
         split_players: a.split_players,
+        players: if a.by_instrument { a.players.unwrap_or(0) } else { a.players.unwrap_or(1) },
+        ensemble: a.players.is_some() || a.by_instrument,
+        by_instrument: a.by_instrument,
         jabchiel: !a.no_jabchiel,
         roles: Some(roles),
         include_drums: a.drums,
+        auto_drums: a.auto_drums,
+        drum_compact: a.drum_compact,
+        auto_bass: a.auto_bass,
+        drum_merge: a.drum_merge,
+        drum_style: a.drum_style.clone().unwrap_or_else(|| "기본".into()),
+        flats: !a.no_compact,
+        n_numbers: !a.no_compact,
         ..Default::default()
     };
-    if crate::ranks::limits_for(&opts.rank, opts.no_song, None).is_err() {
-        eprintln!("알 수 없는 랭크: {} (사용 가능: {}, 무제한)", opts.rank, rank_order().join(", "));
+    if opts.rank == "무제한" || crate::ranks::limits_for(&opts.rank, opts.no_song, None).is_err() {
+        eprintln!("알 수 없는 랭크: {} (사용 가능: {})", opts.rank, rank_order().join(", "));
         return 2;
+    }
+    if a.mobile {
+        let m = match crate::convert::mobile_export(&song, &opts) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{}", e);
+                return 1;
+            }
+        };
+        let text = m.text();
+        println!("{}", text);
+        if let Some(o) = &a.output {
+            if let Err(e) = crate::pyfmt::write_text(o, text + "\n") {
+                eprintln!("저장 실패: {}", e);
+                return 1;
+            }
+        }
+        return 0;
     }
     let res = match convert_song(&song, &opts) {
         Ok(r) => r,

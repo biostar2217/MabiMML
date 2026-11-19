@@ -22,6 +22,8 @@ pub struct BeatGrid {
     pub mode: String,
     pub bias: f64,
     pub beat_step: HashMap<i64, i64>,
+    /// 이미 분석을 마친 격자 (다시 분석하지 않는다: 합주에서 여러 트랙 묶음이 같은 격자를 쓰도록)
+    pub frozen: bool,
 }
 
 impl BeatGrid {
@@ -34,7 +36,7 @@ impl BeatGrid {
         if step_t > 96 {
             step_t = 32;
         }
-        Ok(BeatGrid { step_s, step_t, mode: triplet.to_string(), bias: 0.6, beat_step: HashMap::new() })
+        Ok(BeatGrid { step_s, step_t, mode: triplet.to_string(), bias: 0.6, beat_step: HashMap::new(), frozen: false })
     }
 
     fn snap_g(p: f64, g: i64) -> i64 {
@@ -42,7 +44,7 @@ impl BeatGrid {
     }
 
     pub fn analyze(&mut self, points: &[f64]) {
-        if self.mode != "auto" {
+        if self.mode != "auto" || self.frozen {
             return;
         }
         let mut err: HashMap<i64, (f64, f64, i64)> = HashMap::new();
