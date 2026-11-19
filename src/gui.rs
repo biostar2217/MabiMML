@@ -364,6 +364,21 @@ struct Download {
     rx: Receiver<Result<PathBuf, String>>,
 }
 
+/// 피드백 게시판 창 너비와 목록 칸 (왼쪽 x, 너비)
+const FB_W: f32 = 620.0;
+const FB_HEAD: [&str; 7] = ["번호", "분류", "제목", "글쓴이", "날짜", "상태", "답변"];
+const FB_COLS: [(f32, f32); 7] = [(8.0, 36.0), (48.0, 44.0), (98.0, 222.0), (326.0, 90.0), (422.0, 86.0), (512.0, 70.0), (584.0, 34.0)];
+const FB_CENTER: [bool; 7] = [true, true, false, false, false, true, true];
+
+/// 피드백 게시판 창의 화면
+#[derive(Clone, Debug, PartialEq)]
+enum FbView {
+    List,
+    /// 글 번호(id)
+    Read(String),
+    Write,
+}
+
 /// 캡처 순서 (MABIMML_SHOTS=폴더 로 실행하면 자기 창을 찍고 스스로 닫는다)
 struct Shots {
     dir: PathBuf,
@@ -454,6 +469,14 @@ pub struct App {
     fb_attach: bool,
     fb_status: String,
     fb_rx: Option<Receiver<Result<String, String>>>,
+    /// 게시판 화면: 목록 / 글 보기 / 글쓰기
+    fb_view: FbView,
+    fb_nick: String,
+    fb_list: Option<Vec<feedback::Post>>,
+    fb_list_err: Option<feedback::ListError>,
+    fb_list_rx: Option<Receiver<Result<Vec<feedback::Post>, feedback::ListError>>>,
+    fb_notice: String,
+    fb_new_replies: usize,
     download: Option<Download>,
     // 그림
     icon_tex: Option<egui::TextureHandle>,
@@ -567,6 +590,13 @@ impl App {
             fb_attach: false,
             fb_status: String::new(),
             fb_rx: None,
+            fb_view: FbView::List,
+            fb_nick: config::load().get(feedback::CFG_NICK).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            fb_list: None,
+            fb_list_err: None,
+            fb_list_rx: None,
+            fb_notice: String::new(),
+            fb_new_replies: 0,
             download: None,
             icon_tex: None,
             icon_theme: String::new(),
@@ -598,6 +628,10 @@ impl App {
         app.last_fingerprint = app.fingerprint();
         // 악보 보기를 따로 띄운 창으로 시작 (설정에 기억. 시험용 화면 찍기는 기본으로 붙여서)
         app.fb_open = std::env::var_os("MABIMML_SHOT_FEEDBACK").is_some();
+        // 글을 쓴 적 있는 PC 면 켤 때 한 번 답변이 왔는지 본다 (시험용 화면 찍기 때는 묻지 않음)
+        if feedback::has_client_id() && std::env::var_os("MABIMML_SHOTS").is_none() {
+            app.load_board();
+        }
         app.sheet_window = app.saved.sheet_window && (std::env::var_os("MABIMML_SHOTS").is_none() || std::env::var_os("MABIMML_SHOT_SHEETWIN").is_some());
         app
     }
@@ -2864,12 +2898,17 @@ impl App {
                             );
                         }
                         ui.add_space(6.0);
+                        let fb_label = if self.fb_new_replies > 0 { format!("피드백 · 새 답변 {}", self.fb_new_replies) } else { "피드백 보내기".to_string() };
+                        let fb_color = if self.fb_new_replies > 0 { p.gold } else { Color32::WHITE };
                         let fb = ui
-                            .add(egui::Button::new(RichText::new("피드백 보내기").font(theme::bold(12.5)).color(Color32::WHITE)).frame(false))
-                            .on_hover_text("버그 제보나 바라는 기능을 제작자에게 보내요")
+                            .add(egui::Button::new(RichText::new(fb_label).font(theme::bold(12.5)).color(fb_color)).frame(false))
+                            .on_hover_text("버그 제보·제안·질문을 게시판에 올리고, 내가 쓴 글의 답변을 봐요")
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
                         if fb.clicked() {
                             self.fb_open = true;
+                            self.fb_view = FbView::List;
+                            self.fb_notice.clear();
+                            self.load_board();
                         }
                         ui.add_space(6.0);
                         let busy = self.update_rx.is_some() || self.download.is_some();
@@ -3493,92 +3532,341 @@ impl App {
         });
     }
 
-    // ---------- 의견 보내기 ----------
+    // ---------- 피드백 게시판 ----------
     fn poll_feedback(&mut self) {
-        let Some(rx) = &self.fb_rx else { return };
-        let Ok(r) = rx.try_recv() else { return };
-        self.fb_rx = None;
-        match r {
-            Ok(id) => {
-                self.fb_text.clear();
-                self.fb_attach = false;
-                self.fb_status.clear();
-                self.fb_open = false;
-                let no = if id.is_empty() { String::new() } else { format!("
-접수 번호: {}", id) };
-                self.info("의견 보내기", &format!("보냈어요. 고맙습니다!{}", no));
+        if let Some(rx) = &self.fb_rx {
+            if let Ok(r) = rx.try_recv() {
+                self.fb_rx = None;
+                match r {
+                    Ok(id) => {
+                        self.fb_text.clear();
+                        self.fb_attach = false;
+                        self.fb_status.clear();
+                        self.fb_view = FbView::List;
+                        let no = id.strip_prefix("fb_").unwrap_or(&id);
+                        self.fb_notice = if no.is_empty() { "글을 올렸어요. 고맙습니다!".into() } else { format!("{}번 글을 올렸어요. 고맙습니다!", no) };
+                        self.load_board();
+                    }
+                    Err(e) => self.fb_status = e,
+                }
             }
-            Err(e) => self.fb_status = e,
         }
+        if let Some(rx) = &self.fb_list_rx {
+            if let Ok(r) = rx.try_recv() {
+                self.fb_list_rx = None;
+                match r {
+                    Ok(items) => {
+                        let total = feedback::reply_total(&items);
+                        let seen = feedback::seen_replies();
+                        if total < seen {
+                            feedback::set_seen_replies(total); // 제작자가 답변을 지운 경우
+                        }
+                        self.fb_new_replies = total.saturating_sub(seen);
+                        self.fb_list = Some(items);
+                        self.fb_list_err = None;
+                    }
+                    Err(e) => self.fb_list_err = Some(e),
+                }
+            }
+        }
+    }
+
+    /// 내가 쓴 글 목록을 서버에서 다시 받아 온다 (뒤에서)
+    fn load_board(&mut self) {
+        if self.fb_list_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(feedback::fetch_mine(VERSION, &feedback::feedback_url()));
+        });
+        self.fb_list_rx = Some(rx);
+    }
+
+    /// 글쓰기 화면의 내용을 올린다 (뒤에서)
+    fn board_submit(&mut self) {
+        if self.fb_rx.is_some() || self.fb_text.trim().is_empty() {
+            return;
+        }
+        let attach = self.fb_attach && !self.score_texts.is_empty();
+        let f = feedback::Feedback {
+            nickname: self.fb_nick.clone(),
+            kind: feedback::kind_value(&self.fb_kind).to_string(),
+            message: self.fb_text.clone(),
+            contact: self.fb_contact.clone(),
+            song: if attach { base_name(&self.path) } else { String::new() },
+            mml: if attach { self.score_texts.join("\n\n") } else { String::new() },
+        };
+        config::set(feedback::CFG_CONTACT, json!(self.fb_contact.trim()));
+        config::set(feedback::CFG_NICK, json!(self.fb_nick.trim()));
+        self.fb_status.clear();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(feedback::send(&f, VERSION, &feedback::feedback_url()));
+        });
+        self.fb_rx = Some(rx);
     }
 
     fn feedback_window(&mut self, ctx: &egui::Context) {
         self.poll_feedback();
+        if self.fb_rx.is_some() || self.fb_list_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
         if !self.fb_open {
             return;
         }
-        if self.fb_rx.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
-        let p = self.pal;
         let mut open = true;
         let mut send = false;
-        let sending = self.fb_rx.is_some();
-        let has_mml = !self.score_texts.is_empty();
-        egui::Window::new("의견 보내기").open(&mut open).default_width(480.0).resizable(false).collapsible(false).show(ctx, |ui| {
-            ui.label(RichText::new("버그나 바라는 기능을 적어 주세요. 제작자에게 바로 전달돼요.").color(p.muted));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("종류");
-                let labels: Vec<&str> = feedback::KINDS.iter().map(|(_, l)| *l).collect();
-                Self::combo(ui, "fb_kind", &mut self.fb_kind, &labels, 120.0);
-            });
-            ui.add(
-                egui::TextEdit::multiline(&mut self.fb_text)
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY)
-                    .char_limit(feedback::MAX_MESSAGE)
-                    .hint_text(RichText::new("예: 이 곡을 열면 화음2가 비어 나와요").color(p.line)),
-            );
-            ui.horizontal(|ui| {
-                ui.label("답장 받을 곳 (선택)");
-                ui.add(egui::TextEdit::singleline(&mut self.fb_contact).desired_width(240.0).char_limit(feedback::MAX_CONTACT).hint_text(RichText::new("이메일, 디스코드, 게임 닉네임").color(p.line)));
-            });
-            ui.add_enabled(has_mml, egui::Checkbox::new(&mut self.fb_attach, "지금 곡 이름과 MML 함께 보내기"))
-                .on_hover_text("문제가 난 곡을 제작자가 그대로 볼 수 있어요");
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let can = !sending && !self.fb_text.trim().is_empty();
-                if ui.add_enabled(can, egui::Button::new(RichText::new(if sending { "보내는 중…" } else { "보내기" }).font(theme::bold(13.0)))).clicked() {
-                    send = true;
-                }
-                if !self.fb_status.is_empty() {
-                    ui.label(RichText::new(&self.fb_status).color(Color32::from_rgb(200, 60, 60)));
+        let mut reload = false;
+        let mut go: Option<FbView> = None;
+        let view = self.fb_view.clone();
+        egui::Window::new("피드백 게시판")
+            .id(egui::Id::new("fb_board"))
+            .open(&mut open)
+            .default_pos(ctx.screen_rect().center())
+            .pivot(egui::Align2::CENTER_CENTER)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.set_width(FB_W);
+                match &view {
+                    FbView::List => self.board_list_ui(ui, &mut go, &mut reload),
+                    FbView::Read(id) => self.board_read_ui(ui, id, &mut go),
+                    FbView::Write => send = self.board_write_ui(ui, &mut go),
                 }
             });
-        });
         if send {
-            let attach = self.fb_attach && has_mml;
-            let f = feedback::Feedback {
-                kind: feedback::kind_value(&self.fb_kind).to_string(),
-                message: self.fb_text.clone(),
-                contact: self.fb_contact.clone(),
-                song: if attach { base_name(&self.path) } else { String::new() },
-                mml: if attach { self.score_texts.join("
-
-") } else { String::new() },
-            };
-            config::set(feedback::CFG_CONTACT, json!(self.fb_contact.trim()));
-            self.fb_status.clear();
-            let (tx, rx) = channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(feedback::send(&f, VERSION, &feedback::feedback_url()));
-            });
-            self.fb_rx = Some(rx);
+            self.board_submit();
+        }
+        if reload {
+            self.fb_notice.clear();
+            self.load_board();
+        }
+        if let Some(v) = go {
+            self.fb_notice.clear();
+            if v == FbView::Write {
+                self.fb_status.clear();
+            }
+            self.fb_view = v;
+        }
+        // 목록을 봤으니 새 답변 표시를 끈다
+        if self.fb_view == FbView::List && self.fb_new_replies > 0 {
+            if let Some(items) = &self.fb_list {
+                feedback::set_seen_replies(feedback::reply_total(items));
+                self.fb_new_replies = 0;
+            }
         }
         if !open {
             self.fb_open = false;
         }
+    }
+
+    /// 게시판 목록: 번호 · 분류 · 제목 · 글쓴이 · 날짜 · 상태 · 답변
+    fn board_list_ui(&self, ui: &mut Ui, go: &mut Option<FbView>, reload: &mut bool) {
+        let p = self.pal;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("내가 쓴 글과 제작자 답변만 보여요 (이 PC 기준)").size(12.5).color(p.muted));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.accent(ui, "글쓰기").clicked() {
+                    *go = Some(FbView::Write);
+                }
+                let loading = self.fb_list_rx.is_some();
+                if ui.add_enabled(!loading, egui::Button::new(if loading { "불러오는 중…" } else { "새로 고침" })).clicked() {
+                    *reload = true;
+                }
+            });
+        });
+        if !self.fb_notice.is_empty() {
+            ui.label(RichText::new(&self.fb_notice).font(theme::bold(12.5)).color(theme::OK));
+        }
+        ui.add_space(4.0);
+        // 머리줄
+        let font = egui::FontId::proportional(13.0);
+        let head = theme::bold(12.5);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(FB_W, 24.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 4.0, p.hover);
+        for (i, name) in FB_HEAD.iter().enumerate() {
+            let (x, w) = FB_COLS[i];
+            let at = if FB_CENTER[i] { egui::pos2(rect.left() + x + w / 2.0, rect.center().y) } else { egui::pos2(rect.left() + x, rect.center().y) };
+            let align = if FB_CENTER[i] { egui::Align2::CENTER_CENTER } else { egui::Align2::LEFT_CENTER };
+            ui.painter().text(at, align, *name, head.clone(), p.muted);
+        }
+        let empty_box = |ui: &mut Ui, text: &str, color: Color32| {
+            ui.add_space(28.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(text).color(color));
+            });
+            ui.add_space(28.0);
+        };
+        let items = match (&self.fb_list, &self.fb_list_err) {
+            (Some(items), _) if !items.is_empty() => items,
+            (_, Some(e)) => {
+                let color = if *e == feedback::ListError::NotYet { p.muted } else { theme::OVER };
+                empty_box(ui, &e.text(), color);
+                return;
+            }
+            (None, None) => {
+                empty_box(ui, "불러오는 중…", p.muted);
+                return;
+            }
+            _ => {
+                empty_box(ui, "아직 쓴 글이 없어요. '글쓰기'를 눌러 첫 글을 남겨 보세요.", p.muted);
+                return;
+            }
+        };
+        egui::ScrollArea::vertical().id_salt("fb_list").max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
+            for it in items {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(FB_W, 30.0), egui::Sense::click());
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let painter = ui.painter();
+                if resp.hovered() {
+                    painter.rect_filled(rect, 4.0, p.select);
+                }
+                painter.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0f32, p.line));
+                let date = feedback::short_time(&it.created_at);
+                let date = date.get(5..).unwrap_or(&date).to_string(); // "11-18 10:02"
+                let answered = !it.replies.is_empty();
+                let cells: [(String, Color32, bool); 7] = [
+                    (it.number().to_string(), p.muted, false),
+                    (feedback::kind_label(&it.kind).to_string(), p.wine, true),
+                    (it.title(60), p.ink, false),
+                    (it.nickname.clone(), p.ink, false),
+                    (date, p.muted, false),
+                    (it.status_label().to_string(), if answered { p.wine } else { p.muted }, answered),
+                    (if answered { format!("{}개", it.replies.len()) } else { "-".into() }, if answered { p.wine } else { p.muted }, answered),
+                ];
+                for (i, (text, color, bold)) in cells.into_iter().enumerate() {
+                    let (x, w) = FB_COLS[i];
+                    let cell = egui::Rect::from_min_size(egui::pos2(rect.left() + x, rect.top()), egui::vec2(w, rect.height()));
+                    let f = if bold { theme::bold(13.0) } else { font.clone() };
+                    let (at, align) = if FB_CENTER[i] { (cell.center(), egui::Align2::CENTER_CENTER) } else { (cell.left_center(), egui::Align2::LEFT_CENTER) };
+                    let text = fit_text(ui, &text, &f, w - 8.0);
+                    painter.with_clip_rect(cell).text(at, align, text, f, color);
+                }
+                if resp.clicked() {
+                    *go = Some(FbView::Read(it.id.clone()));
+                }
+            }
+        });
+    }
+
+    /// 글 보기: 글 전체와 제작자 답변
+    fn board_read_ui(&self, ui: &mut Ui, id: &str, go: &mut Option<FbView>) {
+        let p = self.pal;
+        ui.horizontal(|ui| {
+            if ui.button("← 목록").clicked() {
+                *go = Some(FbView::List);
+            }
+        });
+        ui.add_space(4.0);
+        let Some(it) = self.fb_list.as_ref().and_then(|l| l.iter().find(|x| x.id == id)) else {
+            ui.label(RichText::new("글을 찾지 못했어요. 목록을 새로 고쳐 주세요.").color(p.muted));
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("[{}]", feedback::kind_label(&it.kind))).font(theme::bold(14.0)).color(p.wine));
+            ui.label(RichText::new(it.headline(40)).font(theme::bold(14.0)).color(p.ink));
+        });
+        ui.horizontal(|ui| {
+            let mut meta = format!("{}번 · {} · {}", it.number(), it.nickname, feedback::short_time(&it.created_at));
+            if !it.song.is_empty() {
+                meta.push_str(&format!(" · 곡 {}", it.song));
+            }
+            ui.label(RichText::new(meta).size(12.5).color(p.muted));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let done = !it.replies.is_empty();
+                ui.label(RichText::new(it.status_label()).font(theme::bold(12.5)).color(if done { p.wine } else { p.muted }));
+            });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().id_salt("fb_read").max_height(380.0).auto_shrink([false, true]).show(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(&it.message).size(13.5)).wrap());
+            ui.add_space(10.0);
+            if it.replies.is_empty() {
+                egui::Frame::none().stroke(egui::Stroke::new(1.0f32, p.line)).rounding(6.0).inner_margin(10.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("아직 답변이 없어요. 답변이 달리면 위쪽 '피드백' 버튼에 알려 드려요.").size(12.5).color(p.muted));
+                });
+            }
+            for r in &it.replies {
+                egui::Frame::none().fill(p.hover).rounding(6.0).inner_margin(10.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(format!("제작자 답변 · {}", feedback::short_time(&r.created_at))).font(theme::bold(12.5)).color(p.wine));
+                    ui.add(egui::Label::new(&r.message).wrap());
+                });
+                ui.add_space(6.0);
+            }
+        });
+    }
+
+    /// 글쓰기. '등록'을 눌렀으면 true.
+    fn board_write_ui(&mut self, ui: &mut Ui, go: &mut Option<FbView>) -> bool {
+        let p = self.pal;
+        let sending = self.fb_rx.is_some();
+        let has_mml = !self.score_texts.is_empty();
+        let mut send = false;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!sending, egui::Button::new("← 목록")).clicked() {
+                *go = Some(FbView::List);
+            }
+            ui.label(RichText::new("글쓰기").font(theme::bold(14.0)));
+            ui.label(RichText::new("버그·제안·질문을 남기면 제작자가 읽고 답변해요.").size(12.5).color(p.muted));
+        });
+        ui.add_space(6.0);
+        egui::Grid::new("fb_write").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label("닉네임");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fb_nick)
+                        .desired_width(180.0)
+                        .char_limit(feedback::MAX_NICK)
+                        .hint_text(RichText::new(feedback::ANON).color(p.line)),
+                );
+                ui.label(RichText::new("비우면 '익명'으로 올라가요").size(12.0).color(p.muted));
+            });
+            ui.end_row();
+            ui.label("분류");
+            let labels: Vec<&str> = feedback::KINDS.iter().map(|(_, l)| *l).collect();
+            Self::combo(ui, "fb_kind", &mut self.fb_kind, &labels, 100.0);
+            ui.end_row();
+            ui.label("답장 받을 곳");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fb_contact)
+                        .desired_width(240.0)
+                        .char_limit(feedback::MAX_CONTACT)
+                        .hint_text(RichText::new("선택: 이메일, 디스코드, 게임 닉네임").color(p.line)),
+                );
+                ui.label(RichText::new("제작자만 봐요").size(12.0).color(p.muted));
+            });
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::multiline(&mut self.fb_text)
+                .desired_rows(10)
+                .desired_width(f32::INFINITY)
+                .char_limit(feedback::MAX_MESSAGE)
+                .hint_text(RichText::new("내용 (첫 줄이 목록에 제목처럼 보여요)\n예: 이 곡을 열면 화음2가 비어 나와요").color(p.line)),
+        );
+        ui.add_enabled(has_mml, egui::Checkbox::new(&mut self.fb_attach, "지금 곡 이름과 MML 함께 보내기"))
+            .on_hover_text("문제가 난 곡을 제작자가 그대로 볼 수 있어요");
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let can = !sending && !self.fb_text.trim().is_empty();
+            let label = if sending { "올리는 중…" } else { "등록" };
+            if ui.add_enabled_ui(can, |ui| self.accent(ui, label)).inner.clicked() {
+                send = true;
+            }
+            if ui.add_enabled(!sending, egui::Button::new("취소")).clicked() {
+                *go = Some(FbView::List);
+            }
+            ui.label(RichText::new(format!("{} / {}", self.fb_text.chars().count(), feedback::MAX_MESSAGE)).size(12.0).color(p.muted));
+            if !self.fb_status.is_empty() {
+                ui.label(RichText::new(&self.fb_status).color(theme::OVER));
+            }
+        });
+        send
     }
 
     fn direct_window(&mut self, ctx: &egui::Context) {
@@ -3881,8 +4169,41 @@ impl App {
         let mut wait_ms = 0u64;
         let mut again = false;
         let ensemble_shot = std::env::var_os("MABIMML_SHOT_ENSEMBLE").is_some();
+        let board_shot = std::env::var("MABIMML_SHOT_FEEDBACK").is_ok_and(|v| v == "board");
         let edit_shot = std::env::var_os("MABIMML_SHOT_EDIT").is_some();
         match step {
+            // 시험용: 피드백 게시판 (가짜 서버 MABIMML_FEEDBACK_URL 로) 목록 → 글 보기 → 글쓰기 → 등록 뒤 목록
+            0 if board_shot => {
+                self.fb_open = true;
+                self.fb_view = FbView::List;
+                self.load_board();
+                wait_ms = 1500;
+            }
+            1 if board_shot => shot = Some("피드백_1_목록.png"),
+            2 if board_shot => {
+                let pick = self.fb_list.as_ref().and_then(|l| l.iter().find(|x| !x.replies.is_empty()).or(l.first())).map(|x| x.id.clone());
+                if let Some(id) = pick {
+                    self.fb_view = FbView::Read(id);
+                }
+                wait_ms = 600;
+            }
+            3 if board_shot => shot = Some("피드백_2_글보기.png"),
+            4 if board_shot => {
+                self.fb_view = FbView::Write;
+                self.fb_nick.clear();
+                self.fb_kind = "질문".into();
+                self.fb_contact.clear();
+                self.fb_text = "합주 악보에서 화음 개수를 직접 정할 수 있나요?
+곡마다 조금씩 다르게 하고 싶어요.".into();
+                wait_ms = 600;
+            }
+            5 if board_shot => shot = Some("피드백_3_글쓰기.png"),
+            6 if board_shot => {
+                self.board_submit();
+                wait_ms = 2000;
+            }
+            7 if board_shot => shot = Some("피드백_4_등록_뒤_목록.png"),
+            8 if board_shot => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             4 if edit_shot => {
                 // 시험용: 멜로디 세 번째 음을 고른다
                 let part = self.part_text(0, 0);
@@ -4233,4 +4554,21 @@ pub fn run(files: Vec<String>) -> eframe::Result<()> {
     }
     let opts = eframe::NativeOptions { viewport: vb, persist_window: false, ..Default::default() };
     eframe::run_native("MabiMML", opts, Box::new(move |cc| Ok(Box::new(App::new(cc, files)))))
+}
+
+/// 글자를 width 안에 들어가게 자르고 넘치면 "…" 를 붙인다 (게시판 목록 칸)
+fn fit_text(ui: &Ui, text: &str, font: &egui::FontId, width: f32) -> String {
+    let w = |s: &str| ui.fonts(|f| f.layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE).size().x);
+    if w(text) <= width {
+        return text.to_string();
+    }
+    let mut chars: Vec<char> = text.trim_end_matches('…').chars().collect();
+    while !chars.is_empty() {
+        chars.pop();
+        let s: String = chars.iter().collect::<String>().trim_end().to_string() + "…";
+        if w(&s) <= width {
+            return s;
+        }
+    }
+    "…".into()
 }
